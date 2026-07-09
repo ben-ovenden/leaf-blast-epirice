@@ -1,0 +1,7 @@
+# R
+.Rhistory
+.RData
+.Rproj.user
+# Keep committed weekly outputs, ignore scratch
+*.tmp
+.DS_Store
