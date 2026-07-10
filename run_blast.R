@@ -76,13 +76,18 @@ cat("\nRice leaf blast risk (EPIRICE / Open-Meteo)\n")
 cat(strrep("=", 60), "\n")
 
 end_date <- Sys.Date() - ARCHIVE_LAG_DAYS
+# Use the same rolling window as the heatmap: assume a crop of age CROP_AGE_DAYS
+# everywhere, so the table reflects current potential risk rather than a finished
+# past season. Per-site emergence overrides are still honoured if provided.
+rolling_emergence <- as.character(end_date - CROP_AGE_DAYS)
 sites <- as.data.table(SITES)
-if (!"emergence" %in% names(sites)) sites[, emergence := EMERGENCE_DATE]
+if (!"emergence" %in% names(sites)) sites[, emergence := rolling_emergence]
 
 cat("Run date:   ", format(Sys.Date(), "%A %d %B %Y"), "\n")
 cat("Weather to: ", format(end_date, "%Y-%m-%d"), " (archive lag ",
     ARCHIVE_LAG_DAYS, " days)\n", sep = "")
-cat("Emergence:  ", EMERGENCE_DATE, "\n\n", sep = "")
+cat("Crop age:   ", CROP_AGE_DAYS, " days (emergence ", rolling_emergence, ")\n\n",
+    sep = "")
 
 results <- rbindlist(lapply(seq_len(nrow(sites)), function(k) {
   s <- sites[k]
