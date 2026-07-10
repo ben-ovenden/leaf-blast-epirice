@@ -1,0 +1,83 @@
+name: Weekly leaf blast risk
+
+on:
+  schedule:
+    # 06:00 Monday AEST (UTC+10) = 20:00 Sunday UTC. Your Queensland sites stay on
+    # AEST all year (no daylight saving), so this is 6am there every Monday. In
+    # Canberra during daylight saving (Oct-Apr) the local clock reads 7am.
+    # GitHub may start scheduled runs a few minutes late under load.
+    - cron: '0 20 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  blast:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: System libraries for terra/sf
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgdal-dev libgeos-dev libproj-dev \
+            libudunits2-dev libsqlite3-dev
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: 'release'
+          use-public-rspm: true
+
+      - name: Install R packages
+        run: |
+          install.packages(c("data.table", "jsonlite", "terra", "sf",
+                             "ozmaps", "maps", "rnaturalearth",
+                             "rnaturalearthdata"),
+                           repos = "https://packagemanager.posit.co/cran/__linux__/jammy/latest")
+        shell: Rscript {0}
+
+      - name: Site table and summary
+        run: Rscript run_blast.R
+
+      - name: Continental heatmap
+        run: Rscript run_blast_grid.R
+
+      - name: Commit outputs
+        run: |
+          git config --local user.email "github-actions@github.com"
+          git config --local user.name "github-actions"
+          git add blast_outputs/
+          git diff --staged --quiet || git commit -m "Weekly leaf blast run $(date +%F)"
+          git push
+
+      # Optional email. Add secrets MAIL_USERNAME, MAIL_PASSWORD, MAIL_TO.
+      - name: Set run date
+        run: echo "RUN_DATE=$(date -u +%F)" >> "$GITHUB_ENV"
+
+      - name: Email summary and heatmap
+        if: ${{ env.MAIL_USERNAME != '' }}
+        env:
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: Weekly leaf blast risk ${{ env.RUN_DATE }}
+          to: ${{ secrets.MAIL_TO }}
+          from: Leaf blast model <${{ secrets.MAIL_USERNAME }}>
+          body: file://blast_outputs/blast_summary_latest.txt
+          attachments: blast_outputs/blast_heatmap_${{ env.RUN_DATE }}.png,blast_outputs/blast_results_latest.csv
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blast-outputs
+          path: blast_outputs/
+          retention-days: 30
