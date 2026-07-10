@@ -34,7 +34,8 @@ jobs:
       - name: Install R packages
         run: |
           install.packages(c("data.table", "jsonlite", "terra", "sf",
-                             "ozmaps", "maps"),
+                             "ozmaps", "maps", "rnaturalearth",
+                             "rnaturalearthdata"),
                            repos = "https://packagemanager.posit.co/cran/__linux__/jammy/latest")
         shell: Rscript {0}
 
@@ -53,6 +54,9 @@ jobs:
           git push
 
       # Optional email. Add secrets MAIL_USERNAME, MAIL_PASSWORD, MAIL_TO.
+      - name: Set run date
+        run: echo "RUN_DATE=$(date -u +%F)" >> "$GITHUB_ENV"
+
       - name: Email summary and heatmap
         if: ${{ env.MAIL_USERNAME != '' }}
         env:
@@ -64,11 +68,11 @@ jobs:
           secure: true
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
-          subject: Weekly leaf blast risk
+          subject: Weekly leaf blast risk ${{ env.RUN_DATE }}
           to: ${{ secrets.MAIL_TO }}
           from: Leaf blast model <${{ secrets.MAIL_USERNAME }}>
           body: file://blast_outputs/blast_summary_latest.txt
-          attachments: blast_outputs/blast_heatmap_latest.png,blast_outputs/blast_map_latest.png,blast_outputs/blast_results_latest.csv
+          attachments: blast_outputs/blast_heatmap_${{ env.RUN_DATE }}.png,blast_outputs/blast_results_latest.csv
 
       - name: Upload artifact
         if: always()
