@@ -44,26 +44,42 @@ and a GeoTIFF. Both are driven by the same Open-Meteo weather and the same model
 
 The heatmap follows the approach of Savary *et al.* (2012), who mapped potential
 epidemics on a grid. Each week it assumes a crop of age `CROP_AGE_DAYS` at every
-grid cell and colours the modelled leaf blast intensity. Read it as a potential
-risk surface: it shades the whole extent as if rice were grown everywhere, so
-most of the continent is a weather driven potential, not actual crop or measured
-disease. The monitoring sites are drawn on top for reference.
+land cell and colours the modelled leaf blast intensity. It covers all land,
+including coastal cells, and is clipped to the coastline so the ocean is blank.
+Coastline, rivers, roads, towns and your monitoring sites are drawn on top. Read
+it as a potential risk surface: it shades the land as if rice were grown
+everywhere, so most of it is a weather driven potential, not actual crop or
+measured disease.
+
+Colours run from light blue (low) to dark red (high) on a FIXED scale set by
+`HEAT_MAX`, so a given colour means the same intensity every week. That value is
+provisional: EPIRICE intensity is near zero in the dry season and rises in the
+wet, so run once through a favourable month with `HEAT_MAX <- NULL` to read the
+peak, then set `HEAT_MAX` a little above it. Until then, dry-season maps read
+low, which is the correct signal.
+
+Output files are date stamped, for example `blast_heatmap_2026-07-10.png` and the
+matching GeoTIFF, with a `blast_heatmap_latest.png` copy for convenience.
 
 Grid settings live in `blast_config.R`:
 
 - `GRID_EXTENT` and `GRID_RES`: area and resolution. The default is the continent
-  at 0.75 degree with the ocean masked out, about 1,240 land cells, which uses
-  roughly 80 per cent of the free Open-Meteo allowance (10,000 calls per day) for
-  a 60 day window. The runner prints an estimated call budget each time and warns
-  if a change pushes it over. Finer than about 0.70 degree over the whole
-  continent exceeds the free tier, so go finer only over a smaller extent.
-- `LAND_ONLY`: drops ocean cells before fetching using an Australia polygon (needs
-  `ozmaps`). This spends no budget on water and roughly halves the cell count.
+  at 0.75 degree with the ocean masked out. Including coastal cells brings this to
+  roughly 1,400 land cells, about 89 per cent of the free Open-Meteo allowance
+  (10,000 calls per day) for a 60 day window. The runner prints an estimated call
+  budget each run and warns if a change pushes it over. If you see rate-limit
+  (429) errors, coarsen to 0.8 degree.
+- `LAND_ONLY`: keeps any cell touching land and clips the surface to the coast
+  (needs `ozmaps`). It spends no budget on open ocean.
+- `SHOW_COAST`, `SHOW_TOWNS`, `SHOW_ROADS`, `SHOW_RIVERS`: overlay toggles. Roads
+  and rivers are downloaded from Natural Earth at run time (needs `rnaturalearth`);
+  if a download fails the map still renders without that layer. `TOWNS` is an
+  editable table of labelled centres.
 - `CROP_AGE_DAYS`: the trailing crop age and weather window. Larger values give a
   fuller season potential but cost more requests.
 - `SMOOTH_FACTOR`: display only smoothing; the model still runs at `GRID_RES`.
-- `HEAT_MAX`: fixes the colour scale for week to week comparability, or leave
-  `NULL` to auto scale each week.
+- `HEAT_MAX`: fixes the colour scale for week to week comparability, or `NULL` to
+  auto scale each week.
 
 A note on magnitude: EPIRICE intensity values are often small in absolute terms,
 especially early in a crop. The heatmap is most useful for the spatial pattern

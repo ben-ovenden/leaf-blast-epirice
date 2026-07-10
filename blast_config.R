@@ -93,13 +93,44 @@ SMOOTH_FACTOR <- 4L
 # Also write a GeoTIFF of the risk surface alongside the PNG.
 WRITE_GEOTIFF <- TRUE
 
-# Heatmap colour ramp (low -> high), NSW brand-aligned.
-HEAT_COLOURS <- c("#00AA45", "#FFB223", "#DC5800", "#B81237")
+# Heatmap colour ramp, low -> high: light blue through to dark red.
+HEAT_COLOURS <- c("#BFE0F5", "#FFF6B0", "#FDB147", "#E8492B", "#8B0000")
 
-# Heatmap colour scale maximum (%). NULL = auto-scale to the current week's data
-# (always readable, but colours are not comparable between weeks). Set a fixed
-# number once you know your typical range to make weeks comparable.
-HEAT_MAX <- NULL
+# Overlay layers on the heatmap
+SHOW_COAST  <- TRUE
+SHOW_TOWNS  <- TRUE
+SHOW_ROADS  <- TRUE    # major roads from Natural Earth (downloaded at run time)
+SHOW_RIVERS <- TRUE    # rivers from Natural Earth (downloaded at run time)
+
+COL_COAST <- "#22272B"
+COL_ROAD  <- "#8A6D3B"
+COL_RIVER <- "#2E75B6"
+COL_TOWN  <- "#111111"
+
+# Major towns to label (edit freely). name, lon, lat.
+TOWNS <- data.frame(
+  name = c("Cairns", "Townsville", "Mackay", "Rockhampton", "Bundaberg",
+           "Brisbane", "Darwin", "Katherine", "Broome", "Sydney",
+           "Griffith", "Perth", "Adelaide", "Melbourne"),
+  lon  = c(145.75, 146.82, 149.19, 150.51, 152.35,
+           153.02, 130.84, 132.26, 122.24, 151.21,
+           146.05, 115.86, 138.60, 144.96),
+  lat  = c(-16.92, -19.26, -21.14, -23.38, -24.87,
+           -27.47, -12.46, -14.47, -17.96, -33.87,
+           -34.29, -31.95, -34.93, -37.81),
+  stringsAsFactors = FALSE
+)
+
+# Heatmap colour scale maximum (%). A FIXED number makes every week's colours
+# directly comparable (a given colour = the same intensity each week), which is
+# usually what you want for a weekly product. NULL would auto-scale each week.
+#
+# This value is PROVISIONAL. EPIRICE intensity is near zero in the dry season and
+# rises in the wet, so calibrate: run once through a favourable wet-season month
+# with HEAT_MAX <- NULL, read the peak intensity the summary reports, then set
+# HEAT_MAX a little above it. Until then, most dry-season maps will read low/blue,
+# which is the correct signal.
+HEAT_MAX <- 2
 
 ################################################################################
 # 8. Citation (added to the summary and to the heatmap footer)
