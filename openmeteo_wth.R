@@ -18,6 +18,14 @@ suppressPackageStartupMessages({
   library(jsonlite)
 })
 
+# On Windows behind a corporate proxy or SSL inspection (e.g. a department
+# network), route web requests through the Windows system proxy and certificate
+# store, which usually succeeds where R's default method is blocked. This is a
+# no-op on Linux (GitHub Actions), which keeps the default and has open internet.
+if (.Platform$OS.type == "windows") {
+  options(url.method = "wininet", download.file.method = "wininet")
+}
+
 OPENMETEO_ARCHIVE_URL <- "https://archive-api.open-meteo.com/v1/archive"
 
 # Parse an Open-Meteo daily JSON list into the wth schema. Separated from the

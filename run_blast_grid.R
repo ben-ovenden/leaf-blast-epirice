@@ -28,9 +28,16 @@ if (!exists("GRID_FETCH_FN")) GRID_FETCH_FN <- get_openmeteo_grid
 
 ext <- GRID_EXTENT
 
-# Land polygon. Try each source independently so one failing does not abort the
-# others. Returns a SpatVector or NULL.
+# Land polygon. Try the bundled GeoJSON first, read with terra alone (no sf,
+# which can be broken on some runners). Fall back to package sources only if the
+# bundled file is missing. Returns a SpatVector or NULL.
 get_land <- function() {
+  # 0) bundled file, terra-only (most reliable on CI)
+  f <- file.path(SCRIPT_DIR, "australia_land.geojson")
+  v <- tryCatch(if (file.exists(f)) terra::vect(f) else NULL,
+                error = function(e) NULL)
+  if (!is.null(v) && nrow(v) > 0) return(v)
+
   if (requireNamespace("sf", quietly = TRUE)) try(sf::sf_use_s2(FALSE), silent = TRUE)
 
   # 1) ozmaps
@@ -143,24 +150,57 @@ if (isTRUE(WRITE_GEOTIFF))
   terra::writeRaster(r, file.path(OUT, sprintf("blast_heatmap_%s.tif", run_tag)),
                      overwrite = TRUE)
 
+# ---- Monitoring-town values and rolling trends CSV ------------------------
+# Sample the risk surface at each monitoring town, then keep a wide table of the
+# last HISTORY_RUNS runs (one column per run date) so trends are visible per row.
+if (exists("MONITOR_TOWNS") && nrow(MONITOR_TOWNS) > 0) {
+  mt <- as.data.table(MONITOR_TOWNS)
+  tpts <- terra::vect(as.matrix(mt[, .(lon, lat)]), type = "points",
+                      crs = "EPSG:4326")
+  tvals <- terra::extract(r, tpts)[, 2]
+  today <- data.table(town = mt$name)
+  today[[run_tag]] <- round(tvals, 3)
+
+  hist_file <- file.path(OUT, "town_trends.csv")
+  hist <- if (file.exists(hist_file))
+    fread(hist_file, header = TRUE, colClasses = list(character = "town")) else
+    data.table(town = character())
+  if (run_tag %in% names(hist)) hist[, (run_tag) := NULL]   # re-run same day
+
+  hist <- merge(hist, today, by = "town", all = TRUE)
+
+  # rows in MONITOR_TOWNS order (any retired towns kept at the end)
+  ord <- c(mt$name, setdiff(hist$town, mt$name))
+  hist <- hist[match(ord, town)]
+
+  # keep only the most recent HISTORY_RUNS date columns, in date order
+  keep_n <- if (exists("HISTORY_RUNS")) HISTORY_RUNS else 10L
+  date_cols <- setdiff(names(hist), "town")
+  date_cols <- date_cols[order(as.Date(date_cols))]
+  if (length(date_cols) > keep_n) date_cols <- tail(date_cols, keep_n)
+  hist <- hist[, c("town", date_cols), with = FALSE]
+
+  fwrite(hist, hist_file)
+  cat(sprintf("Town trends: %d towns x %d runs -> %s\n",
+              nrow(hist), length(date_cols), hist_file))
+}
+
 r_disp <- r
 if (SMOOTH_FACTOR > 1L) {
   r_disp <- terra::disagg(r, fact = SMOOTH_FACTOR, method = "bilinear")
   if (!is.null(land_poly)) r_disp <- terra::mask(r_disp, land_poly)
 }
 
-# ---- Optional Natural Earth overlays (downloaded at run time) -------------
-load_ne <- function(type, category, scale = 10) {
-  if (!requireNamespace("rnaturalearth", quietly = TRUE)) return(NULL)
-  v <- tryCatch(
-    rnaturalearth::ne_download(scale = scale, type = type, category = category,
-                               returnclass = "sf"),
-    error = function(e) NULL)
-  if (is.null(v)) return(NULL)
-  tryCatch(terra::crop(terra::vect(v), terra::ext(r0)), error = function(e) NULL)
+# ---- Bundled Natural Earth overlays, read with terra (no sf, no download) ---
+load_bundled <- function(fname) {
+  f <- file.path(SCRIPT_DIR, fname)
+  v <- tryCatch(if (file.exists(f)) terra::vect(f) else NULL,
+                error = function(e) NULL)
+  if (is.null(v) || nrow(v) == 0) return(NULL)
+  tryCatch(terra::crop(v, terra::ext(r0)), error = function(e) v)
 }
-rivers <- if (isTRUE(SHOW_RIVERS)) load_ne("rivers_lake_centerlines", "physical") else NULL
-roads  <- if (isTRUE(SHOW_ROADS))  load_ne("roads", "cultural") else NULL
+rivers <- if (isTRUE(SHOW_RIVERS)) load_bundled("australia_rivers.geojson") else NULL
+roads  <- if (isTRUE(SHOW_ROADS))  load_bundled("australia_roads.geojson") else NULL
 
 # ---- Render ----------------------------------------------------------------
 png_file <- file.path(OUT, sprintf("blast_heatmap_%s.png", run_tag))
@@ -183,14 +223,12 @@ if (isTRUE(SHOW_ROADS) && !is.null(roads))
 if (isTRUE(SHOW_COAST) && !is.null(land_poly))
   try(terra::lines(land_poly, col = COL_COAST, lwd = 1), silent = TRUE)
 
-if (isTRUE(SHOW_TOWNS) && exists("TOWNS") && nrow(TOWNS) > 0) {
-  points(TOWNS$lon, TOWNS$lat, pch = 20, cex = 0.7, col = COL_TOWN)
-  text(TOWNS$lon, TOWNS$lat, TOWNS$name, pos = 4, offset = 0.25,
-       cex = 0.55, col = COL_TOWN)
+if (isTRUE(SHOW_TOWNS) && exists("MONITOR_TOWNS") && nrow(MONITOR_TOWNS) > 0) {
+  points(MONITOR_TOWNS$lon, MONITOR_TOWNS$lat, pch = 21, bg = "white",
+         col = COL_TOWN, cex = 1.1, lwd = 1.4)
+  text(MONITOR_TOWNS$lon, MONITOR_TOWNS$lat, MONITOR_TOWNS$name, pos = 4,
+       offset = 0.3, cex = 0.5, col = COL_TOWN)
 }
-sites <- as.data.table(SITES)
-points(sites$lon, sites$lat, pch = 21, bg = "white", col = "#22272B",
-       cex = 1.3, lwd = 1.6)
 
 par(op); dev.off()
 file.copy(png_file, file.path(OUT, "blast_heatmap_latest.png"), overwrite = TRUE)

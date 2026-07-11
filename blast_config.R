@@ -107,19 +107,30 @@ COL_ROAD  <- "#8A6D3B"
 COL_RIVER <- "#2E75B6"
 COL_TOWN  <- "#111111"
 
-# Major towns to label (edit freely). name, lon, lat.
-TOWNS <- data.frame(
-  name = c("Cairns", "Townsville", "Mackay", "Rockhampton", "Bundaberg",
-           "Brisbane", "Darwin", "Katherine", "Broome", "Sydney",
-           "Griffith", "Perth", "Adelaide", "Melbourne"),
-  lon  = c(145.75, 146.82, 149.19, 150.51, 152.35,
-           153.02, 130.84, 132.26, 122.24, 151.21,
-           146.05, 115.86, 138.60, 144.96),
-  lat  = c(-16.92, -19.26, -21.14, -23.38, -24.87,
-           -27.47, -12.46, -14.47, -17.96, -33.87,
-           -34.29, -31.95, -34.93, -37.81),
+# Monitoring towns: modelled each run, tracked in the trends CSV, and highlighted
+# on the map. name, lon, lat. Coordinates for the remote roadhouses (Archer
+# River, Lakeland, Timber Creek) are approximate; edit any as needed.
+MONITOR_TOWNS <- data.frame(
+  name = c("Malanda", "Lismore", "Gympie", "Dalby", "Warwick", "Griffith",
+           "Deniliquin", "Moree", "Emerald", "Clermont", "Biloela", "Marian",
+           "Proserpine", "Home Hill", "Lakeland", "Archer River", "Bamaga",
+           "Croydon", "Burketown", "Borroloola", "Katherine", "Humpty Doo",
+           "Jabiru", "Timber Creek", "Kununurra"),
+  lon  = c(145.596, 153.277, 152.665, 151.262, 152.034, 146.040,
+           144.958, 149.841, 148.159, 147.639, 150.503, 148.947,
+           148.581, 147.415, 144.851, 142.940, 142.386,
+           142.240, 139.546, 136.307, 132.264, 131.281,
+           132.836, 130.480, 128.741),
+  lat  = c(-17.354, -28.814, -26.190, -27.183, -28.219, -34.288,
+           -35.532, -29.462, -23.527, -22.826, -24.403, -21.150,
+           -20.401, -19.663, -15.855, -13.435, -10.892,
+           -18.204, -17.744, -16.070, -14.465, -12.584,
+           -12.671, -15.660, -15.772),
   stringsAsFactors = FALSE
 )
+
+# Number of recent runs to keep in the trends CSV (one column per run).
+HISTORY_RUNS <- 10
 
 # Heatmap colour scale maximum (%). A FIXED number makes every week's colours
 # directly comparable (a given colour = the same intensity each week), which is
