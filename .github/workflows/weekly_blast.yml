@@ -41,10 +41,12 @@ jobs:
       - name: Set run date
         run: echo "RUN_DATE=$(date -u +%F)" >> "$GITHUB_ENV"
 
-      # Optional email. Add secrets MAIL_USERNAME, MAIL_PASSWORD, MAIL_TO.
-      # Placed before the commit so a git hiccup cannot block delivery.
-      - name: Email summary and heatmap
-        if: ${{ env.MAIL_USERNAME != '' }}
+      # Email is REQUIRED: the heatmaps are delivered ONLY by email (they are not
+      # committed to the repo). The run artifact below is a 90-day fallback copy.
+      # This step needs repo secrets MAIL_USERNAME, MAIL_PASSWORD, MAIL_TO; if any
+      # is missing the step fails loudly rather than skipping silently. Placed
+      # before the commit so a git problem cannot block delivery.
+      - name: Email summary and heatmaps
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
@@ -57,7 +59,7 @@ jobs:
           from: WWAI Cereal Pathology - Blast Models <${{ secrets.MAIL_USERNAME }}>
           html_body: file://blast_outputs/blast_summary_latest.html
           body: file://blast_outputs/blast_summary_latest.txt
-          attachments: blast_outputs/blast_heatmap_${{ env.RUN_DATE }}.png,blast_outputs/blastam_heatmap_${{ env.RUN_DATE }}.png,blast_outputs/town_trends.csv,blast_outputs/blastam_trends.csv
+          attachments: blast_outputs/epirice_heatmap_${{ env.RUN_DATE }}.png,blast_outputs/blastam_heatmap_${{ env.RUN_DATE }}.png,blast_outputs/town_trends.csv,blast_outputs/blastam_trends.csv
 
       - name: Commit trends history
         run: |
@@ -68,10 +70,12 @@ jobs:
           git diff --staged --quiet || git commit -m "Weekly run (trends + weather cache) $(date +%F)"
           git push
 
+      # Fallback copy of everything (including both heatmaps) kept for 90 days,
+      # in case an email fails to deliver. Runs even if an earlier step failed.
       - name: Upload artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: blast-outputs
           path: blast_outputs/
-          retention-days: 30
+          retention-days: 90
