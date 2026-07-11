@@ -171,6 +171,11 @@ MONITOR_TOWNS <- data.frame(
 # Number of recent runs to keep in the trends CSV (one column per run).
 HISTORY_RUNS <- 10
 
+# Town weather fetches run concurrently (they are slow, cold, independent hourly
+# requests). This caps the concurrency. Linux only (the GitHub runner); Windows
+# runs serial automatically.
+TOWN_FETCH_CORES <- 8L
+
 # Heatmap colour scale maximum (%). A FIXED number makes every week's colours
 # directly comparable (a given colour = the same intensity each week), which is
 # usually what you want for a weekly product. NULL would auto-scale each week.

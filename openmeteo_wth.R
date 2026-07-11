@@ -177,16 +177,21 @@ get_openmeteo_grid <- function(lats, lons, start_date, end_date, pause = 0.8) {
 # is by variable count and period, not resolution), so one hourly fetch feeds
 # both EPIRICE (via daily aggregation) and BLASTAM.
 ################################################################################
-get_openmeteo_hourly <- function(lat, lon, start_date, end_date) {
+get_openmeteo_hourly <- function(lat, lon, start_date, end_date, timeout_seconds = 120) {
+  old <- options(timeout = max(timeout_seconds, getOption("timeout", 60)))
+  on.exit(options(old), add = TRUE)
   url <- sprintf(
     "%s?latitude=%.4f&longitude=%.4f&start_date=%s&end_date=%s&hourly=%s&timezone=UTC",
     OPENMETEO_ARCHIVE_URL, lat, lon,
     format(as.Date(start_date), "%Y-%m-%d"), format(as.Date(end_date), "%Y-%m-%d"),
     "temperature_2m,relative_humidity_2m,precipitation")
-  resp <- tryCatch(jsonlite::fromJSON(url), error = function(e) NULL)
+  resp <- tryCatch(
+    withCallingHandlers(jsonlite::fromJSON(url),
+                        warning = function(w) invokeRestart("muffleWarning")),
+    error = function(e) NULL)
   if (is.null(resp) || is.null(resp$hourly) || is.null(resp$hourly$time)) return(NULL)
   h <- resp$hourly
-  gv <- function(x) if (is.null(x)) NA_real_ else as.numeric(x)
+  gv <- function(x) if (is.null(x)) NA_real_ else suppressWarnings(as.numeric(x))
   dt <- as.POSIXct(h$time, format = "%Y-%m-%dT%H:%M", tz = "UTC")
   out <- data.table(dt = dt, temp = gv(h$temperature_2m),
                     rh = gv(h$relative_humidity_2m), rain = gv(h$precipitation))

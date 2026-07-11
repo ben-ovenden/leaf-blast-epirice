@@ -108,15 +108,30 @@ cat("Weather to: ", format(end_date, "%Y-%m-%d"), " (archive lag ",
 cat("Crop age:   ", CROP_AGE_DAYS, " days (emergence ", rolling_emergence, ")\n\n",
     sep = "")
 
-results <- rbindlist(lapply(seq_len(nrow(sites)), function(k) {
+options(timeout = max(120, getOption("timeout", 60)))  # slow archive requests
+
+# Towns are independent, and each is a separate (slow, cold) hourly request, so
+# fetch and model them concurrently. mclapply forks on Linux (the GitHub runner);
+# on Windows it falls back to serial automatically. TOWN_FETCH_CORES caps the
+# concurrency; 31 town requests * ~6.4 weighted calls stays well under the rate
+# limit even fired together.
+.cores <- if (exists("TOWN_FETCH_CORES")) TOWN_FETCH_CORES else 8L
+one_site <- function(k) {
   s <- sites[k]
-  cat(sprintf("%-14s ... ", s$name))
-  r <- run_site(s$name, s$lat, s$lon, s$emergence, end_date)
-  msg <- if (is.na(r$intensity)) r$level else
-    sprintf("%.1f%% (%s)", r$intensity * 100, r$level)
-  cat(msg, "\n")
-  r
-}))
+  run_site(s$name, s$lat, s$lon, s$emergence, end_date)
+}
+results_list <- tryCatch(
+  parallel::mclapply(seq_len(nrow(sites)), one_site, mc.cores = .cores),
+  error = function(e) lapply(seq_len(nrow(sites)), one_site))
+# any forks that failed outright fall back to a serial re-run for that row
+bad <- which(!vapply(results_list, is.data.frame, logical(1)))
+for (k in bad) results_list[[k]] <- one_site(k)
+results <- rbindlist(results_list)
+for (k in seq_len(nrow(results))) {
+  r <- results[k]
+  msg <- if (is.na(r$intensity)) r$level else sprintf("%.1f%% (%s)", r$intensity * 100, r$level)
+  cat(sprintf("%-14s ... %s\n", r$name, msg))
+}
 
 # Attach state and order by state then town (alphabetical within state)
 st <- as.data.table(MONITOR_TOWNS)[, .(name, state)]
