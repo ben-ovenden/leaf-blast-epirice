@@ -52,18 +52,19 @@ jobs:
           secure: true
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
-          subject: Weekly leaf blast risk ${{ env.RUN_DATE }}
+          subject: Blast risk summary ${{ env.RUN_DATE }}
           to: ${{ secrets.MAIL_TO }}
-          from: Leaf blast model <${{ secrets.MAIL_USERNAME }}>
+          from: WWAI Cereal Pathology - Blast Models <${{ secrets.MAIL_USERNAME }}>
+          html_body: file://blast_outputs/blast_summary_latest.html
           body: file://blast_outputs/blast_summary_latest.txt
-          attachments: blast_outputs/blast_heatmap_${{ env.RUN_DATE }}.png,blast_outputs/town_trends.csv
+          attachments: blast_outputs/blast_heatmap_${{ env.RUN_DATE }}.png,blast_outputs/blastam_heatmap_${{ env.RUN_DATE }}.png,blast_outputs/town_trends.csv,blast_outputs/blastam_trends.csv
 
       - name: Commit trends history
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config --local user.email "github-actions@github.com"
           git config --local user.name "github-actions"
-          git add -f blast_outputs/town_trends.csv blast_outputs/weather_cache.csv.gz
+          git add -f blast_outputs/town_trends.csv blast_outputs/blastam_trends.csv blast_outputs/weather_cache.csv.gz
           git diff --staged --quiet || git commit -m "Weekly run (trends + weather cache) $(date +%F)"
           git push
 
