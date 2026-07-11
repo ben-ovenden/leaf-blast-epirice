@@ -9,14 +9,26 @@
 # infection days. This is fundamentally different from EPIRICE, which simulates
 # disease build-up (intensity).
 #
-# INFECTION CRITERIA (as operated by Japanese prefectural plant-protection
-# stations, e.g. Fukushima, Kochi, Saga, Ehime, Miyagi, Kyoto, Hokkaido). A day
-# is FAVOURABLE (the filled-circle mark) when ALL THREE hold:
+# INFECTION CRITERIA. A day is FAVOURABLE when ALL THREE hold:
 #   1. leaf wetness duration >= 10 hours (including the night);
-#   2. mean air temperature DURING the wetness period is 15-25 C;
-#   3. mean air temperature of the preceding 5 days is 20-25 C.
+#   2. mean air temperature DURING the wetness period is within bounds;
+#   3. mean air temperature of the preceding 5 days is within bounds.
 # If wetness is >= 10 h but exactly one temperature condition fails, the day is
 # SEMI-FAVOURABLE. Otherwise it is not favourable.
+#
+# Original Japanese BLASTAM bounds (Koshimizu 1988, as operated by the Fukushima,
+# Kochi, Saga, Ehime, Miyagi, Kyoto and Hokkaido plant-protection stations):
+# wetness-period temperature 15-25 C; preceding 5-day mean 20-25 C.
+#
+# LOCAL ADAPTATION (northern Australia) -- USED HERE. The upper temperature
+# bounds are raised to: wetness-period 15-32 C; preceding 5-day mean 20-30 C.
+# Rationale: rice blast infects efficiently from about 25 up to ~32 C when leaf
+# wetness is adequate (the required wetness duration is in fact shortest near
+# 25-28 C), so the strict Japanese 25 C caps wrongly exclude warm, humid
+# wet-season nights in the tropics. This is a DELIBERATE deviation from Koshimizu
+# (1988), calibrated for warmer conditions; the lower bounds are unchanged. To
+# reproduce the original Japanese model, set BLASTAM_TWET_MAX <- 25 and
+# BLASTAM_PREV5_MAX <- 25 below.
 #
 # LEAF WETNESS
 # The original BLASTAM estimates leaf wetness from AMeDAS temperature, rainfall,
@@ -37,12 +49,15 @@
 #    in Fukushima Prefecture. Ann. Rep. Soc. Pl. Prot. North Japan 76: 41-46.
 ################################################################################
 
-# ---- Parameters (edit here to match a local BLASTAM variant) --------------
+# ---- Parameters -----------------------------------------------------------
+# Upper temperature bounds are RAISED from the original Japanese BLASTAM to suit
+# warmer northern-Australian conditions (see LOCAL ADAPTATION in the header). For
+# the strict Japanese model, set BLASTAM_TWET_MAX <- 25 and BLASTAM_PREV5_MAX <- 25.
 BLASTAM_WET_HOURS_MIN <- 10    # leaf wetness duration threshold (hours)
-BLASTAM_TWET_MIN      <- 15    # mean temperature during wetness, lower bound (C)
-BLASTAM_TWET_MAX      <- 25    # mean temperature during wetness, upper bound (C)
-BLASTAM_PREV5_MIN     <- 20    # preceding 5-day mean temperature, lower bound (C)
-BLASTAM_PREV5_MAX     <- 25    # preceding 5-day mean temperature, upper bound (C)
+BLASTAM_TWET_MIN      <- 15    # mean temp during wetness, lower bound (C)
+BLASTAM_TWET_MAX      <- 32    # mean temp during wetness, upper bound (C)  [Japan: 25]
+BLASTAM_PREV5_MIN     <- 20    # preceding 5-day mean temp, lower bound (C)
+BLASTAM_PREV5_MAX     <- 30    # preceding 5-day mean temp, upper bound (C) [Japan: 25]
 BLASTAM_RH_WET        <- 90    # RH (%) at or above = leaf wet
 BLASTAM_RAIN_WET      <- 0.2   # precipitation (mm) at or above = leaf wet
 

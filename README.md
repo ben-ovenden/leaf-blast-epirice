@@ -2,7 +2,7 @@
 
 A small, self contained pipeline that runs two complementary blast models each
 week from GitHub Actions, using free Open-Meteo weather, and writes two risk
-maps, a town table and a summary. Email delivery is optional.
+maps, a town table and a summary, and emails them out.
 
 ## What this is
 
@@ -18,10 +18,13 @@ Two models, run from one weather fetch:
   Koshimizu (1988). For each day it judges whether conditions favoured a new
   infection, and counts the favourable **infection days in the last 21 days** (`BLASTAM_WINDOW_DAYS`). A day is favourable
   when leaf wetness is at least 10 hours, the mean temperature during wetness is
-  15-25 C, and the preceding 5-day mean temperature is 20-25 C (the criteria as
-  operated by Japanese prefectural plant-protection stations). Leaf wetness is
-  estimated from hourly humidity (>=90%) and rainfall, since ERA5 has no
-  measured leaf-wetness variable. See `blastam_model.R` for parameters and refs.
+  within bounds, and the preceding 5-day mean temperature is within bounds. The
+  original Japanese bounds are 15-25 C and 20-25 C; here the upper bounds are
+  raised to 15-32 C and 20-30 C for warmer northern-Australian conditions (a
+  deliberate, documented deviation, since blast infects up to about 32 C given
+  adequate leaf wetness). Leaf wetness is estimated from hourly humidity (>=90%)
+  and rainfall, since ERA5 has no measured leaf-wetness variable. See
+  `blastam_model.R` for parameters and refs.
 
 The two are complementary: BLASTAM flags when infection windows open (early
 warning), while EPIRICE estimates the disease that may follow. Each run produces
@@ -71,8 +74,8 @@ wet, so run once through a favourable month with `HEAT_MAX <- NULL` to read the
 peak, then set `HEAT_MAX` a little above it. Until then, dry-season maps read
 low, which is the correct signal.
 
-Output files are date stamped, for example `blast_heatmap_2026-07-10.png` and the
-matching GeoTIFF, with a `blast_heatmap_latest.png` copy for convenience.
+Output files are date stamped, for example `epirice_heatmap_2026-07-10.png` and `blastam_heatmap_2026-07-10.png` and the
+matching GeoTIFF, with a `_latest.png` copy of each for convenience.
 
 Grid settings live in `blast_config.R`:
 
@@ -127,12 +130,20 @@ Rscript run_blast.R
 The Open-Meteo archive lags real time by roughly five days, so the run reports
 up to about five days ago. That is set by `ARCHIVE_LAG_DAYS` in the config.
 
-## Email (optional)
+## Email (required)
 
-Email is sent by the workflow, not by R, which avoids a Java dependency. Add
-three repository secrets: `MAIL_USERNAME` (a Gmail address), `MAIL_PASSWORD` (a
-Gmail app password, not the account password), and `MAIL_TO` (recipient, or a
-comma separated list). If the secrets are absent the email step is skipped.
+Email is how the two heatmaps leave the runner: the PNGs are NOT committed to the
+repo, so email is their delivery path (with the run artifact as a 90-day fallback
+copy). Email is sent by the workflow, not by R, which avoids a Java dependency.
+
+Add three repository secrets: `MAIL_USERNAME` (a Gmail address), `MAIL_PASSWORD`
+(a Gmail app password, not the account password), and `MAIL_TO` (recipient, or a
+comma separated list). If any is missing the email step fails loudly (a red run)
+rather than skipping silently, so a delivery problem is visible. The maps are
+still recoverable for 90 days from the run's uploaded artifact.
+
+Each email carries: the combined town table (EPIRICE and BLASTAM), the two
+heatmap PNGs, and the two trends CSVs.
 
 ## Reading the output
 
@@ -156,12 +167,44 @@ days, which indicates whether the epidemic is building or easing.
 
 ## Attribution
 
-Please retain the attribution in `epirice_model.R` and cite the model if you
-publish or distribute results:
+Please retain the attribution in `epirice_model.R` and `blastam_model.R`, and
+cite the models if you publish or distribute results.
+
+EPIRICE:
 
 Savary, S., Nelson, A., Willocquet, L., Pangga, I., and Aunario, J. (2012).
 Modeling and mapping potential epidemics of rice diseases globally. *Crop
 Protection* 34: 6 to 17. doi:10.1016/j.cropro.2011.11.009.
 
-epicrop package: Adam H. Sparks and colleagues. Check the epicrop licence
-before redistributing the model code itself.
+epicrop package (vendored SEIR engine and leaf blast parameters): Adam H. Sparks
+and colleagues. Check the epicrop licence before redistributing the model code
+itself. Framework: Zadoks, J.C. (1971). *Phytopathology* 61: 600 to 610.
+
+BLASTAM:
+
+Koshimizu, Y. (1988). A forecasting method for occurrence of rice leaf blast
+with AMeDAS data. *Bulletin of the Tohoku National Agricultural Experiment
+Station* 78: 67 to 121. [in Japanese]
+
+Hayashi, T. and Koshimizu, Y. (1988). Computer program BLASTAM for forecasting
+occurrence of rice leaf blast. *Bulletin of the Tohoku National Agricultural
+Experiment Station* 78: 123 to 138. [in Japanese]
+
+Maehara, H. and Yamada, M. (2025). Annual changes in the timing and frequency of
+favorable conditions for rice leaf blast infection estimated by BLASTAM in
+Fukushima Prefecture. *Annual Report of the Society of Plant Protection of North
+Japan* 76: 41 to 46. doi:10.11455/kitanihon.2025.76_41.
+
+The infection criteria follow the operational Japanese BLASTAM (leaf wetness at
+least 10 hours; mean temperature during wetness and preceding 5-day mean within
+bounds), with the upper temperature bounds deliberately raised from the Japanese
+25 C to 32 C (wetness period) and 30 C (5-day mean) for warmer
+northern-Australian conditions. Set both maxima back to 25 in `blastam_model.R`
+to reproduce the original. Leaf wetness is estimated from hourly humidity and
+rainfall, since ERA5 has no measured leaf-wetness variable.
+
+Weather:
+
+Open-Meteo historical (ERA5) archive, data licensed CC BY 4.0.
+Hersbach, H. et al. (2020). The ERA5 global reanalysis. *Quarterly Journal of
+the Royal Meteorological Society* 146: 1999 to 2049. doi:10.1002/qj.3803.

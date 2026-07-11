@@ -107,9 +107,9 @@ WRITE_GEOTIFF <- TRUE
 # Heatmap colour ramp, low -> high: light blue through to dark red.
 HEAT_COLOURS <- c("#BFE0F5", "#FFF6B0", "#FDB147", "#E8492B", "#8B0000")
 
-# BLASTAM infection-days heatmap: a distinct sequential purple ramp (few -> many
-# favourable infection days), so it is not confused with the EPIRICE map.
-BLASTAM_HEAT_COLOURS <- c("#F2F0F7", "#CBC9E2", "#9E9AC8", "#756BB1", "#54278F")
+# BLASTAM infection-days heatmap ramp, low -> high: light blue through to dark
+# red (same scheme as EPIRICE; the title and legend distinguish the two maps).
+BLASTAM_HEAT_COLOURS <- c("#BFE0F5", "#FFF6B0", "#FDB147", "#E8492B", "#8B0000")
 
 # BLASTAM reporting window: the map, town table and trends count FAVOURABLE
 # infection days over the most recent BLASTAM_WINDOW_DAYS, to show where infection
@@ -141,22 +141,30 @@ MONITOR_TOWNS <- data.frame(
            "Deniliquin", "Moree", "Emerald", "Clermont", "Biloela", "Marian",
            "Proserpine", "Home Hill", "Lakeland", "Archer River", "Bamaga",
            "Croydon", "Burketown", "Borroloola", "Katherine", "Humpty Doo",
-           "Jabiru", "Timber Creek", "Kununurra"),
+           "Jabiru", "Timber Creek", "Kununurra",
+           "Roma", "Rolleston", "Goondiwindi", "Theodore",
+           "Fitzroy Crossing", "Dubbo"),
   state = c("QLD", "NSW", "QLD", "QLD", "QLD", "NSW",
             "NSW", "NSW", "QLD", "QLD", "QLD", "QLD",
             "QLD", "QLD", "QLD", "QLD", "QLD",
             "QLD", "QLD", "NT", "NT", "NT",
-            "NT", "NT", "WA"),
+            "NT", "NT", "WA",
+            "QLD", "QLD", "QLD", "QLD",
+            "WA", "NSW"),
   lon  = c(145.596, 153.277, 152.665, 151.262, 152.034, 146.040,
            144.958, 149.841, 148.159, 147.639, 150.503, 148.947,
            148.581, 147.415, 144.851, 142.940, 142.386,
            142.240, 139.546, 136.307, 132.264, 131.281,
-           132.836, 130.480, 128.741),
+           132.836, 130.480, 128.741,
+           148.787, 148.630, 150.310, 150.076,
+           125.565, 148.601),
   lat  = c(-17.354, -28.814, -26.190, -27.183, -28.219, -34.288,
            -35.532, -29.462, -23.527, -22.826, -24.403, -21.150,
            -20.401, -19.663, -15.855, -13.435, -10.892,
            -18.204, -17.744, -16.070, -14.465, -12.584,
-           -12.671, -15.660, -15.772),
+           -12.671, -15.660, -15.772,
+           -26.570, -24.462, -28.549, -24.948,
+           -18.197, -32.257),
   stringsAsFactors = FALSE
 )
 
@@ -190,10 +198,12 @@ CITATION <- paste(
   "  A forecasting method for occurrence of rice leaf blast with AMeDAS data,",
   "  Bull. Tohoku Natl. Agric. Exp. Stn. 78: 67-121; program in Hayashi, T. and",
   "  Koshimizu, Y. (1988), ibid. 78: 123-138 [in Japanese]. A day is favourable",
-  "  when leaf wetness >=10 h, mean temperature during wetness 15-25 C, and the",
-  "  preceding 5-day mean temperature 20-25 C (as operated by Japanese",
-  "  prefectural plant-protection stations). Leaf wetness estimated from hourly",
-  "  humidity and rainfall.",
+  "  when leaf wetness >=10 h, the mean temperature during wetness is within",
+  "  bounds, and the preceding 5-day mean is within bounds. Original Japanese",
+  "  bounds 15-25 C and 20-25 C; the upper bounds are RAISED here to 15-32 C and",
+  "  20-30 C for warmer Australian conditions (a deliberate deviation, since",
+  "  blast infects up to ~32 C given leaf wetness). Leaf wetness estimated from",
+  "  hourly humidity and rainfall.",
   "Weather: Open-Meteo ERA5 archive (data CC BY 4.0).",
   sep = "\n"
 )

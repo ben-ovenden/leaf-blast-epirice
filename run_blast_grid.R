@@ -210,8 +210,8 @@ render_map <- function(pts, valcol, title, colours, hmax, legend, base) {
 
 # EPIRICE intensity (%) and BLASTAM infection days
 pm_epi[, intensity_pct := intensity * 100]
-render_map(pm_epi, "intensity_pct", "Blast potential risk (%)", HEAT_COLOURS, HEAT_MAX,
-           "intensity %", "blast_heatmap")
+render_map(pm_epi, "intensity_pct", "EPIRICE potential risk (%)", HEAT_COLOURS, HEAT_MAX,
+           "intensity %", "epirice_heatmap")
 render_map(pm, "events", sprintf("BLASTAM infection days (last %d)", BLASTAM_WINDOW_DAYS),
            BLASTAM_HEAT_COLOURS,
            BLASTAM_HEAT_MAX, "days", "blastam_heatmap")
