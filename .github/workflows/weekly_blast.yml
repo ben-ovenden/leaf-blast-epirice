@@ -63,8 +63,8 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config --local user.email "github-actions@github.com"
           git config --local user.name "github-actions"
-          git add -f blast_outputs/town_trends.csv
-          git diff --staged --quiet || git commit -m "Town blast trends $(date +%F)"
+          git add -f blast_outputs/town_trends.csv blast_outputs/weather_cache.csv.gz
+          git diff --staged --quiet || git commit -m "Weekly run (trends + weather cache) $(date +%F)"
           git push
 
       - name: Upload artifact
