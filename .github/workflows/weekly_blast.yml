@@ -39,7 +39,9 @@ jobs:
         run: Rscript run_blast_grid.R
 
       - name: Set run date
-        run: echo "RUN_DATE=$(date -u +%F)" >> "$GITHUB_ENV"
+        run: |
+          RD=$(cat blast_outputs/run_date.txt 2>/dev/null || date -u +%F)
+          echo "RUN_DATE=$RD" >> "$GITHUB_ENV"
 
       # Email is REQUIRED: the heatmaps are delivered ONLY by email (they are not
       # committed to the repo). The run artifact below is a 90-day fallback copy.
