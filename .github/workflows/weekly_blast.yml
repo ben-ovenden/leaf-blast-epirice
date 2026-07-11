@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   blast:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,9 +33,7 @@ jobs:
 
       - name: Install R packages
         run: |
-          install.packages(c("data.table", "jsonlite", "terra", "sf",
-                             "ozmaps", "maps", "rnaturalearth",
-                             "rnaturalearthdata"),
+          install.packages(c("data.table", "jsonlite", "terra"),
                            repos = "https://packagemanager.posit.co/cran/__linux__/jammy/latest")
         shell: Rscript {0}
 
@@ -45,12 +43,12 @@ jobs:
       - name: Continental heatmap
         run: Rscript run_blast_grid.R
 
-      - name: Commit outputs
+      - name: Commit trends history
         run: |
           git config --local user.email "github-actions@github.com"
           git config --local user.name "github-actions"
-          git add blast_outputs/
-          git diff --staged --quiet || git commit -m "Weekly leaf blast run $(date +%F)"
+          git add -f blast_outputs/town_trends.csv
+          git diff --staged --quiet || git commit -m "Town blast trends $(date +%F)"
           git push
 
       # Optional email. Add secrets MAIL_USERNAME, MAIL_PASSWORD, MAIL_TO.
@@ -72,7 +70,7 @@ jobs:
           to: ${{ secrets.MAIL_TO }}
           from: Leaf blast model <${{ secrets.MAIL_USERNAME }}>
           body: file://blast_outputs/blast_summary_latest.txt
-          attachments: blast_outputs/blast_heatmap_${{ env.RUN_DATE }}.png,blast_outputs/blast_results_latest.csv
+          attachments: blast_outputs/blast_heatmap_${{ env.RUN_DATE }}.png,blast_outputs/town_trends.csv
 
       - name: Upload artifact
         if: always()
