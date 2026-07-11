@@ -22,10 +22,10 @@ EMERGENCE_DATE <- "2025-12-01"
 
 # ---- 3. Risk bands ---------------------------------------------------------
 # EPIRICE reports leaf blast intensity as a proportion of diseased sites (0-1).
-# These cut points are PROVISIONAL and should be calibrated against your own
-# field observations before being relied on. They only affect labelling.
-INTENSITY_LOW_MAX      <- 0.05   # below this = low
-INTENSITY_MODERATE_MAX <- 0.15   # below this = moderate, at or above = high
+# Calibrated so that 1% (0.01) intensity, taken as a significant epidemic, is the
+# top of the "high" band. Adjust these against your own field observations.
+INTENSITY_LOW_MAX      <- 0.002  # below 0.2% = low
+INTENSITY_MODERATE_MAX <- 0.01   # 0.2% to <1% = moderate; 1% and above = high
 
 # ---- 4. Data window --------------------------------------------------------
 # The Open-Meteo archive (ERA5) lags real time by about 5 days. End the fetch a
@@ -68,14 +68,25 @@ SEND_EMAIL <- FALSE          # set TRUE once secrets are configured
 # Extent: c(lon_min, lon_max, lat_min, lat_max). Default = Australian continent.
 GRID_EXTENT <- c(112, 154, -44, -10)
 
-# Resolution in degrees. 0.75 is tuned to keep a land-only continental run (about
-# 1,240 cells over a 60 day window) at roughly 80% of the free Open-Meteo budget
-# (10,000 calls/day), with headroom. Finer than ~0.70 over the whole continent
-# exceeds the free tier; go finer only over a smaller extent.
-GRID_RES <- 0.75
+# Resolution. The map now refines over consecutive runs: a weather cache
+# (WEATHER_CACHE_FILE, kept in the repo) means each run only fetches the newest
+# days for points it already has, which frees budget to ADD new points. Coverage
+# fills coarse-to-fine toward GRID_RES_FINEST, then holds there once maintaining
+# the points costs about the per-run budget.
+GRID_RES_FINEST <- 0.5              # finest resolution the map refines toward
+GRID_RES_LEVELS <- c(2.0, 1.0, 0.5) # coarse-to-fine fill order; each must be a
+                                    # whole-number multiple of GRID_RES_FINEST
+TARGET_CALLS_PER_RUN <- 4000        # weighted-call budget per run (< 5000/hour)
+WEATHER_CACHE_FILE   <- "weather_cache.csv.gz"  # in OUTPUT_DIR, committed to git
 
-# Free Open-Meteo daily call allowance, used by the budget self-check.
-FREE_DAILY_CALLS <- 10000
+# Legacy fixed resolution (no longer used by the dynamic runner; kept for
+# reference and any single-shot use).
+GRID_RES <- 1.25
+
+# Free Open-Meteo limits used by the budget self-check. The hourly cap is the
+# binding one for a single weekly run.
+FREE_HOURLY_CALLS <- 5000
+FREE_DAILY_CALLS  <- 10000
 
 # Crop age framing: each week, assume a crop this many days old everywhere, and
 # run the model over the trailing weather window. This makes the surface
@@ -136,11 +147,8 @@ HISTORY_RUNS <- 10
 # directly comparable (a given colour = the same intensity each week), which is
 # usually what you want for a weekly product. NULL would auto-scale each week.
 #
-# This value is PROVISIONAL. EPIRICE intensity is near zero in the dry season and
-# rises in the wet, so calibrate: run once through a favourable wet-season month
-# with HEAT_MAX <- NULL, read the peak intensity the summary reports, then set
-# HEAT_MAX a little above it. Until then, most dry-season maps will read low/blue,
-# which is the correct signal.
+# Set to 2 so 2% intensity and above is the deepest red (a severe epidemic);
+# ~1% reads as strong orange-red. Values grade from light blue up.
 HEAT_MAX <- 2
 
 ################################################################################

@@ -145,71 +145,28 @@ get_openmeteo_wth <- function(lat, lon, start_date, end_date,
   dt[]
 }
 
-# Small wrapper around the JSON fetch so it can be stubbed in tests.
-.om_fetch <- function(url) {
-  tryCatch(jsonlite::fromJSON(url, simplifyVector = FALSE),
-           error = function(e) {
-             warning("grid fetch failed: ", conditionMessage(e), call. = FALSE)
-             NULL
-           })
-}
-
-# Fetch weather for a set of grid points. lats/lons are equal-length vectors.
+# Fetch weather for a set of grid points, one request per point.
 #
-# Strategy: request coordinates in SMALL batches (keeps the URL short; large
-# multi-coordinate URLs are commonly rejected). Any cell that still has no data
-# afterwards is retried with a single-point request, which is the proven path
-# used elsewhere. A summary line reports how many cells returned data.
-get_openmeteo_grid <- function(lats, lons, start_date, end_date,
-                               batch = 100L, pause = 1) {
+# Multi-location requests do not help here: Open-Meteo's free quota is by data
+# volume, not request count, so the binding limit is 5,000 weighted calls/hour
+# and 600/minute. We therefore pace single-point requests (a short sleep) to stay
+# under the per-minute limit, and log progress so a long run is visibly moving.
+# The grid resolution in blast_config.R is chosen so the whole run fits the
+# hourly cap.
+get_openmeteo_grid <- function(lats, lons, start_date, end_date, pause = 0.8) {
   stopifnot(length(lats) == length(lons))
   n <- length(lats)
   out <- vector("list", n)
-  vars <- paste0("temperature_2m_mean,temperature_2m_max,temperature_2m_min,",
-                 "relative_humidity_2m_mean,relative_humidity_2m_max,",
-                 "relative_humidity_2m_min,precipitation_sum")
-  sd <- format(as.Date(start_date), "%Y-%m-%d")
-  ed <- format(as.Date(end_date), "%Y-%m-%d")
-
-  idx <- split(seq_len(n), ceiling(seq_len(n) / batch))
-  for (g in idx) {
-    url <- sprintf(
-      "%s?latitude=%s&longitude=%s&start_date=%s&end_date=%s&daily=%s&timezone=UTC",
-      OPENMETEO_ARCHIVE_URL,
-      paste(sprintf("%.4f", lats[g]), collapse = ","),
-      paste(sprintf("%.4f", lons[g]), collapse = ","), sd, ed, vars)
-    resp <- .om_fetch(url)
-    if (!is.null(resp)) {
-      # multi-point response is a top-level array; single point is one object
-      elems <- if (!is.null(resp$daily)) list(resp) else resp
-      for (j in seq_along(g)) {
-        el <- tryCatch(elems[[j]], error = function(e) NULL)
-        if (!is.null(el)) {
-          p <- tryCatch(.parse_openmeteo_point(el, lats[g[j]], lons[g[j]]),
-                        error = function(e) NULL)
-          if (!is.null(p)) p <- tryCatch(.fill_gaps(p), error = function(e) NULL)
-          if (!is.null(p)) out[[g[j]]] <- p   # never assign NULL: that deletes
-        }
-      }
-    }
+  got <- 0L
+  for (k in seq_len(n)) {
+    res <- tryCatch(
+      get_openmeteo_wth(lats[k], lons[k], start_date, end_date),
+      error = function(e) NULL)
+    if (!is.null(res)) { out[[k]] <- res; got <- got + 1L }  # never assign NULL
+    if (k %% 50 == 0 || k == n)
+      cat(sprintf("  ...fetched %d/%d cells (%d with data)\n", k, n, got))
     if (pause > 0) Sys.sleep(pause)
   }
-
-  # Fall back to single-point requests for any cell still missing.
-  missing <- which(vapply(out, is.null, logical(1)))
-  if (length(missing) > 0) {
-    cat(sprintf("  %d of %d cells missing after batched fetch; retrying singly\n",
-                length(missing), n))
-    for (k in missing) {
-      res <- tryCatch(
-        get_openmeteo_wth(lats[k], lons[k], start_date, end_date),
-        error = function(e) NULL)
-      if (!is.null(res)) out[[k]] <- res   # never assign NULL: that deletes
-      if (pause > 0) Sys.sleep(0.15)
-    }
-  }
-
-  ndata <- sum(!vapply(out, is.null, logical(1)))
-  cat(sprintf("  grid weather: %d of %d cells returned data\n", ndata, n))
+  cat(sprintf("  grid weather: %d of %d cells returned data\n", got, n))
   out
 }

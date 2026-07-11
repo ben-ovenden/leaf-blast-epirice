@@ -80,7 +80,7 @@ end_date <- Sys.Date() - ARCHIVE_LAG_DAYS
 # everywhere, so the table reflects current potential risk rather than a finished
 # past season. Per-site emergence overrides are still honoured if provided.
 rolling_emergence <- as.character(end_date - CROP_AGE_DAYS)
-sites <- as.data.table(SITES)
+sites <- as.data.table(MONITOR_TOWNS)
 if (!"emergence" %in% names(sites)) sites[, emergence := rolling_emergence]
 
 cat("Run date:   ", format(Sys.Date(), "%A %d %B %Y"), "\n")
@@ -116,7 +116,7 @@ summary_lines <- c(
   sprintf("Pre-season:%d", getn("pre-season")),
   sprintf("No data:   %d", getn("no data")),
   "",
-  "Site detail (current modelled leaf blast intensity):",
+  "Town detail (current modelled leaf blast intensity):",
   strrep("-", 60)
 )
 for (k in seq_len(nrow(results))) {
@@ -127,9 +127,27 @@ for (k in seq_len(nrow(results))) {
     sprintf("%-14s %s  %-10s %s%s", r$name, pct, r$level,
             ifelse(is.na(r$last_date), "", r$last_date), tr))
 }
-summary_lines <- c(summary_lines, strrep("-", 60),
-  "Intensity is the EPIRICE proportion of diseased sites. Risk band cut points",
-  "are provisional; calibrate against field observations before relying on them.",
+summary_lines <- c(summary_lines, "",
+  "About this estimate",
+  strrep("-", 60),
+  "Intensity is the EPIRICE model's output: the proportion of leaf tissue",
+  "(modelled as many small 'sites') that is diseased, from 0 to 100%. It is a",
+  "weather-driven potential, not a field measurement, so it reads near zero in",
+  "cool, dry conditions and rises in warm, humid, wet spells.",
+  "",
+  "How the model works, in brief:",
+  sprintf(" - It assumes a crop about %d days old and steps through the season day",
+          CROP_AGE_DAYS),
+  "   by day, tracking healthy, latent, infectious and removed leaf sites.",
+  " - Infection is favoured on days that are warm (optimum near 20C, useful",
+  "   roughly 18-28C) and wet (relative humidity at or above 90%, or rainfall",
+  "   at or above 5 mm).",
+  " - Disease can begin about 15 days after emergence, then builds through",
+  "   repeated cycles (latent period about 5 days, infectious about 20 days).",
+  "",
+  "The '7d' figure is the change in intensity over the last seven days. Risk",
+  "bands (low, moderate, high) are provisional cut points; calibrate them",
+  "against your own field observations before relying on them.",
   "",
   if (exists("CITATION")) CITATION else NULL)
 
@@ -146,6 +164,28 @@ writeLines(summary_text, file.path(OUT, sprintf("blast_summary_%s.txt", run_tag)
 # Stable "latest" copies so automation can reference a fixed filename
 fwrite(results, file.path(OUT, "blast_results_latest.csv"))
 writeLines(summary_text, file.path(OUT, "blast_summary_latest.txt"))
+
+# ---- Rolling town trends CSV (last HISTORY_RUNS runs, one column per run) ----
+# Wide format: one row per town, one column per run date, so a row reads left to
+# right as the trend. Persisted in the repo so it accumulates across weekly runs.
+today <- data.table(town = results$name)
+today[[run_tag]] <- round(results$intensity * 100, 3)
+hist_file <- file.path(OUT, "town_trends.csv")
+hist <- if (file.exists(hist_file))
+  fread(hist_file, header = TRUE, colClasses = list(character = "town")) else
+  data.table(town = character())
+if (run_tag %in% names(hist)) hist[, (run_tag) := NULL]   # re-run same day
+hist <- merge(hist, today, by = "town", all = TRUE)
+ord <- c(results$name, setdiff(hist$town, results$name))
+hist <- hist[match(ord, town)]
+keep_n <- if (exists("HISTORY_RUNS")) HISTORY_RUNS else 10L
+date_cols <- setdiff(names(hist), "town")
+date_cols <- date_cols[order(as.Date(date_cols))]
+if (length(date_cols) > keep_n) date_cols <- tail(date_cols, keep_n)
+hist <- hist[, c("town", date_cols), with = FALSE]
+fwrite(hist, hist_file)
+cat(sprintf("Town trends: %d towns x %d runs -> %s\n",
+            nrow(hist), length(date_cols), hist_file))
 
 band_col <- function(level) {
   vapply(level, function(l) switch(l,

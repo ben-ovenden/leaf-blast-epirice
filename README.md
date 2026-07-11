@@ -63,23 +63,26 @@ matching GeoTIFF, with a `blast_heatmap_latest.png` copy for convenience.
 
 Grid settings live in `blast_config.R`:
 
-- `GRID_EXTENT` and `GRID_RES`: area and resolution. The default is the continent
-  at 0.75 degree with the ocean masked out. Including coastal cells brings this to
-  roughly 1,400 land cells, about 89 per cent of the free Open-Meteo allowance
-  (10,000 calls per day) for a 60 day window. The runner prints an estimated call
-  budget each run and warns if a change pushes it over. If you see rate-limit
-  (429) errors, coarsen to 0.8 degree.
-- `LAND_ONLY`: keeps any cell touching land and clips the surface to the coast
-  (needs `ozmaps`). It spends no budget on open ocean.
-- `SHOW_COAST`, `SHOW_TOWNS`, `SHOW_ROADS`, `SHOW_RIVERS`: overlay toggles. Roads
-  and rivers are downloaded from Natural Earth at run time (needs `rnaturalearth`);
-  if a download fails the map still renders without that layer. `TOWNS` is an
-  editable table of labelled centres.
-- `CROP_AGE_DAYS`: the trailing crop age and weather window. Larger values give a
-  fuller season potential but cost more requests.
-- `SMOOTH_FACTOR`: display only smoothing; the model still runs at `GRID_RES`.
-- `HEAT_MAX`: fixes the colour scale for week to week comparability, or `NULL` to
-  auto scale each week.
+- Dynamic resolution with a weather cache. Each run keeps a weather cache
+  (`weather_cache.csv.gz`, committed to the repo, pruned to the 60 day window).
+  Points already in the cache only need their newest days fetched, which is cheap,
+  so the spare API budget is spent ADDING new points. The map therefore fills
+  coarse to fine over successive runs, reaching about 0.5 degree (~2,800 land
+  points over the continent) in roughly six weeks, then holds there. This keeps
+  every run inside the free Open-Meteo hourly limit (5,000 weighted calls).
+- `GRID_RES_FINEST`: the finest resolution the map refines toward (default 0.5).
+- `GRID_RES_LEVELS`: the coarse-to-fine fill order (each a whole multiple of
+  `GRID_RES_FINEST`).
+- `TARGET_CALLS_PER_RUN`: weighted-call budget per run (default 4,000, under the
+  5,000 per hour cap). Larger fills faster but risks rate limits.
+- `GRID_EXTENT`: the mapped area. Default is the Australian continent.
+- `LAND_ONLY`: keeps land points and clips the surface to the coast, using the
+  bundled `australia_land.geojson` (read with terra, no `sf`).
+- `SHOW_COAST`, `SHOW_TOWNS`, `SHOW_ROADS`, `SHOW_RIVERS`: overlay toggles. Coast,
+  rivers and roads come from the bundled GeoJSON files. `MONITOR_TOWNS` is the
+  editable list of towns, highlighted on the map and tracked in the trends CSV.
+- `CROP_AGE_DAYS`: the trailing crop age and weather window (default 60).
+- `HEAT_MAX`: fixes the colour scale (deepest red at this %); `NULL` auto-scales.
 
 A note on magnitude: EPIRICE intensity values are often small in absolute terms,
 especially early in a crop. The heatmap is most useful for the spatial pattern
