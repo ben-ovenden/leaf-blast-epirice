@@ -1,23 +1,36 @@
-# Weekly rice leaf blast risk (EPIRICE + Open-Meteo)
+# Weekly blast risk (EPIRICE + BLASTAM, Open-Meteo)
 
-A small, self contained pipeline that runs the EPIRICE leaf blast model each
-week from GitHub Actions, using free Open-Meteo weather, and writes a risk map,
-a table and a summary. Email delivery is optional.
+A small, self contained pipeline that runs two complementary blast models each
+week from GitHub Actions, using free Open-Meteo weather, and writes two risk
+maps, a town table and a summary. Email delivery is optional.
 
 ## What this is
 
-The disease model is the EPIRICE leaf blast model of Savary *et al.* (2012),
-implemented in the epicrop R package by Adam Sparks and colleagues. The core
-SEIR engine and the exact leaf blast parameters are vendored into
-`epirice_model.R` so the pipeline runs without installing the package. The only
-substitution is the weather source: `openmeteo_wth.R` replaces the package's
-NASA POWER downloader with the Open-Meteo historical archive, returning the same
-daily fields the model expects (mean temperature, mean relative humidity, and
-rainfall).
+Two models, run from one weather fetch:
 
-The model is a mechanistic epidemic simulation. From an emergence date it steps
-through the season day by day, tracking healthy, latent, infectious and removed
-leaf sites, and reports leaf blast intensity (the proportion of diseased sites).
+- **EPIRICE** (Savary *et al.* 2012), a mechanistic SEIR epidemic simulation.
+  From an emergence date it steps through the season day by day, tracking
+  healthy, latent, infectious and removed leaf sites, and reports leaf blast
+  **intensity** (the proportion of leaf tissue diseased). It answers: how much
+  disease has the season built up? The SEIR engine and leaf blast parameters are
+  vendored into `epirice_model.R` so no package install is needed.
+- **BLASTAM** (`blastam_model.R`), the Japanese infection-warning model of
+  Koshimizu (1988). For each day it judges whether conditions favoured a new
+  infection, and counts the favourable **infection days in the last 21 days** (`BLASTAM_WINDOW_DAYS`). A day is favourable
+  when leaf wetness is at least 10 hours, the mean temperature during wetness is
+  15-25 C, and the preceding 5-day mean temperature is 20-25 C (the criteria as
+  operated by Japanese prefectural plant-protection stations). Leaf wetness is
+  estimated from hourly humidity (>=90%) and rainfall, since ERA5 has no
+  measured leaf-wetness variable. See `blastam_model.R` for parameters and refs.
+
+The two are complementary: BLASTAM flags when infection windows open (early
+warning), while EPIRICE estimates the disease that may follow. Each run produces
+a map and a rolling trends CSV for each model.
+
+`openmeteo_wth.R` fetches the Open-Meteo historical archive. A single hourly
+fetch per point feeds BLASTAM (leaf-wetness nights) and is aggregated to the
+daily fields EPIRICE expects, so both models share the same weather at no extra
+API cost.
 A day counts as wet, and therefore infection favourable, when mean relative
 humidity is at or above 90 per cent or rainfall is at or above 5 mm, which are
 the published thresholds.

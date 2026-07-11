@@ -21,12 +21,17 @@ SCRIPT_DIR <- tryCatch(
 )
 
 source(file.path(SCRIPT_DIR, "epirice_model.R"))
+source(file.path(SCRIPT_DIR, "blastam_model.R"))
 source(file.path(SCRIPT_DIR, "openmeteo_wth.R"))
 source(file.path(SCRIPT_DIR, "blast_config.R"))
 
-# A weather-fetch hook, so tests can inject synthetic weather. Defaults to the
-# live Open-Meteo adapter.
-if (!exists("WTH_FN")) WTH_FN <- get_openmeteo_wth
+# Weather-fetch hook (tests inject synthetic data). Fetches hourly and returns
+# daily rows carrying both EPIRICE inputs and the BLASTAM night judgement.
+if (!exists("WTH_FN")) WTH_FN <- function(lat, lon, start_date, end_date) {
+  hw <- get_openmeteo_hourly(lat, lon, start_date, end_date)
+  if (is.null(hw) || nrow(hw) == 0) return(NULL)
+  blastam_daily_from_hourly(hw)
+}
 
 classify <- function(intensity) {
   if (is.na(intensity)) return("no data")
@@ -39,26 +44,39 @@ run_site <- function(name, lat, lon, emergence, end_date) {
   na_row <- data.table(name = name, lat = lat, lon = lon,
                        intensity = NA_real_, peak = NA_real_,
                        trend7 = NA_real_, level = "no data",
-                       last_date = NA_character_, days = 0L)
+                       last_date = NA_character_, days = 0L,
+                       blast_events = NA_integer_, blast_recent = NA_integer_)
 
   if (end_date <= as.Date(emergence) + MIN_DAYS) {
     na_row[, level := "pre-season"]
     return(na_row)
   }
 
-  wth <- tryCatch(
+  dd <- tryCatch(
     WTH_FN(lat = lat, lon = lon, start_date = emergence, end_date = end_date),
     error = function(e) NULL
   )
-  if (is.null(wth) || nrow(wth) < MIN_DAYS) return(na_row)
+  if (is.null(dd) || nrow(dd) < MIN_DAYS) return(na_row)
 
+  # BLASTAM: infection-favoured days (total over window, and last 7 days)
+  bs <- blastam_score(dd$infect, dd$semi, as.Date(dd$date), end_date,
+                      window = if (exists("BLASTAM_WINDOW_DAYS")) BLASTAM_WINDOW_DAYS else 21L,
+                      recent = 7L)
+
+  # EPIRICE: build daily weather and run the SEIR
+  wth <- data.table(YYYYMMDD = as.Date(dd$date),
+                    DOY = as.integer(format(as.Date(dd$date), "%j")),
+                    TEMP = dd$TEMP, RHUM = dd$RHUM, RAIN = dd$RAIN, LAT = lat, LON = lon)
+  setorder(wth, YYYYMMDD)
   duration <- as.integer(min(120L, nrow(wth)))
-
   lb <- tryCatch(
     predict_leaf_blast(wth, emergence = emergence, duration = duration),
     error = function(e) NULL
   )
-  if (is.null(lb) || nrow(lb) == 0) return(na_row)
+  if (is.null(lb) || nrow(lb) == 0) {
+    na_row[, `:=`(blast_events = bs$events, blast_recent = bs$recent)]
+    return(na_row)
+  }
 
   cur  <- lb$intensity[nrow(lb)]
   peak <- max(lb$intensity, na.rm = TRUE)
@@ -68,7 +86,8 @@ run_site <- function(name, lat, lon, emergence, end_date) {
              intensity = cur, peak = peak, trend7 = trend7,
              level = classify(cur),
              last_date = as.character(lb$dates[nrow(lb)]),
-             days = duration)
+             days = duration,
+             blast_events = bs$events, blast_recent = bs$recent)
 }
 
 # ---- Run all sites --------------------------------------------------------
@@ -99,55 +118,67 @@ results <- rbindlist(lapply(seq_len(nrow(sites)), function(k) {
   r
 }))
 
+# Attach state and order by state then town (alphabetical within state)
+st <- as.data.table(MONITOR_TOWNS)[, .(name, state)]
+results <- merge(results, st, by = "name", all.x = TRUE, sort = FALSE)
+results[is.na(state), state := "--"]
+setorder(results, state, name)
+
 # ---- Summary --------------------------------------------------------------
 counts <- results[, .N, by = level]
 getn <- function(lv) { x <- counts[level == lv, N]; if (length(x)) x else 0L }
 
 summary_lines <- c(
-  "Rice leaf blast risk summary",
+  "Blast risk summary",
   strrep("=", 60),
   paste0("Generated:  ", format(Sys.Date(), "%A %d %B %Y")),
-  paste0("Model:      EPIRICE leaf blast (Savary et al. 2012)"),
+  paste0("Models:     EPIRICE (Savary et al. 2012) + BLASTAM (Koshimizu 1988)"),
   paste0("Weather:    Open-Meteo ERA5 archive, to ", format(end_date, "%Y-%m-%d")),
   "",
-  sprintf("High:      %d", getn("high")),
-  sprintf("Moderate:  %d", getn("moderate")),
-  sprintf("Low:       %d", getn("low")),
-  sprintf("Pre-season:%d", getn("pre-season")),
-  sprintf("No data:   %d", getn("no data")),
+  sprintf("EPIRICE bands  High:%d  Moderate:%d  Low:%d  Pre-season:%d  No data:%d",
+          getn("high"), getn("moderate"), getn("low"),
+          getn("pre-season"), getn("no data")),
   "",
-  "Town detail (current modelled leaf blast intensity):",
+  sprintf("Town detail: EPIRICE intensity + BLASTAM favourable days (last %d), by state:", BLASTAM_WINDOW_DAYS),
   strrep("-", 60)
 )
+cur_state <- ""
 for (k in seq_len(nrow(results))) {
   r <- results[k]
+  if (r$state != cur_state) {
+    cur_state <- r$state
+    summary_lines <- c(summary_lines, "", paste0("[", cur_state, "]"))
+  }
   pct <- if (is.na(r$intensity)) "  -  " else sprintf("%5.1f%%", r$intensity * 100)
-  tr  <- if (is.na(r$trend7)) "" else sprintf("  7d %+0.1f pts", r$trend7 * 100)
+  bl  <- if (is.na(r$blast_events)) "-" else
+    sprintf("%d days (7d %d)", r$blast_events, r$blast_recent)
   summary_lines <- c(summary_lines,
-    sprintf("%-14s %s  %-10s %s%s", r$name, pct, r$level,
-            ifelse(is.na(r$last_date), "", r$last_date), tr))
+    sprintf("  %-14s EPIRICE %s %-9s  BLASTAM %s", r$name, pct, r$level, bl))
 }
 summary_lines <- c(summary_lines, "",
-  "About this estimate",
+  "About these estimates: two different models",
   strrep("-", 60),
-  "Intensity is the EPIRICE model's output: the proportion of leaf tissue",
-  "(modelled as many small 'sites') that is diseased, from 0 to 100%. It is a",
-  "weather-driven potential, not a field measurement, so it reads near zero in",
-  "cool, dry conditions and rises in warm, humid, wet spells.",
+  "EPIRICE (intensity %) mechanistically simulates the whole epidemic. It steps",
+  sprintf("through a crop about %d days old, tracking healthy, latent, infectious", CROP_AGE_DAYS),
+  "and removed leaf sites, and reports the proportion of leaf tissue diseased",
+  "(0-100%). It answers: how much disease has the season built up? It is slow and",
+  "cumulative, and reads near zero in cool, dry conditions.",
   "",
-  "How the model works, in brief:",
-  sprintf(" - It assumes a crop about %d days old and steps through the season day",
-          CROP_AGE_DAYS),
-  "   by day, tracking healthy, latent, infectious and removed leaf sites.",
-  " - Infection is favoured on days that are warm (optimum near 20C, useful",
-  "   roughly 18-28C) and wet (relative humidity at or above 90%, or rainfall",
-  "   at or above 5 mm).",
-  " - Disease can begin about 15 days after emergence, then builds through",
-  "   repeated cycles (latent period about 5 days, infectious about 20 days).",
+  "BLASTAM (infection days) is the Japanese infection-warning model (Koshimizu",
+  "1988). For each day it judges whether conditions favoured a NEW infection, and",
+  "counts the favourable days in the last 21 days. A day is favourable when all three",
+  "hold: leaf wetness >=10 h; mean temperature during wetness 15-25 C; and the",
+  "preceding 5-day mean temperature 20-25 C. (If wetness >=10 h but one",
+  "temperature is out of range, the day is only semi-favourable.) It answers: how",
+  "often have conditions recently favoured NEW infections? It is fast and",
+  "event-based, and responds to humid, wet spells before disease builds up.",
   "",
-  "The '7d' figure is the change in intensity over the last seven days. Risk",
-  "bands (low, moderate, high) are provisional cut points; calibrate them",
-  "against your own field observations before relying on them.",
+  "Used together: BLASTAM flags when infection windows open (useful for timing a",
+  "response), while EPIRICE estimates the disease that may result. Leaf wetness",
+  "is estimated from hourly humidity (>=90%) and rain; both models read low in",
+  "cool, dry weather.",
+  "",
+  "Bands and thresholds are provisional; calibrate against field observations.",
   "",
   if (exists("CITATION")) CITATION else NULL)
 
@@ -165,27 +196,112 @@ writeLines(summary_text, file.path(OUT, sprintf("blast_summary_%s.txt", run_tag)
 fwrite(results, file.path(OUT, "blast_results_latest.csv"))
 writeLines(summary_text, file.path(OUT, "blast_summary_latest.txt"))
 
-# ---- Rolling town trends CSV (last HISTORY_RUNS runs, one column per run) ----
+# ---- Pretty HTML email body ----------------------------------------------
+band_bg <- function(l) switch(l, low = "#E8F1F8", moderate = "#FDB147",
+                              high = "#E8492B", "#EFEFEF")
+band_fg <- function(l) if (identical(l, "high")) "#FFFFFF" else "#22272B"
+pill <- function(label, n, bg, fg) sprintf(
+  paste0("<span style='display:inline-block;background:%s;color:%s;padding:4px 12px;",
+         "border-radius:14px;margin-right:6px;font-size:13px;'>%s %d</span>"),
+  bg, fg, label, n)
+
+row_html <- character(0); cur <- ""
+bl_bg <- function(n) if (is.na(n)) "#FFFFFF" else if (n == 0) "#F7F7FA" else
+  if (n < 5) "#E5E1F0" else if (n < 10) "#CBC9E2" else if (n < 20) "#9E9AC8" else "#756BB1"
+bl_fg <- function(n) if (!is.na(n) && n >= 20) "#FFFFFF" else "#22272B"
+for (k in seq_len(nrow(results))) {
+  r <- results[k]
+  if (r$state != cur) {
+    cur <- r$state
+    row_html <- c(row_html, sprintf(
+      paste0("<tr><td colspan='5' style='background:#F0F3F6;font-weight:bold;",
+             "padding:6px 8px;border-top:1px solid #DDE2E6;'>%s</td></tr>"), cur))
+  }
+  pct <- if (is.na(r$intensity)) "-" else sprintf("%.2f%%", r$intensity * 100)
+  tr  <- if (is.na(r$trend7)) "" else sprintf("%+0.2f", r$trend7 * 100)
+  blv <- if (is.na(r$blast_events)) "-" else
+    sprintf("%d<span style='color:#8a8f94;font-size:11px;'> (7d %d)</span>",
+            r$blast_events, r$blast_recent)
+  row_html <- c(row_html, sprintf(
+    paste0("<tr><td style='padding:5px 8px;border-top:1px solid #EEE;'>%s</td>",
+           "<td style='padding:5px 8px;border-top:1px solid #EEE;text-align:right;'>%s</td>",
+           "<td style='padding:5px 8px;border-top:1px solid #EEE;'>",
+           "<span style='background:%s;color:%s;padding:2px 9px;border-radius:10px;",
+           "font-size:12px;'>%s</span></td>",
+           "<td style='padding:5px 8px;border-top:1px solid #EEE;text-align:right;",
+           "color:#6b7378;'>%s</td>",
+           "<td style='padding:5px 8px;border-top:1px solid #EEE;text-align:right;",
+           "background:%s;color:%s;'>%s</td></tr>"),
+    r$name, pct, band_bg(r$level), band_fg(r$level), r$level, tr,
+    bl_bg(r$blast_events), bl_fg(r$blast_events), blv))
+}
+
+html <- paste0(
+"<div style='font-family:Arial,Helvetica,sans-serif;color:#22272B;max-width:720px;margin:auto;'>",
+"<div style='background:#002664;color:#fff;padding:16px 20px;border-radius:6px 6px 0 0;'>",
+"<div style='font-size:19px;font-weight:bold;'>Blast risk summary</div>",
+sprintf("<div style='font-size:13px;opacity:.9;'>%s</div>", format(Sys.Date(), "%A %d %B %Y")),
+"</div>",
+"<div style='padding:16px 20px;border:1px solid #E0E0E0;border-top:none;border-radius:0 0 6px 6px;'>",
+sprintf(paste0("<p style='margin:0 0 12px;'>Two models for %d monitoring towns, from ",
+        "Open-Meteo ERA5 weather to %s. <b>EPIRICE intensity</b> is how much disease the ",
+        "season has built up; <b>BLASTAM days</b> is how many of the last 21 days favoured a ",
+        "new infection. Both are weather-driven potentials, not field measurements.</p>"),
+        nrow(results), format(end_date, "%d %b %Y")),
+"<p style='margin:0 0 14px;'>",
+"<span style='font-size:12px;color:#6b7378;margin-right:8px;'>EPIRICE bands:</span>",
+pill("High", getn("high"), "#E8492B", "#fff"),
+pill("Moderate", getn("moderate"), "#FDB147", "#22272B"),
+pill("Low", getn("low"), "#E8F1F8", "#22272B"),
+"</p>",
+"<table style='border-collapse:collapse;width:100%;font-size:13px;'>",
+"<thead><tr style='text-align:left;border-bottom:2px solid #002664;'>",
+"<th style='padding:6px 8px;'>Town</th>",
+"<th style='padding:6px 8px;text-align:right;'>EPIRICE %</th>",
+"<th style='padding:6px 8px;'>Risk</th>",
+"<th style='padding:6px 8px;text-align:right;'>7-day pts</th>",
+"<th style='padding:6px 8px;text-align:right;'>BLASTAM days</th></tr></thead><tbody>",
+paste(row_html, collapse = ""),
+"</tbody></table>",
+paste0("<p style='font-size:12px;color:#6b7378;margin:14px 0 0;'><b>EPIRICE</b> (intensity %) ",
+       "mechanistically simulates the epidemic: the proportion of leaf tissue diseased. ",
+       "<b>BLASTAM</b> (days) counts the days in the last 21 that were favourable for a NEW infection, when leaf wetness is ",
+       "&ge;10&nbsp;h, the mean temperature during wetness is 15-25&deg;C, and the preceding ",
+       "5-day mean temperature is 20-25&deg;C. EPIRICE says how much disease may build; BLASTAM ",
+       "flags when infection windows open. Leaf wetness is estimated from humidity (&ge;90%) and ",
+       "rain; both read low in cool, dry weather. Two maps and two trends CSVs are attached. ",
+       "Values are provisional.</p>"),
+paste0("<p style='font-size:11px;color:#9aa0a6;margin:10px 0 0;'>EPIRICE: Savary ",
+       "<em>et al.</em> 2012 (Crop Prot. 34:6-17); epicrop (A.H. Sparks). BLASTAM: ",
+       "Koshimizu 1988 (Bull. Tohoku Natl. Agric. Exp. Stn. 78:67-121); Hayashi &amp; ",
+       "Koshimizu 1988. Weather: Open-Meteo ERA5 (CC BY 4.0).</p>"),
+"</div></div>")
+writeLines(html, file.path(OUT, "blast_summary_latest.html"))
+
+# ---- Rolling trends CSVs (last HISTORY_RUNS runs, one column per run) ------
 # Wide format: one row per town, one column per run date, so a row reads left to
-# right as the trend. Persisted in the repo so it accumulates across weekly runs.
-today <- data.table(town = results$name)
-today[[run_tag]] <- round(results$intensity * 100, 3)
-hist_file <- file.path(OUT, "town_trends.csv")
-hist <- if (file.exists(hist_file))
-  fread(hist_file, header = TRUE, colClasses = list(character = "town")) else
-  data.table(town = character())
-if (run_tag %in% names(hist)) hist[, (run_tag) := NULL]   # re-run same day
-hist <- merge(hist, today, by = "town", all = TRUE)
-ord <- c(results$name, setdiff(hist$town, results$name))
-hist <- hist[match(ord, town)]
-keep_n <- if (exists("HISTORY_RUNS")) HISTORY_RUNS else 10L
-date_cols <- setdiff(names(hist), "town")
-date_cols <- date_cols[order(as.Date(date_cols))]
-if (length(date_cols) > keep_n) date_cols <- tail(date_cols, keep_n)
-hist <- hist[, c("town", date_cols), with = FALSE]
-fwrite(hist, hist_file)
-cat(sprintf("Town trends: %d towns x %d runs -> %s\n",
-            nrow(hist), length(date_cols), hist_file))
+# right as the trend. Persisted in the repo so they accumulate across runs.
+write_trends <- function(values, file_name) {
+  today <- data.table(town = results$name)
+  today[[run_tag]] <- values
+  f <- file.path(OUT, file_name)
+  hist <- if (file.exists(f))
+    fread(f, header = TRUE, colClasses = list(character = "town")) else
+    data.table(town = character())
+  if (run_tag %in% names(hist)) hist[, (run_tag) := NULL]   # re-run same day
+  hist <- merge(hist, today, by = "town", all = TRUE)
+  ord <- c(results$name, setdiff(hist$town, results$name))
+  hist <- hist[match(ord, town)]
+  keep_n <- if (exists("HISTORY_RUNS")) HISTORY_RUNS else 10L
+  dcols <- setdiff(names(hist), "town")
+  dcols <- dcols[order(as.Date(dcols))]
+  if (length(dcols) > keep_n) dcols <- tail(dcols, keep_n)
+  hist <- hist[, c("town", dcols), with = FALSE]
+  fwrite(hist, f)
+  cat(sprintf("Trends: %d towns x %d runs -> %s\n", nrow(hist), length(dcols), f))
+}
+write_trends(round(results$intensity * 100, 3), "town_trends.csv")     # EPIRICE %
+write_trends(as.integer(results$blast_events),  "blastam_trends.csv")  # BLASTAM days
 
 band_col <- function(level) {
   vapply(level, function(l) switch(l,

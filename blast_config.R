@@ -107,6 +107,21 @@ WRITE_GEOTIFF <- TRUE
 # Heatmap colour ramp, low -> high: light blue through to dark red.
 HEAT_COLOURS <- c("#BFE0F5", "#FFF6B0", "#FDB147", "#E8492B", "#8B0000")
 
+# BLASTAM infection-days heatmap: a distinct sequential purple ramp (few -> many
+# favourable infection days), so it is not confused with the EPIRICE map.
+BLASTAM_HEAT_COLOURS <- c("#F2F0F7", "#CBC9E2", "#9E9AC8", "#756BB1", "#54278F")
+
+# BLASTAM reporting window: the map, town table and trends count FAVOURABLE
+# infection days over the most recent BLASTAM_WINDOW_DAYS, to show where infection
+# pressure is building now (not a whole-season total). EPIRICE keeps its own
+# CROP_AGE_DAYS window; only the cached daily flags are shared.
+BLASTAM_WINDOW_DAYS <- 21
+
+# Deepest colour at this many favourable days within the 21-day window (the max
+# possible is the window length). PROVISIONAL: lower it (e.g. 14) to make
+# building pressure show up more strongly. NULL auto-scales each week.
+BLASTAM_HEAT_MAX <- 21
+
 # Overlay layers on the heatmap
 SHOW_COAST  <- TRUE
 SHOW_TOWNS  <- TRUE
@@ -127,6 +142,11 @@ MONITOR_TOWNS <- data.frame(
            "Proserpine", "Home Hill", "Lakeland", "Archer River", "Bamaga",
            "Croydon", "Burketown", "Borroloola", "Katherine", "Humpty Doo",
            "Jabiru", "Timber Creek", "Kununurra"),
+  state = c("QLD", "NSW", "QLD", "QLD", "QLD", "NSW",
+            "NSW", "NSW", "QLD", "QLD", "QLD", "QLD",
+            "QLD", "QLD", "QLD", "QLD", "QLD",
+            "QLD", "QLD", "NT", "NT", "NT",
+            "NT", "NT", "WA"),
   lon  = c(145.596, 153.277, 152.665, 151.262, 152.034, 146.040,
            144.958, 149.841, 148.159, 147.639, 150.503, 148.947,
            148.581, 147.415, 144.851, 142.940, 142.386,
@@ -158,20 +178,23 @@ HEAT_MAX <- 2
 # package. BLASTL is cited as the related Japanese epidemic-progression model
 # (conceptual lineage), not as the implemented code.
 CITATION <- paste(
-  "Model and data citation",
+  "Models and data citation",
   "------------------------------------------------------------",
-  "Model: EPIRICE. Savary, S., Nelson, A., Willocquet, L., Pangga, I.,",
+  "EPIRICE (intensity): Savary, S., Nelson, A., Willocquet, L., Pangga, I.,",
   "  and Aunario, J. (2012). Modeling and mapping potential epidemics of",
   "  rice diseases globally. Crop Protection 34: 6-17.",
   "  doi:10.1016/j.cropro.2011.11.009",
-  "Software: epicrop R package (leaf blast parameters and SEIR engine),",
-  "  Adam H. Sparks and colleagues; adapted from cropsim (Hijmans et al. 2009).",
-  "SEIR framework: Zadoks, J.C. (1971). Phytopathology 61: 600-610.",
+  "  Software: epicrop R package (SEIR engine), A.H. Sparks and colleagues,",
+  "  adapted from cropsim (Hijmans et al. 2009). Framework: Zadoks (1971).",
+  "BLASTAM (infection days): infection-warning model of Koshimizu, Y. (1988),",
+  "  A forecasting method for occurrence of rice leaf blast with AMeDAS data,",
+  "  Bull. Tohoku Natl. Agric. Exp. Stn. 78: 67-121; program in Hayashi, T. and",
+  "  Koshimizu, Y. (1988), ibid. 78: 123-138 [in Japanese]. A day is favourable",
+  "  when leaf wetness >=10 h, mean temperature during wetness 15-25 C, and the",
+  "  preceding 5-day mean temperature 20-25 C (as operated by Japanese",
+  "  prefectural plant-protection stations). Leaf wetness estimated from hourly",
+  "  humidity and rainfall.",
   "Weather: Open-Meteo ERA5 archive (data CC BY 4.0).",
-  "Related model (BLASTL, conceptual lineage): Hashimoto, A., Hirano, K.,",
-  "  and Matsumoto, K. (1984). Studies on the forecasting of rice leaf blast",
-  "  development by application of the computer simulation. Special Bulletin",
-  "  of Fukushima Prefecture Agricultural Experiment Station 2: 1-104.",
   sep = "\n"
 )
 
