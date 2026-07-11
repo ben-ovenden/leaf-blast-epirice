@@ -28,23 +28,47 @@ if (!exists("GRID_FETCH_FN")) GRID_FETCH_FN <- get_openmeteo_grid
 
 ext <- GRID_EXTENT
 
-# ---- Land polygon ----------------------------------------------------------
+# Land polygon. Try each source independently so one failing does not abort the
+# others. Returns a SpatVector or NULL.
 get_land <- function() {
-  tryCatch({
+  if (requireNamespace("sf", quietly = TRUE)) try(sf::sf_use_s2(FALSE), silent = TRUE)
+
+  # 1) ozmaps
+  v <- tryCatch({
     if (requireNamespace("ozmaps", quietly = TRUE) &&
-        requireNamespace("sf", quietly = TRUE)) {
-      terra::vect(sf::st_union(ozmaps::ozmap_country))
-    } else if (requireNamespace("rnaturalearth", quietly = TRUE)) {
+        requireNamespace("sf", quietly = TRUE))
+      terra::vect(sf::st_union(sf::st_make_valid(ozmaps::ozmap_country)))
+    else NULL
+  }, error = function(e) NULL)
+  if (!is.null(v)) return(v)
+
+  # 2) rnaturalearth
+  v <- tryCatch({
+    if (requireNamespace("rnaturalearth", quietly = TRUE))
       terra::vect(rnaturalearth::ne_countries(country = "Australia",
                                               returnclass = "sf"))
-    } else if (requireNamespace("maps", quietly = TRUE) &&
-               requireNamespace("sf", quietly = TRUE)) {
+    else NULL
+  }, error = function(e) NULL)
+  if (!is.null(v)) return(v)
+
+  # 3) maps
+  v <- tryCatch({
+    if (requireNamespace("maps", quietly = TRUE) &&
+        requireNamespace("sf", quietly = TRUE)) {
       m <- maps::map("world", "Australia", plot = FALSE, fill = TRUE)
       terra::vect(sf::st_make_valid(sf::st_as_sf(m)))
     } else NULL
   }, error = function(e) NULL)
+  v
 }
 land_poly <- if (isTRUE(LAND_ONLY)) get_land() else NULL
+
+if (isTRUE(LAND_ONLY) && is.null(land_poly)) {
+  stop("LAND_ONLY is TRUE but no Australia polygon could be built (ozmaps, ",
+       "rnaturalearth and maps all unavailable). Without the mask the run would ",
+       "fetch the whole ocean box and exceed the free API budget. Install one of ",
+       "those packages, or set LAND_ONLY <- FALSE deliberately.", call. = FALSE)
+}
 
 # ---- Build grid: keep every cell that TOUCHES land (no coastal gaps) -------
 r0 <- terra::rast(xmin = ext[1], xmax = ext[2], ymin = ext[3], ymax = ext[4],

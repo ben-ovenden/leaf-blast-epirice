@@ -180,7 +180,7 @@ get_openmeteo_grid <- function(lats, lons, start_date, end_date,
           p <- tryCatch(.parse_openmeteo_point(el, lats[g[j]], lons[g[j]]),
                         error = function(e) NULL)
           if (!is.null(p)) p <- tryCatch(.fill_gaps(p), error = function(e) NULL)
-          out[[g[j]]] <- p
+          if (!is.null(p)) out[[g[j]]] <- p   # never assign NULL: that deletes
         }
       }
     }
@@ -193,9 +193,10 @@ get_openmeteo_grid <- function(lats, lons, start_date, end_date,
     cat(sprintf("  %d of %d cells missing after batched fetch; retrying singly\n",
                 length(missing), n))
     for (k in missing) {
-      out[[k]] <- tryCatch(
+      res <- tryCatch(
         get_openmeteo_wth(lats[k], lons[k], start_date, end_date),
         error = function(e) NULL)
+      if (!is.null(res)) out[[k]] <- res   # never assign NULL: that deletes
       if (pause > 0) Sys.sleep(0.15)
     }
   }
