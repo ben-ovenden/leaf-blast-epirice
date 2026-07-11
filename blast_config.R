@@ -77,6 +77,8 @@ GRID_RES_FINEST <- 0.5              # finest resolution the map refines toward
 GRID_RES_LEVELS <- c(2.0, 1.0, 0.5) # coarse-to-fine fill order; each must be a
                                     # whole-number multiple of GRID_RES_FINEST
 TARGET_CALLS_PER_RUN <- 4000        # weighted-call budget per run (< 5000/hour)
+GRID_CONC           <- 6            # grid points fetched concurrently (Linux runner)
+GRID_TARGET_PER_MIN <- 450          # weighted-call rate cap while fetching (< 600/min)
 WEATHER_CACHE_FILE   <- "weather_cache.csv.gz"  # in OUTPUT_DIR, committed to git
 
 # Legacy fixed resolution (no longer used by the dynamic runner; kept for

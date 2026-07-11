@@ -120,15 +120,34 @@ fetch_point <- function(lon, lat, start) {
              semi = as.integer(w$semi))
 }
 new_rows <- list()
-rate_per_sec <- 6
+# Parallel, rate-limited fetch. Points are fetched in chunks of GRID_CONC at once
+# (mclapply forks on Linux; serial on Windows), and each chunk is held to at least
+# a minimum duration so the weighted-call rate stays under GRID_TARGET_PER_MIN
+# (< the 600/min limit) whether the archive responds fast or slow. This overlaps
+# the slow cold hourly requests instead of doing them one at a time.
+GRID_CONC <- if (exists("GRID_CONC")) GRID_CONC else 6L
+GRID_TARGET_PER_MIN <- if (exists("GRID_TARGET_PER_MIN")) GRID_TARGET_PER_MIN else 450
 pace_mult <- if (exists("GRID_PACE")) GRID_PACE else 1
 do_fetch <- function(tab, start_fun, label, cost) {
-  got <- 0L
-  for (i in seq_len(nrow(tab))) {
-    r <- fetch_point(tab$lon[i], tab$lat[i], start_fun(tab$pid[i]))
-    if (!is.null(r)) { new_rows[[length(new_rows) + 1L]] <<- r; got <- got + 1L }
-    if (i %% 100 == 0 || i == nrow(tab)) cat(sprintf("  %s %d/%d (%d ok)\n", label, i, nrow(tab), got))
-    if (pace_mult > 0) Sys.sleep((cost / rate_per_sec) * pace_mult)
+  n <- nrow(tab); got <- 0L
+  min_chunk_s <- (GRID_CONC * cost) / (GRID_TARGET_PER_MIN / 60)  # hold the rate
+  i <- 1L
+  while (i <= n) {
+    j <- min(i + GRID_CONC - 1L, n)
+    t0 <- Sys.time()
+    idx <- i:j
+    chunk <- tryCatch(
+      parallel::mclapply(idx, function(m)
+        fetch_point(tab$lon[m], tab$lat[m], start_fun(tab$pid[m])), mc.cores = GRID_CONC),
+      error = function(e) lapply(idx, function(m)
+        fetch_point(tab$lon[m], tab$lat[m], start_fun(tab$pid[m]))))
+    for (r in chunk) if (is.data.frame(r) && nrow(r) > 0) {
+      new_rows[[length(new_rows) + 1L]] <<- r; got <- got + 1L
+    }
+    if (j %% 100 < GRID_CONC || j == n) cat(sprintf("  %s %d/%d (%d ok)\n", label, j, n, got))
+    el <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+    if (pace_mult > 0 && el < min_chunk_s) Sys.sleep((min_chunk_s - el) * pace_mult)
+    i <- j + 1L
   }
 }
 if (nrow(maintain) > 0) {
@@ -146,6 +165,7 @@ cache <- unique(cache, by = c("pid", "date"), fromLast = TRUE)
 
 # ---- Model both per point --------------------------------------------------
 run_tag <- format(Sys.Date(), "%Y-%m-%d")
+writeLines(run_tag, file.path(OUT, "run_date.txt"))  # so the email attaches the exact files
 model_pt <- function(dt) {
   epi <- NA_real_
   if (nrow(dt) >= 20) {
