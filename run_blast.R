@@ -149,12 +149,33 @@ setorder(results, state, name)
 counts <- results[, .N, by = level]
 getn <- function(lv) { x <- counts[level == lv, N]; if (length(x)) x else 0L }
 
+# Read the grid's map stats (written by run_blast_grid.R) into a one-line note so
+# the reader can see the cache growing and the map sharpening week to week.
+map_growth_line <- function() {
+  f <- file.path(SCRIPT_DIR, OUTPUT_DIR, "map_stats.txt")
+  if (!file.exists(f)) return(NULL)
+  s <- tryCatch(strsplit(readLines(f, warn = FALSE)[1], "\\|")[[1]],
+                error = function(e) NULL)
+  if (length(s) < 4) return(NULL)
+  now <- as.integer(s[1]); sp <- as.numeric(s[2])
+  prev <- as.integer(s[3]); finest <- as.numeric(s[4])
+  chg <- if (is.na(prev) || prev <= 0) ""
+         else if (now > prev) sprintf(" (up from %d last week)", prev)
+         else " (steady)"
+  at_target <- !is.na(sp) && !is.na(finest) && sp <= finest * 1.05
+  tail <- if (at_target) "; at target resolution"
+          else sprintf("; sharpening toward ~%.2f deg", finest)
+  sprintf("%d grid points at ~%.2f deg spacing%s%s", now, sp, chg, tail)
+}
+mg <- map_growth_line()
+
 summary_lines <- c(
   "Blast risk summary",
   strrep("=", 60),
   paste0("Generated:  ", format(Sys.Date(), "%A %d %B %Y")),
   paste0("Models:     EPIRICE (Savary et al. 2012) + BLASTAM (Koshimizu 1988)"),
   paste0("Weather:    Open-Meteo ERA5 archive, to ", format(end_date, "%Y-%m-%d")),
+  if (!is.null(mg)) paste0("Map:        ", mg) else NULL,
   "",
   sprintf("EPIRICE bands  High:%d  Moderate:%d  Low:%d  Pre-season:%d  No data:%d",
           getn("high"), getn("moderate"), getn("low"),
@@ -270,6 +291,9 @@ sprintf(paste0("<p style='margin:0 0 12px;'>Two models for %d monitoring towns, 
         "season has built up; <b>BLASTAM days</b> is how many of the last 21 days favoured a ",
         "new infection. Both are weather-driven potentials, not field measurements.</p>"),
         nrow(results), format(end_date, "%d %b %Y")),
+if (!is.null(mg))
+  sprintf(paste0("<p style='margin:-4px 0 12px;font-size:12px;color:#6b7378;'>",
+                 "<b>Map:</b> %s.</p>"), mg) else "",
 "<p style='margin:0 0 14px;'>",
 "<span style='font-size:12px;color:#6b7378;margin-right:8px;'>EPIRICE bands:</span>",
 pill("High", getn("high"), "#E8492B", "#fff"),

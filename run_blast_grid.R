@@ -205,8 +205,8 @@ model_pt <- function(dt) {
 pm <- cache[, { m <- model_pt(.SD); .(lon = lon[1], lat = lat[1],
               intensity = m$intensity, events = m$events) }, by = pid]
 pm_epi <- pm[!is.na(intensity)]
-cat(sprintf("Modelled %d points; effective spacing ~%.2f deg\n", nrow(pm),
-            if (nrow(pm) > 0) sqrt(prod(ext[c(2,4)] - ext[c(1,3)]) / nrow(pm)) else NA))
+map_spacing <- if (nrow(pm) > 0) sqrt(prod(ext[c(2,4)] - ext[c(1,3)]) / nrow(pm)) else NA
+cat(sprintf("Modelled %d points; effective spacing ~%.2f deg\n", nrow(pm), map_spacing))
 
 # ---- Render helper (IDW surface -> PNG + GeoTIFF) -------------------------
 load_bundled <- function(fname) {
@@ -266,3 +266,10 @@ csv[, `:=`(TEMP = round(TEMP, 1), RHUM = round(RHUM, 0), RAIN = round(RAIN, 1),
            lon = round(lon, 4), lat = round(lat, 4))]
 fwrite(csv, cache_file)
 cat(sprintf("Cache saved: %d points -> %s\nDone.\n", length(unique(cache$pid)), cache_file))
+
+# Small stats line for the email: current points, spacing, last week's points,
+# and the target finest spacing, so the reader can see the map sharpening.
+writeLines(sprintf("%d|%.2f|%d|%.2f",
+                   length(unique(cache$pid)), map_spacing,
+                   length(cached_pids), GRID_RES_FINEST),
+           file.path(OUT, "map_stats.txt"))
