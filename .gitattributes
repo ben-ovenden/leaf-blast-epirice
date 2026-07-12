@@ -1,0 +1,4 @@
+# Keep the weather cache as plain LF text so git never mangles it on checkout.
+blast_outputs/weather_cache.csv text eol=lf
+*.csv text eol=lf
+*.gz binary
