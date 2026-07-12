@@ -1,32 +1,32 @@
-town,2026-07-11
-Deniliquin,0
-Dubbo,
-Griffith,
-Lismore,0
-Moree,0
-Borroloola,
-Humpty Doo,
-Jabiru,
-Katherine,
-Timber Creek,0
-Archer River,1
-Bamaga,1
-Biloela,
-Burketown,
-Clermont,
-Croydon,
-Dalby,
-Emerald,0
-Goondiwindi,0
-Gympie,
-Home Hill,
-Lakeland,
-Malanda,0
-Marian,
-Proserpine,
-Rolleston,0
-Roma,
-Theodore,
-Warwick,0
-Fitzroy Crossing,0
-Kununurra,0
+town,2026-07-11,2026-07-12
+Deniliquin,0,0
+Dubbo,,0
+Griffith,,0
+Lismore,0,0
+Moree,0,0
+Borroloola,,3
+Humpty Doo,,2
+Jabiru,,1
+Katherine,,0
+Timber Creek,0,0
+Archer River,1,1
+Bamaga,1,0
+Biloela,,0
+Burketown,,0
+Clermont,,0
+Croydon,,0
+Dalby,,0
+Emerald,0,0
+Goondiwindi,0,0
+Gympie,,0
+Home Hill,,1
+Lakeland,,0
+Malanda,0,0
+Marian,,0
+Proserpine,,2
+Rolleston,0,0
+Roma,,0
+Theodore,,0
+Warwick,0,0
+Fitzroy Crossing,0,0
+Kununurra,0,0
