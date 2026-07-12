@@ -123,9 +123,15 @@ one_site <- function(k) {
 results_list <- tryCatch(
   parallel::mclapply(seq_len(nrow(sites)), one_site, mc.cores = .cores),
   error = function(e) lapply(seq_len(nrow(sites)), one_site))
-# any forks that failed outright fall back to a serial re-run for that row
-bad <- which(!vapply(results_list, is.data.frame, logical(1)))
-for (k in bad) results_list[[k]] <- one_site(k)
+# Serial retry (clean, non-forked connection) for towns whose concurrent fetch
+# was dropped by the API ("no data") or whose fork failed outright.
+needs_retry <- function(r) (!is.data.frame(r)) ||
+  identical(as.character(r$level), "no data")
+retry <- which(vapply(results_list, needs_retry, logical(1)))
+if (length(retry) > 0) {
+  cat(sprintf("Serial retry for %d town(s) that returned no data...\n", length(retry)))
+  for (k in retry) results_list[[k]] <- one_site(k)
+}
 results <- rbindlist(results_list)
 for (k in seq_len(nrow(results))) {
   r <- results[k]

@@ -84,9 +84,17 @@ cat(sprintf("Window %s to %s (%d days); target %d land points at %.2f deg\n",
 OUT <- file.path(SCRIPT_DIR, OUTPUT_DIR)
 dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
 cache_file <- file.path(OUT, WEATHER_CACHE_FILE)
+if (file.exists(cache_file)) {
+  cat(sprintf("Cache file found: %s (%.0f KB)\n", cache_file,
+              file.info(cache_file)$size / 1024))
+} else {
+  cat("Cache file NOT found at start; building fresh.\n")
+}
 cache <- if (file.exists(cache_file))
   tryCatch(fread(cache_file, colClasses = list(character = "pid")),
-           error = function(e) NULL) else NULL
+           error = function(e) { cat("Cache read FAILED: ", conditionMessage(e), "\n"); NULL }) else NULL
+if (!is.null(cache))
+  cat(sprintf("Cache read: %d rows, %d points\n", nrow(cache), length(unique(cache$pid))))
 if (is.null(cache) || !all(c("infect","semi","wet_hours") %in% names(cache))) {
   if (!is.null(cache)) cat("Cache lacks BLASTAM columns; rebuilding from scratch.\n")
   cache <- data.table(pid = character(), lon = numeric(), lat = numeric(),
@@ -156,6 +164,19 @@ if (nrow(maintain) > 0) {
   do_fetch(maintain, ms, "refresh", 1)
 }
 if (nrow(add) > 0) do_fetch(add, function(k) emergence, "add", cost_new)
+
+# Serial retry (clean, non-forked connection) for add points that failed under
+# concurrency, so as much coverage as possible is filled this run rather than
+# waiting for the next weekly run.
+fetched_pids <- if (length(new_rows) > 0) unique(rbindlist(new_rows)$pid) else character(0)
+failed_add <- add[!pid %in% fetched_pids]
+if (nrow(failed_add) > 0) {
+  cat(sprintf("  serial retry for %d failed add points\n", nrow(failed_add)))
+  for (i in seq_len(nrow(failed_add))) {
+    r <- fetch_point(failed_add$lon[i], failed_add$lat[i], emergence)
+    if (!is.null(r) && nrow(r) > 0) new_rows[[length(new_rows) + 1L]] <- r
+  }
+}
 if (length(new_rows) > 0)
   cache <- rbindlist(list(cache, rbindlist(new_rows)), use.names = TRUE)
 
@@ -237,5 +258,11 @@ render_map(pm, "events", sprintf("BLASTAM infection days (last %d)", BLASTAM_WIN
            BLASTAM_HEAT_MAX, "days", "blastam_heatmap")
 
 # ---- Save cache -----------------------------------------------------------
-fwrite(cache, cache_file)
+# Round weather values before saving to keep the plain-CSV cache compact
+# (no meaningful model impact). lon/lat/pid/date/flags are left exact.
+csv <- copy(cache)
+csv[, `:=`(TEMP = round(TEMP, 1), RHUM = round(RHUM, 0), RAIN = round(RAIN, 1),
+           temp_wet = round(temp_wet, 1), wet_hours = round(wet_hours, 0),
+           lon = round(lon, 4), lat = round(lat, 4))]
+fwrite(csv, cache_file)
 cat(sprintf("Cache saved: %d points -> %s\nDone.\n", length(unique(cache$pid)), cache_file))
