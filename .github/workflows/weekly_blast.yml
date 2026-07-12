@@ -40,29 +40,13 @@ jobs:
 
       - name: Set run date
         run: |
-          RD=$(cat blast_outputs/run_date.txt 2>/dev/null || date -u +%F)
+          RD=$(cat blast_outputs/run_date.txt 2>/dev/null || true)
+          [ -z "$RD" ] && RD=$(date -u +%F)
           echo "RUN_DATE=$RD" >> "$GITHUB_ENV"
+          echo "Using RUN_DATE=$RD"
 
-      # Email is REQUIRED: the heatmaps are delivered ONLY by email (they are not
-      # committed to the repo). The run artifact below is a 90-day fallback copy.
-      # This step needs repo secrets MAIL_USERNAME, MAIL_PASSWORD, MAIL_TO; if any
-      # is missing the step fails loudly rather than skipping silently. Placed
-      # before the commit so a git problem cannot block delivery.
-      - name: Email summary and heatmaps
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 465
-          secure: true
-          username: ${{ secrets.MAIL_USERNAME }}
-          password: ${{ secrets.MAIL_PASSWORD }}
-          subject: Blast risk summary ${{ env.RUN_DATE }}
-          to: ${{ secrets.MAIL_TO }}
-          from: WWAI Cereal Pathology - Blast Models <${{ secrets.MAIL_USERNAME }}>
-          html_body: file://blast_outputs/blast_summary_latest.html
-          body: file://blast_outputs/blast_summary_latest.txt
-          attachments: blast_outputs/epirice_heatmap_${{ env.RUN_DATE }}.png,blast_outputs/blastam_heatmap_${{ env.RUN_DATE }}.png,blast_outputs/town_trends.csv,blast_outputs/blastam_trends.csv
-
+      # Commit the cache and trends FIRST, so resolution progress is never lost
+      # even if the email step later fails.
       - name: Commit trends history
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -72,6 +56,18 @@ jobs:
           git add -f blast_outputs/town_trends.csv blast_outputs/blastam_trends.csv blast_outputs/weather_cache.csv
           git diff --staged --quiet || git commit -m "Weekly run (trends + weather cache) $(date +%F)"
           git push
+
+      # Send the email with a Python stdlib script (send_email.py) rather than a
+      # JavaScript action: the send-mail action broke when GitHub forced actions
+      # onto Node 24. The script fails loudly if a secret or attachment is missing.
+      - name: Email summary and heatmaps
+        env:
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: |
+          command -v python3 >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq python3; }
+          python3 send_email.py
 
       # Fallback copy of everything (including both heatmaps) kept for 90 days,
       # in case an email fails to deliver. Runs even if an earlier step failed.
