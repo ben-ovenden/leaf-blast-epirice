@@ -32,11 +32,11 @@ jobs:
           if (length(need)) install.packages(need)
         shell: Rscript {0}
 
-      - name: Site table and summary
-        run: Rscript run_blast.R
-
       - name: Continental heatmap
         run: Rscript run_blast_grid.R
+
+      - name: Site table and summary
+        run: Rscript run_blast.R
 
       - name: Set run date
         run: |
@@ -52,8 +52,9 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config --local user.email "github-actions@github.com"
           git config --local user.name "github-actions"
-          git rm --cached -q blast_outputs/weather_cache.csv.gz 2>/dev/null || true
-          git add -f blast_outputs/town_trends.csv blast_outputs/blastam_trends.csv blast_outputs/weather_cache.csv
+          git add -f blast_outputs/town_trends.csv blast_outputs/blastam_trends.csv
+          for f in weather_cache.csv.gz weather_cache.csv; do [ -f "blast_outputs/$f" ] && git add -f "blast_outputs/$f"; done
+          git add -u blast_outputs/ 2>/dev/null || true
           git diff --staged --quiet || git commit -m "Weekly run (trends + weather cache) $(date +%F)"
           git push
 
