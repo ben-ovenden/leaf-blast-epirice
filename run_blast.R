@@ -159,13 +159,19 @@ map_growth_line <- function() {
   if (length(s) < 4) return(NULL)
   now <- as.integer(s[1]); sp <- as.numeric(s[2])
   prev <- as.integer(s[3]); finest <- as.numeric(s[4])
+  fmt <- if (length(s) >= 5) s[5] else NA
+  kb  <- if (length(s) >= 6) as.numeric(s[6]) else NA
   chg <- if (is.na(prev) || prev <= 0) ""
          else if (now > prev) sprintf(" (up from %d last week)", prev)
          else " (steady)"
   at_target <- !is.na(sp) && !is.na(finest) && sp <= finest * 1.05
   tail <- if (at_target) "; at target resolution"
           else sprintf("; sharpening toward ~%.2f deg", finest)
-  sprintf("%d grid points at ~%.2f deg spacing%s%s", now, sp, chg, tail)
+  cache_bit <- if (!is.na(fmt) && !is.na(kb))
+    sprintf(" Cache %s, %s.", fmt,
+            if (kb >= 1024) sprintf("%.1f MB", kb / 1024) else sprintf("%.0f KB", kb))
+    else ""
+  sprintf("%d grid points at ~%.2f deg spacing%s%s.%s", now, sp, chg, tail, cache_bit)
 }
 mg <- map_growth_line()
 

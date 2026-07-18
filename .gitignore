@@ -11,4 +11,5 @@ blast_outputs/*
 !blast_outputs/town_trends.csv
 !blast_outputs/blastam_trends.csv
 !blast_outputs/weather_cache.csv
+!blast_outputs/weather_cache.csv.gz
 !blast_outputs/.gitkeep

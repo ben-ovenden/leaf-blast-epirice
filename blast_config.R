@@ -38,7 +38,8 @@ MIN_DAYS <- 16
 
 # ---- 5. Output -------------------------------------------------------------
 OUTPUT_DIR <- "blast_outputs"
-MAKE_MAP   <- TRUE          # write a simple PNG risk map
+MAKE_MAP   <- FALSE         # off: the workflow emails the two grid heatmaps;
+                            # this simple town point-map is not delivered
 MAP_WIDTH  <- 900
 MAP_HEIGHT <- 800
 
@@ -79,7 +80,13 @@ GRID_RES_LEVELS <- c(2.0, 1.0, 0.5) # coarse-to-fine fill order; each must be a
 TARGET_CALLS_PER_RUN <- 4000        # weighted-call budget per run (< 5000/hour)
 GRID_CONC           <- 4            # grid points fetched concurrently (Linux runner)
 GRID_TARGET_PER_MIN <- 400          # weighted-call rate cap while fetching (< 600/min)
-WEATHER_CACHE_FILE   <- "weather_cache.csv"     # plain CSV (git-safe), committed
+WEATHER_CACHE_GZ   <- "weather_cache.csv.gz"   # primary: gzipped, small (~1/5 size)
+WEATHER_CACHE_CSV  <- "weather_cache.csv"      # fallback: plain CSV
+# Read tries gz first, then csv. Write uses gz and verifies it can be read back;
+# if that fails it falls back to writing plain CSV. Keep FALSE to commit only the
+# small gz; set TRUE to also commit the CSV every run as a belt-and-braces backup
+# (larger repo). The email note shows which format and its size.
+WEATHER_CACHE_KEEP_CSV <- FALSE
 
 # Legacy fixed resolution (no longer used by the dynamic runner; kept for
 # reference and any single-shot use).

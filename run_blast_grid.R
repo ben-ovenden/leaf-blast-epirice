@@ -83,18 +83,27 @@ cat(sprintf("Window %s to %s (%d days); target %d land points at %.2f deg\n",
 # ---- Load cache (rebuild if it predates the BLASTAM columns) ---------------
 OUT <- file.path(SCRIPT_DIR, OUTPUT_DIR)
 dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
-cache_file <- file.path(OUT, WEATHER_CACHE_FILE)
-if (file.exists(cache_file)) {
-  cat(sprintf("Cache file found: %s (%.0f KB)\n", cache_file,
-              file.info(cache_file)$size / 1024))
-} else {
-  cat("Cache file NOT found at start; building fresh.\n")
+gz_file  <- file.path(OUT, WEATHER_CACHE_GZ)
+csv_file <- file.path(OUT, WEATHER_CACHE_CSV)
+
+# Read the cache preferring the small gz; fall back to the plain CSV if the gz is
+# missing or unreadable (also covers the one-time migration from a CSV-only repo).
+read_cache <- function() {
+  for (f in c(gz_file, csv_file)) {
+    if (!file.exists(f)) next
+    d <- tryCatch(fread(f, colClasses = list(character = "pid")),
+                  error = function(e) {
+                    cat(sprintf("Cache read FAILED (%s): %s\n", basename(f), conditionMessage(e))); NULL })
+    if (!is.null(d)) {
+      cat(sprintf("Cache file: %s (%.0f KB); read %d rows, %d points\n",
+                  basename(f), file.info(f)$size / 1024, nrow(d), length(unique(d$pid))))
+      return(list(data = d, fmt = if (grepl("\\.gz$", f)) "gz" else "csv"))
+    }
+  }
+  cat("No readable cache found; building fresh.\n")
+  list(data = NULL, fmt = NA_character_)
 }
-cache <- if (file.exists(cache_file))
-  tryCatch(fread(cache_file, colClasses = list(character = "pid")),
-           error = function(e) { cat("Cache read FAILED: ", conditionMessage(e), "\n"); NULL }) else NULL
-if (!is.null(cache))
-  cat(sprintf("Cache read: %d rows, %d points\n", nrow(cache), length(unique(cache$pid))))
+cache <- read_cache()$data
 if (is.null(cache) || !all(c("infect","semi","wet_hours") %in% names(cache))) {
   if (!is.null(cache)) cat("Cache lacks BLASTAM columns; rebuilding from scratch.\n")
   cache <- data.table(pid = character(), lon = numeric(), lat = numeric(),
@@ -107,14 +116,19 @@ cache[, date := as.Date(date)]
 # ---- Decide what to fetch --------------------------------------------------
 cost_new <- (CROP_AGE_DAYS / 7) * 0.75
 cached_pids <- unique(cache$pid)
-maintain <- targets[pid %in% cached_pids]
+# Only refresh points whose newest cached day is behind end_date; points already
+# current need no fetch (avoids a wasted, failing request per point on re-runs).
+last_by <- if (nrow(cache) > 0) cache[, .(last = max(date)), by = pid] else data.table(pid = character(), last = as.Date(character()))
+behind_pids <- last_by[last < end_date, pid]
+maintain <- targets[pid %in% behind_pids]
 to_add   <- targets[!pid %in% cached_pids]
+already_current <- length(cached_pids) - length(behind_pids)
 maintain_cost <- nrow(maintain) * 1
 remaining <- max(0, TARGET_CALLS_PER_RUN - maintain_cost)
 n_add <- min(nrow(to_add), floor(remaining / cost_new))
 add <- if (n_add > 0) to_add[seq_len(n_add)] else to_add[0]
-cat(sprintf("Cache: %d points. Refresh %d, add %d new (est %.0f/%d hourly calls)\n",
-            length(cached_pids), nrow(maintain), nrow(add),
+cat(sprintf("Cache: %d points (%d already current). Refresh %d, add %d new (est %.0f/%d hourly calls)\n",
+            length(cached_pids), already_current, nrow(maintain), nrow(add),
             maintain_cost + nrow(add) * cost_new, FREE_HOURLY_CALLS))
 
 # ---- Fetch (per point, only missing dates) --------------------------------
@@ -258,18 +272,36 @@ render_map(pm, "events", sprintf("BLASTAM infection days (last %d)", BLASTAM_WIN
            BLASTAM_HEAT_MAX, "days", "blastam_heatmap")
 
 # ---- Save cache -----------------------------------------------------------
-# Round weather values before saving to keep the plain-CSV cache compact
-# (no meaningful model impact). lon/lat/pid/date/flags are left exact.
-csv <- copy(cache)
-csv[, `:=`(TEMP = round(TEMP, 1), RHUM = round(RHUM, 0), RAIN = round(RAIN, 1),
-           temp_wet = round(temp_wet, 1), wet_hours = round(wet_hours, 0),
-           lon = round(lon, 4), lat = round(lat, 4))]
-fwrite(csv, cache_file)
-cat(sprintf("Cache saved: %d points -> %s\nDone.\n", length(unique(cache$pid)), cache_file))
+# Round weather values before saving to keep the cache compact (no meaningful
+# model impact). lon/lat/pid/date/flags are left exact.
+csvdt <- copy(cache)
+csvdt[, `:=`(TEMP = round(TEMP, 1), RHUM = round(RHUM, 0), RAIN = round(RAIN, 1),
+             temp_wet = round(temp_wet, 1), wet_hours = round(wet_hours, 0),
+             lon = round(lon, 4), lat = round(lat, 4))]
 
-# Small stats line for the email: current points, spacing, last week's points,
-# and the target finest spacing, so the reader can see the map sharpening.
-writeLines(sprintf("%d|%.2f|%d|%.2f",
+# Primary write is gz (small); verify it reads back, else fall back to plain CSV.
+write_cache <- function(dt) {
+  ok_gz <- tryCatch({
+    fwrite(dt, gz_file)
+    nrow(fread(gz_file, colClasses = list(character = "pid"))) == nrow(dt)
+  }, error = function(e) FALSE)
+  if (ok_gz) {
+    if (WEATHER_CACHE_KEEP_CSV) { fwrite(dt, csv_file); fmt <- "gz+csv" }
+    else { if (file.exists(csv_file)) file.remove(csv_file); fmt <- "gz" }
+    return(list(fmt = fmt, kb = file.info(gz_file)$size / 1024))
+  }
+  cat("gz cache write/verify failed; falling back to plain CSV.\n")
+  fwrite(dt, csv_file)
+  if (file.exists(gz_file)) file.remove(gz_file)
+  list(fmt = "csv", kb = file.info(csv_file)$size / 1024)
+}
+wc <- write_cache(csvdt)
+cat(sprintf("Cache saved: %d points as %s (%.0f KB)\nDone.\n",
+            length(unique(cache$pid)), wc$fmt, wc$kb))
+
+# Stats line for the email: points, spacing, last week's points, target spacing,
+# cache format and size, so the reader sees the map sharpening and the cache size.
+writeLines(sprintf("%d|%.2f|%d|%.2f|%s|%.0f",
                    length(unique(cache$pid)), map_spacing,
-                   length(cached_pids), GRID_RES_FINEST),
+                   length(cached_pids), GRID_RES_FINEST, wc$fmt, wc$kb),
            file.path(OUT, "map_stats.txt"))
