@@ -1,32 +1,32 @@
-town,2026-07-11,2026-07-12
-Deniliquin,0.002,0.003
-Dubbo,,0.004
-Griffith,,0
-Lismore,0.031,0.018
-Moree,0.006,0.005
-Borroloola,,0
-Humpty Doo,,0.002
-Jabiru,,0.001
-Katherine,,0.001
-Timber Creek,0,0
-Archer River,0,0
-Bamaga,0,0
-Biloela,,0
-Burketown,,0
-Clermont,,0
-Croydon,,0
-Dalby,,0.004
-Emerald,0,0
-Goondiwindi,0.007,0.005
-Gympie,,0.004
-Home Hill,,0
-Lakeland,,0
-Malanda,0.146,0.178
-Marian,,0.005
-Proserpine,,0.007
-Rolleston,0,0
-Roma,,0.002
-Theodore,,0
-Warwick,0.002,0.001
-Fitzroy Crossing,0,0
-Kununurra,0,0
+town,2026-07-11,2026-07-12,2026-07-18
+Deniliquin,0.002,0.003,0.002
+Dubbo,,0.004,0.004
+Griffith,,0,0
+Lismore,0.031,0.018,0.018
+Moree,0.006,0.005,0.001
+Borroloola,,0,0
+Humpty Doo,,0.002,0.002
+Jabiru,,0.001,0.001
+Katherine,,0.001,0.001
+Timber Creek,0,0,0
+Archer River,0,0,0
+Bamaga,0,0,0
+Biloela,,0,0.003
+Burketown,,0,0
+Clermont,,0,0
+Croydon,,0,0
+Dalby,,0.004,0
+Emerald,0,0,0.002
+Goondiwindi,0.007,0.005,0.001
+Gympie,,0.004,0.005
+Home Hill,,0,0.003
+Lakeland,,0,0
+Malanda,0.146,0.178,0.407
+Marian,,0.005,0.005
+Proserpine,,0.007,0.009
+Rolleston,0,0,0
+Roma,,0.002,0
+Theodore,,0,0.001
+Warwick,0.002,0.001,0
+Fitzroy Crossing,0,0,0
+Kununurra,0,0,0
