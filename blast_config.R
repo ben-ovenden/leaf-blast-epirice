@@ -30,7 +30,7 @@ INTENSITY_MODERATE_MAX <- 0.01   # 0.2% to <1% = moderate; 1% and above = high
 # ---- 4. Data window --------------------------------------------------------
 # The Open-Meteo archive (ERA5) lags real time by about 5 days. End the fetch a
 # few days back so the most recent days are actually populated.
-ARCHIVE_LAG_DAYS <- 5
+ARCHIVE_LAG_DAYS <- 6
 
 # Minimum days of weather after emergence before a run is meaningful. Disease
 # onset in the leaf blast model is day 15.
@@ -74,10 +74,21 @@ GRID_EXTENT <- c(112, 154, -44, -10)
 # days for points it already has, which frees budget to ADD new points. Coverage
 # fills coarse-to-fine toward GRID_RES_FINEST, then holds there once maintaining
 # the points costs about the per-run budget.
-GRID_RES_FINEST <- 0.5              # finest resolution the map refines toward
-GRID_RES_LEVELS <- c(2.0, 1.0, 0.5) # coarse-to-fine fill order; each must be a
+GRID_RES_FINEST <- 0.3              # finest resolution the map refines toward
+GRID_RES_LEVELS <- c(2.4, 1.2, 0.6, 0.3) # coarse-to-fine fill order; each a
                                     # whole-number multiple of GRID_RES_FINEST
-TARGET_CALLS_PER_RUN <- 4000        # weighted-call budget per run (< 5000/hour)
+
+# Two runs a week (a full run that emails, plus a silent midweek fetch-only run)
+# each do a single batch of up to GRID_BATCH_CALLS. To hold a resolution whose
+# point count exceeds one batch, each run refreshes only points stale by at least
+# REFRESH_MIN_STALE_DAYS (most-stale first, capped to the budget) and spends the
+# rest adding new points. Recently-refreshed points are skipped, so the two runs
+# between them cover the whole grid roughly weekly without breaching the limits.
+GRID_BATCHES        <- 1            # fetch batches per run (1 = single quick batch)
+GRID_BATCH_CALLS    <- 4500         # weighted calls per run (< 5000/hour)
+GRID_BATCH_WAIT_S   <- 3660         # wait between batches (only used if GRID_BATCHES > 1)
+REFRESH_MIN_STALE_DAYS <- 5L        # only refresh points at least this many days old
+TARGET_CALLS_PER_RUN <- GRID_BATCHES * GRID_BATCH_CALLS  # total weighted budget/run
 GRID_CONC           <- 4            # grid points fetched concurrently (Linux runner)
 GRID_TARGET_PER_MIN <- 400          # weighted-call rate cap while fetching (< 600/min)
 WEATHER_CACHE_GZ   <- "weather_cache.csv.gz"   # primary: gzipped, small (~1/5 size)

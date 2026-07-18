@@ -14,6 +14,10 @@
 # successive weeks. See blastam_model.R for BLASTAM parameters and caveats.
 ################################################################################
 
+# Dates in Australian Eastern time (AEST/AEDT), matching run_blast.R, so the
+# run tag and map filenames agree with the Monday-morning email.
+Sys.setenv(TZ = "Australia/Sydney")
+
 SCRIPT_DIR <- tryCatch(
   normalizePath(dirname(sys.frame(1)$ofile), winslash = "/"),
   error = function(e) normalizePath(getwd(), winslash = "/"))
@@ -116,20 +120,23 @@ cache[, date := as.Date(date)]
 # ---- Decide what to fetch --------------------------------------------------
 cost_new <- (CROP_AGE_DAYS / 7) * 0.75
 cached_pids <- unique(cache$pid)
-# Only refresh points whose newest cached day is behind end_date; points already
-# current need no fetch (avoids a wasted, failing request per point on re-runs).
 last_by <- if (nrow(cache) > 0) cache[, .(last = max(date)), by = pid] else data.table(pid = character(), last = as.Date(character()))
-behind_pids <- last_by[last < end_date, pid]
-maintain <- targets[pid %in% behind_pids]
+# Refresh only points stale by >= REFRESH_MIN_STALE_DAYS (most-stale first), capped
+# to the per-run budget; skip fresh/current points so their budget adds new points
+# instead. Two staggered runs a week then cover the grid ~weekly within the limits.
+stale_days <- if (exists("REFRESH_MIN_STALE_DAYS")) REFRESH_MIN_STALE_DAYS else 0L
+eligible <- last_by[last < end_date & last <= (end_date - stale_days)][order(last)]
+n_refresh <- min(nrow(eligible), TARGET_CALLS_PER_RUN)
+maintain <- targets[pid %in% eligible$pid[seq_len(n_refresh)]]
 to_add   <- targets[!pid %in% cached_pids]
-already_current <- length(cached_pids) - length(behind_pids)
 maintain_cost <- nrow(maintain) * 1
 remaining <- max(0, TARGET_CALLS_PER_RUN - maintain_cost)
 n_add <- min(nrow(to_add), floor(remaining / cost_new))
 add <- if (n_add > 0) to_add[seq_len(n_add)] else to_add[0]
-cat(sprintf("Cache: %d points (%d already current). Refresh %d, add %d new (est %.0f/%d hourly calls)\n",
-            length(cached_pids), already_current, nrow(maintain), nrow(add),
-            maintain_cost + nrow(add) * cost_new, FREE_HOURLY_CALLS))
+skipped_fresh <- length(cached_pids) - nrow(eligible)
+cat(sprintf("Cache: %d points (%d fresh, skipped). Refresh %d, add %d new (~%.0f weighted, budget %d)\n",
+            length(cached_pids), skipped_fresh, nrow(maintain), nrow(add),
+            maintain_cost + nrow(add) * cost_new, TARGET_CALLS_PER_RUN))
 
 # ---- Fetch (per point, only missing dates) --------------------------------
 fetch_point <- function(lon, lat, start) {
@@ -150,6 +157,27 @@ new_rows <- list()
 GRID_CONC <- if (exists("GRID_CONC")) GRID_CONC else 6L
 GRID_TARGET_PER_MIN <- if (exists("GRID_TARGET_PER_MIN")) GRID_TARGET_PER_MIN else 450
 pace_mult <- if (exists("GRID_PACE")) GRID_PACE else 1
+
+# Coarser batch pause: once a batch's worth of weighted calls is made, wait out
+# the hour so the next batch starts with a clear hourly quota. This lets one run
+# do GRID_BATCHES * GRID_BATCH_CALLS calls (more points -> higher resolution)
+# without breaching the 5000/hour limit.
+n_batches   <- if (exists("GRID_BATCHES")) GRID_BATCHES else 1L
+batch_calls <- if (exists("GRID_BATCH_CALLS")) GRID_BATCH_CALLS else TARGET_CALLS_PER_RUN
+batch_wait  <- if (exists("GRID_BATCH_WAIT_S")) GRID_BATCH_WAIT_S else 3660
+planned_total <- nrow(maintain) * 1 + nrow(add) * cost_new
+calls_made <- 0
+next_pause <- batch_calls
+account_and_maybe_pause <- function(weighted) {
+  calls_made <<- calls_made + weighted
+  if (n_batches > 1 && calls_made >= next_pause && calls_made < planned_total && pace_mult > 0) {
+    cat(sprintf("  batch complete (~%.0f weighted calls); pausing %.0f min for the hourly limit...\n",
+                calls_made, batch_wait / 60))
+    Sys.sleep(batch_wait)
+    next_pause <<- next_pause + batch_calls
+  }
+}
+
 do_fetch <- function(tab, start_fun, label, cost) {
   n <- nrow(tab); got <- 0L
   min_chunk_s <- (GRID_CONC * cost) / (GRID_TARGET_PER_MIN / 60)  # hold the rate
@@ -169,6 +197,7 @@ do_fetch <- function(tab, start_fun, label, cost) {
     if (j %% 100 < GRID_CONC || j == n) cat(sprintf("  %s %d/%d (%d ok)\n", label, j, n, got))
     el <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
     if (pace_mult > 0 && el < min_chunk_s) Sys.sleep((min_chunk_s - el) * pace_mult)
+    account_and_maybe_pause(length(idx) * cost)
     i <- j + 1L
   }
 }
@@ -305,3 +334,15 @@ writeLines(sprintf("%d|%.2f|%d|%.2f|%s|%.0f",
                    length(unique(cache$pid)), map_spacing,
                    length(cached_pids), GRID_RES_FINEST, wc$fmt, wc$kb),
            file.path(OUT, "map_stats.txt"))
+
+# On the silent midweek fetch-only run, record a status line (committed to the
+# repo) so the next full run can confirm in the email that it ran and went well.
+if (Sys.getenv("BLAST_MIDWEEK") == "1") {
+  added <- length(unique(cache$pid)) - length(cached_pids)
+  writeLines(sprintf("%s|%d|%d|%d|%s|%.0f",
+                     format(Sys.Date()), length(unique(cache$pid)),
+                     length(cached_pids), added, wc$fmt, wc$kb),
+             file.path(OUT, "midweek_status.txt"))
+  cat(sprintf("Midweek fetch-only run: +%d points, cache now %d.\n",
+              added, length(unique(cache$pid))))
+}

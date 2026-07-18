@@ -15,6 +15,11 @@
 #   4. Write a CSV, a text summary, and a PNG map; optionally email them.
 ################################################################################
 
+# Report all dates in Australian Eastern time (AEST/AEDT). The scheduled run
+# fires 20:00 UTC Sunday, which is Monday morning in eastern Australia, so the
+# email is stamped with the Monday (local) date, not the UTC Sunday.
+Sys.setenv(TZ = "Australia/Sydney")
+
 SCRIPT_DIR <- tryCatch(
   normalizePath(dirname(sys.frame(1)$ofile), winslash = "/"),
   error = function(e) normalizePath(getwd(), winslash = "/")
@@ -175,6 +180,24 @@ map_growth_line <- function() {
 }
 mg <- map_growth_line()
 
+# Read the silent midweek fetch-only run's status (committed by that run) so this
+# email can confirm it ran and went well, or flag if it hasn't run recently.
+midweek_line <- function() {
+  f <- file.path(SCRIPT_DIR, OUTPUT_DIR, "midweek_status.txt")
+  if (!file.exists(f)) return("Midweek top-up: no run recorded yet.")
+  s <- tryCatch(strsplit(readLines(f, warn = FALSE)[1], "\\|")[[1]],
+                error = function(e) NULL)
+  if (length(s) < 4) return(NULL)
+  d <- suppressWarnings(as.Date(s[1])); pts <- as.integer(s[2]); added <- as.integer(s[4])
+  if (is.na(d) || as.integer(Sys.Date() - d) > 5)
+    sprintf("Midweek top-up: no run in the last 5 days (last %s) - check the midweek job.",
+            if (is.na(d)) "never" else format(d, "%d %b"))
+  else
+    sprintf("Midweek top-up ran %s: +%d points, cache now %d (ok).",
+            format(d, "%d %b"), added, pts)
+}
+mw <- midweek_line()
+
 summary_lines <- c(
   "Blast risk summary",
   strrep("=", 60),
@@ -182,6 +205,7 @@ summary_lines <- c(
   paste0("Models:     EPIRICE (Savary et al. 2012) + BLASTAM (Koshimizu 1988)"),
   paste0("Weather:    Open-Meteo ERA5 archive, to ", format(end_date, "%Y-%m-%d")),
   if (!is.null(mg)) paste0("Map:        ", mg) else NULL,
+  if (!is.null(mw)) paste0("Midweek:    ", mw) else NULL,
   "",
   sprintf("EPIRICE bands  High:%d  Moderate:%d  Low:%d  Pre-season:%d  No data:%d",
           getn("high"), getn("moderate"), getn("low"),
@@ -300,6 +324,9 @@ sprintf(paste0("<p style='margin:0 0 12px;'>Two models for %d monitoring towns, 
 if (!is.null(mg))
   sprintf(paste0("<p style='margin:-4px 0 12px;font-size:12px;color:#6b7378;'>",
                  "<b>Map:</b> %s.</p>"), mg) else "",
+if (!is.null(mw))
+  sprintf(paste0("<p style='margin:-8px 0 12px;font-size:12px;color:#6b7378;'>",
+                 "<b>Midweek:</b> %s</p>"), mw) else "",
 "<p style='margin:0 0 14px;'>",
 "<span style='font-size:12px;color:#6b7378;margin-right:8px;'>EPIRICE bands:</span>",
 pill("High", getn("high"), "#E8492B", "#fff"),
