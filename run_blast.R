@@ -166,16 +166,26 @@ map_growth_line <- function() {
   prev <- as.integer(s[3]); finest <- as.numeric(s[4])
   fmt <- if (length(s) >= 5) s[5] else NA
   kb  <- if (length(s) >= 6) as.numeric(s[6]) else NA
+  rd  <- if (length(s) >= 7) s[7] else NA
   chg <- if (is.na(prev) || prev <= 0) ""
          else if (now > prev) sprintf(" (up from %d at the last run)", prev)
          else " (steady)"
   at_target <- !is.na(sp) && !is.na(finest) && sp <= finest * 1.05
-  tail <- if (at_target) "; at target resolution"
-          else sprintf("; sharpening toward ~%.2f deg", finest)
-  cache_bit <- if (!is.na(fmt) && !is.na(kb))
-    sprintf(" Cache %s, %s.", fmt,
+  # ~111 km per degree of latitude; east-west is less at southern latitudes.
+  km <- if (!is.na(finest)) sprintf(" (~%.0f km)", finest * 111) else ""
+  tail <- if (at_target) sprintf("; at target resolution%s", km)
+          else sprintf("; sharpening toward ~%.2f deg%s", finest, km)
+  # Say which copy is in use: the one read this run, plus whether a backup exists.
+  cache_bit <- if (is.na(fmt) || is.na(kb)) "" else {
+    active <- if (!is.na(rd) && rd %in% c("gz", "csv")) rd
+              else if (grepl("^gz", fmt)) "gz" else "csv"
+    extra <- if (active == "gz" && grepl("csv", fmt)) ", csv backup kept"
+             else if (active == "csv" && identical(fmt, "csv")) ", gz unavailable"
+             else if (active == "csv" && grepl("gz", fmt)) ", gz restored this run"
+             else ""
+    sprintf(" Cache: %s active%s, %s.", active, extra,
             if (kb >= 1024) sprintf("%.1f MB", kb / 1024) else sprintf("%.0f KB", kb))
-    else ""
+  }
   sprintf("%d grid points at ~%.2f deg spacing%s%s.%s", now, sp, chg, tail, cache_bit)
 }
 mg <- map_growth_line()
@@ -204,8 +214,6 @@ summary_lines <- c(
   paste0("Generated:  ", format(Sys.Date(), "%A %d %B %Y")),
   paste0("Models:     EPIRICE (Savary et al. 2012) + BLASTAM (Koshimizu 1988)"),
   paste0("Weather:    Open-Meteo ERA5 archive, to ", format(end_date, "%Y-%m-%d")),
-  if (!is.null(mg)) paste0("Map:        ", mg) else NULL,
-  if (!is.null(mw)) paste0("Midweek:    ", mw) else NULL,
   "",
   sprintf("EPIRICE bands  High:%d  Moderate:%d  Low:%d  Pre-season:%d  No data:%d",
           getn("high"), getn("moderate"), getn("low"),
@@ -253,7 +261,14 @@ summary_lines <- c(summary_lines, "",
   "",
   "Bands and thresholds are provisional; calibrate against field observations.",
   "",
-  if (exists("CITATION")) CITATION else NULL)
+  if (exists("CITATION")) CITATION else NULL,
+  # Run status (map growth, cache in use, midweek top-up) sits after the citation
+  # as fine print rather than at the top of the summary.
+  if (!is.null(mg) || !is.null(mw)) "" else NULL,
+  if (!is.null(mg)) paste0("Map:     ", mg) else NULL,
+  if (!is.null(mw)) paste0("Midweek: ", mw) else NULL,
+  "",
+  "Sent by Ben Ovenden, ben.ovenden@dpird.nsw.gov.au")
 
 summary_text <- paste(summary_lines, collapse = "\n")
 cat("\n", summary_text, "\n", sep = "")
@@ -291,7 +306,7 @@ for (k in seq_len(nrow(results))) {
              "padding:6px 8px;border-top:1px solid #DDE2E6;'>%s</td></tr>"), cur))
   }
   pct <- if (is.na(r$intensity)) "-" else sprintf("%.2f%%", r$intensity * 100)
-  tr  <- if (is.na(r$trend7)) "" else sprintf("%+0.2f", r$trend7 * 100)
+  tr  <- if (is.na(r$trend7)) "" else sprintf("%+0.2f", { v <- r$trend7 * 100; if (abs(v) < 0.005) 0 else v })
   blv <- if (is.na(r$blast_events)) "-" else
     sprintf("%d<span style='color:#8a8f94;font-size:11px;'> (7d %d)</span>",
             r$blast_events, r$blast_recent)
@@ -321,12 +336,6 @@ sprintf(paste0("<p style='margin:0 0 12px;'>Two models for %d monitoring towns, 
         "season has built up; <b>BLASTAM days</b> is how many of the last 21 days favoured a ",
         "new infection. Both are weather-driven potentials, not field measurements.</p>"),
         nrow(results), format(end_date, "%d %b %Y")),
-if (!is.null(mg))
-  sprintf(paste0("<p style='margin:-4px 0 12px;font-size:12px;color:#6b7378;'>",
-                 "<b>Map:</b> %s</p>"), mg) else "",
-if (!is.null(mw))
-  sprintf(paste0("<p style='margin:-8px 0 12px;font-size:12px;color:#6b7378;'>",
-                 "<b>Midweek:</b> %s</p>"), mw) else "",
 "<p style='margin:0 0 14px;'>",
 "<span style='font-size:12px;color:#6b7378;margin-right:8px;'>EPIRICE bands:</span>",
 pill("High", getn("high"), "#E8492B", "#fff"),
@@ -354,6 +363,15 @@ paste0("<p style='font-size:11px;color:#9aa0a6;margin:10px 0 0;'>EPIRICE: Savary
        "<em>et al.</em> 2012 (Crop Prot. 34:6-17); epicrop (A.H. Sparks). BLASTAM: ",
        "Koshimizu 1988 (Bull. Tohoku Natl. Agric. Exp. Stn. 78:67-121); Hayashi &amp; ",
        "Koshimizu 1988. Weather: Open-Meteo ERA5 (CC BY 4.0).</p>"),
+if (!is.null(mg))
+  sprintf(paste0("<p style='font-size:11px;color:#9aa0a6;margin:8px 0 0;'>",
+                 "<b>Map:</b> %s</p>"), mg) else "",
+if (!is.null(mw))
+  sprintf(paste0("<p style='font-size:11px;color:#9aa0a6;margin:2px 0 0;'>",
+                 "<b>Midweek:</b> %s</p>"), mw) else "",
+"<p style='font-size:11px;color:#b0b5ba;margin:8px 0 0;'>Sent by Ben Ovenden, ",
+"<a href='mailto:ben.ovenden@dpird.nsw.gov.au' style='color:#b0b5ba;'>",
+"ben.ovenden@dpird.nsw.gov.au</a></p>",
 "</div></div>")
 writeLines(html, file.path(OUT, "blast_summary_latest.html"))
 

@@ -146,7 +146,9 @@ read_cache <- function() {
               nrow(pick), length(unique(pick$pid))))
   list(data = pick, fmt = if (grepl("\\.gz$", used)) "gz" else "csv")
 }
-cache <- read_cache()$data
+cache_in <- read_cache()
+cache <- cache_in$data
+read_fmt <- if (is.na(cache_in$fmt)) "none" else cache_in$fmt
 if (is.null(cache) || !all(c("infect","semi","wet_hours") %in% names(cache))) {
   if (!is.null(cache)) cat("Cache lacks BLASTAM columns; rebuilding from scratch.\n")
   cache <- data.table(pid = character(), lon = numeric(), lat = numeric(),
@@ -380,11 +382,11 @@ wc <- write_cache(csvdt)
 cat(sprintf("Cache saved: %d points as %s (%.0f KB)\nDone.\n",
             length(unique(cache$pid)), wc$fmt, wc$kb))
 
-# Stats line for the email: points, spacing, last week's points, target spacing,
-# cache format and size, so the reader sees the map sharpening and the cache size.
-writeLines(sprintf("%d|%.2f|%d|%.2f|%s|%.0f",
+# Stats line for the email: points, spacing, last run's points, target spacing,
+# stored format and size, and which format was actually read (the active one).
+writeLines(sprintf("%d|%.2f|%d|%.2f|%s|%.0f|%s",
                    length(unique(cache$pid)), map_spacing,
-                   length(cached_pids), GRID_RES_FINEST, wc$fmt, wc$kb),
+                   length(cached_pids), GRID_RES_FINEST, wc$fmt, wc$kb, read_fmt),
            file.path(OUT, "map_stats.txt"))
 
 # On the silent midweek fetch-only run, record a status line (committed to the
