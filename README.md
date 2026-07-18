@@ -181,6 +181,59 @@ days, which indicates whether the epidemic is building or easing.
 - The wet day proxy uses daily mean humidity and rainfall. It does not resolve
   the length of overnight leaf wetness directly.
 
+## EPIRICE leaf blast parameters
+
+`epirice_model.R` vendors the SEIR engine and the leaf blast parameterisation
+from the `epicrop` package (Sparks and colleagues), which implements EPIRICE
+(Savary *et al.* 2012). The parameters are used exactly as published; the values
+are listed here for reference and are not meant to be edited casually.
+
+Each day the model moves leaf sites through healthy, latent, infectious and
+removed states. New infection is the basic infection rate `RcOpt` scaled by four
+modifiers: crop age (`RcA`), temperature (`RcT`), a leaf-wetness switch (on when
+RH is at least `rhlim` or rain at least `rainlim`), and the fraction of sites
+still free to infect. The daily output is intensity, the proportion of leaf
+tissue diseased (0 to 1), reported as the EPIRICE %.
+
+| Parameter | Value | Meaning |
+| --- | --- | --- |
+| `onset` | 15 | days after emergence before the epidemic can start |
+| `duration` | 120 (published); run at `CROP_AGE_DAYS`, default 60 | season length simulated (days) |
+| `rhlim` | 90 | relative humidity (%) at or above which leaves count as wet |
+| `rainlim` | 5 | rainfall (mm) at or above which leaves count as wet |
+| `H0` | 600 | initial healthy sites |
+| `I0` | 1 | initial infective site at onset |
+| `RcOpt` | 1.14 | optimum daily basic infection rate |
+| `p` | 5 | latent period (days) |
+| `i` | 20 | infectious period (days) |
+| `a` | 1 | aggregation exponent on the free-sites correction |
+| `Sx` | 30000 | maximum sites (carrying capacity) |
+| `RRS` | 0.01 | relative senescence rate |
+| `RRG` | 0.1 | relative growth rate |
+
+Temperature response `RcT` (relative infection rate vs mean air temperature):
+
+| Temp (C) | 10 | 15 | 20 | 25 | 30 | 35 | 40 | 45 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Rc | 0 | 0.5 | 1.0 | 0.6 | 0.2 | 0.05 | 0.01 | 0 |
+
+The curve peaks at 20 C. The `epicrop` author reports that Table 2 of Savary
+*et al.* 2012 prints the optimum as 25 C in error and codes the response peak at
+20 C, which is the value vendored here. This is the package author's reading of
+the source rather than a published erratum, so treat it as such. Note this is a
+different, cooler temperature response than the 15 to 32 C bounds used in BLASTAM,
+so the two models will not agree on warm days by design.
+
+Crop-age response `RcA` (relative infection rate vs crop age in days) is a
+25-point curve from 1.0 for the first ~10 days, decaying to 0.01 by about day 90
+(young tissue is far more susceptible). See `epirice_model.R` for the full curve.
+
+Two things in this deployment differ from a stock run: `duration` is set to
+`CROP_AGE_DAYS` (default 60) rather than the published 120, so results are
+"disease built up in a crop of that age", not a full-season figure; and the
+weather is Open-Meteo ERA5 rather than NASA POWER. The parameters themselves are
+unchanged.
+
 ## Attribution
 
 Please retain the attribution in `epirice_model.R` and `blastam_model.R`, and
