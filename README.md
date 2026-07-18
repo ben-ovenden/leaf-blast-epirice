@@ -47,7 +47,10 @@ the published thresholds.
 | `blast_config.R` | Your sites, season, risk bands, output and email settings |
 | `run_blast.R` | Runner: fetch weather, run model, write map, table, summary |
 | `run_blast_grid.R` | Continental risk **heatmap**: runs the model on a grid |
-| `.github/workflows/weekly_blast.yml` | Weekly GitHub Actions schedule |
+| `blastam_model.R` | BLASTAM infection-warning model and its parameters |
+| `send_email.py` | Sends the summary email (Python stdlib, no Node action) |
+| `.github/workflows/weekly_blast.yml` | Monday run: models, emails, commits |
+| `.github/workflows/midweek_blast.yml` | Silent midweek run: tops up the cache only |
 
 ## Two outputs
 
@@ -80,13 +83,22 @@ matching GeoTIFF, with a `_latest.png` copy of each for convenience.
 Grid settings live in `blast_config.R`:
 
 - Dynamic resolution with a weather cache. Each run keeps a weather cache
-  (`weather_cache.csv.gz`, committed to the repo, pruned to the 60 day window).
+  (committed to the repo, pruned to the 60 day window). It is written as
+  `weather_cache.csv.gz`, with a plain `weather_cache.csv` copy kept alongside
+  while gzip is being proven (`WEATHER_CACHE_KEEP_CSV`). Reading prefers the gz,
+  falls back to the CSV if the gz is missing, malformed or truncated, and writing
+  falls back to CSV if the gz cannot be verified.
   Points already in the cache only need their newest days fetched, which is cheap,
   so the spare API budget is spent ADDING new points. The map therefore fills
-  coarse to fine over successive runs, reaching about 0.5 degree (~2,800 land
-  points over the continent) in roughly six weeks, then holds there. This keeps
-  every run inside the free Open-Meteo hourly limit (5,000 weighted calls).
-- `GRID_RES_FINEST`: the finest resolution the map refines toward (default 0.5).
+  coarse to fine over successive runs, reaching about 0.3 degree (~7,700 land
+  points over the continent) in roughly ten weeks, then holds there. Two runs a
+  week (Monday and a silent midweek top-up) each spend up to 4,500 weighted calls,
+  keeping every run inside the free Open-Meteo hourly limit (5,000 weighted calls)
+  and the weekly total inside the daily limit. Each run refreshes only points at
+  least `REFRESH_MIN_STALE_DAYS` old, so the two runs share the refresh load.
+  Changing `GRID_RES_FINEST` discards cached points that no longer sit on the new
+  grid, since they could never be refreshed again.
+- `GRID_RES_FINEST`: the finest resolution the map refines toward (default 0.3).
 - `GRID_RES_LEVELS`: the coarse-to-fine fill order (each a whole multiple of
   `GRID_RES_FINEST`).
 - `TARGET_CALLS_PER_RUN`: weighted-call budget per run (default 4,000, under the
@@ -115,7 +127,10 @@ and its change over the season, rather than the absolute percentage.
 3. Commit and push. In the repository, open Settings, Actions, General, and
    under Workflow permissions choose read and write.
 4. Trigger a first run from the Actions tab (Run workflow), or wait for the
-   Monday schedule.
+   schedule. The main run is timed to deliver the email about 7am Monday,
+   Australian Eastern time; a second, silent workflow runs midweek to top up the
+   weather cache and sends nothing. The Monday email confirms in its fine print
+   that the midweek run happened.
 
 Each run writes to `blast_outputs/`: a dated map, table and summary, plus
 `*_latest` copies, and commits them back to the repository.
@@ -127,8 +142,9 @@ Rscript -e 'install.packages(c("data.table","jsonlite"))'
 Rscript run_blast.R
 ```
 
-The Open-Meteo archive lags real time by roughly five days, so the run reports
-up to about five days ago. That is set by `ARCHIVE_LAG_DAYS` in the config.
+The Open-Meteo archive lags real time by several days, so the run reports up to
+about six days ago. That is set by `ARCHIVE_LAG_DAYS` in the config. Dates are
+reported in Australian Eastern time (AEST/AEDT).
 
 ## Email (required)
 

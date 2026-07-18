@@ -93,11 +93,12 @@ GRID_CONC           <- 4            # grid points fetched concurrently (Linux ru
 GRID_TARGET_PER_MIN <- 400          # weighted-call rate cap while fetching (< 600/min)
 WEATHER_CACHE_GZ   <- "weather_cache.csv.gz"   # primary: gzipped, small (~1/5 size)
 WEATHER_CACHE_CSV  <- "weather_cache.csv"      # fallback: plain CSV
-# Read tries gz first, then csv. Write uses gz and verifies it can be read back;
-# if that fails it falls back to writing plain CSV. Keep FALSE to commit only the
-# small gz; set TRUE to also commit the CSV every run as a belt-and-braces backup
-# (larger repo). The email note shows which format and its size.
-WEATHER_CACHE_KEEP_CSV <- FALSE
+# Read tries gz first, then csv. Write saves the gz and reads it back to verify;
+# if that fails it falls back to writing plain CSV (that fallback is always on).
+# KEEP_CSV additionally writes the CSV alongside a good gz, so a readable copy is
+# always in the repo while gz is being proven. Set to FALSE once a few runs have
+# reported "Cache gz+csv" with no fallback, to stop committing the larger CSV.
+WEATHER_CACHE_KEEP_CSV <- TRUE
 
 # Legacy fixed resolution (no longer used by the dynamic runner; kept for
 # reference and any single-shot use).

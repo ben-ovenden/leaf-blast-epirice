@@ -167,7 +167,7 @@ map_growth_line <- function() {
   fmt <- if (length(s) >= 5) s[5] else NA
   kb  <- if (length(s) >= 6) as.numeric(s[6]) else NA
   chg <- if (is.na(prev) || prev <= 0) ""
-         else if (now > prev) sprintf(" (up from %d last week)", prev)
+         else if (now > prev) sprintf(" (up from %d at the last run)", prev)
          else " (steady)"
   at_target <- !is.na(sp) && !is.na(finest) && sp <= finest * 1.05
   tail <- if (at_target) "; at target resolution"
@@ -323,7 +323,7 @@ sprintf(paste0("<p style='margin:0 0 12px;'>Two models for %d monitoring towns, 
         nrow(results), format(end_date, "%d %b %Y")),
 if (!is.null(mg))
   sprintf(paste0("<p style='margin:-4px 0 12px;font-size:12px;color:#6b7378;'>",
-                 "<b>Map:</b> %s.</p>"), mg) else "",
+                 "<b>Map:</b> %s</p>"), mg) else "",
 if (!is.null(mw))
   sprintf(paste0("<p style='margin:-8px 0 12px;font-size:12px;color:#6b7378;'>",
                  "<b>Midweek:</b> %s</p>"), mw) else "",

@@ -92,20 +92,59 @@ csv_file <- file.path(OUT, WEATHER_CACHE_CSV)
 
 # Read the cache preferring the small gz; fall back to the plain CSV if the gz is
 # missing or unreadable (also covers the one-time migration from a CSV-only repo).
+#
+# NOTE: fread() cannot read .gz directly unless the R.utils package is installed
+# (it is not in the runner container), so gz files are decompressed with base R's
+# gzfile connection into a temp CSV first. That keeps the cache dependency-free.
+read_gz_dt <- function(f) {
+  tmp <- tempfile(fileext = ".csv")
+  on.exit(unlink(tmp), add = TRUE)
+  inp <- gzfile(f, "rb"); outp <- file(tmp, "wb")
+  repeat {
+    chunk <- readBin(inp, "raw", 1048576L)
+    if (length(chunk) == 0L) break
+    writeBin(chunk, outp)
+  }
+  close(inp); close(outp)
+  fread(tmp, colClasses = list(character = "pid"))
+}
 read_cache <- function() {
-  for (f in c(gz_file, csv_file)) {
-    if (!file.exists(f)) next
-    d <- tryCatch(fread(f, colClasses = list(character = "pid")),
+  need <- c("pid","lon","lat","date","TEMP","RHUM","RAIN","wet_hours","temp_wet","infect","semi")
+  read_one <- function(f) {
+    if (!file.exists(f)) return(NULL)
+    is_gz <- grepl("\\.gz$", f)
+    d <- tryCatch(if (is_gz) read_gz_dt(f) else fread(f, colClasses = list(character = "pid")),
                   error = function(e) {
                     cat(sprintf("Cache read FAILED (%s): %s\n", basename(f), conditionMessage(e))); NULL })
-    if (!is.null(d)) {
-      cat(sprintf("Cache file: %s (%.0f KB); read %d rows, %d points\n",
-                  basename(f), file.info(f)$size / 1024, nrow(d), length(unique(d$pid))))
-      return(list(data = d, fmt = if (grepl("\\.gz$", f)) "gz" else "csv"))
+    # A damaged file can read without error yet be empty or missing columns (a
+    # non-gzip file opened through gzfile reads as plain text, for instance).
+    if (is.null(d) || nrow(d) == 0 || !all(need %in% names(d))) {
+      if (!is.null(d))
+        cat(sprintf("Cache file %s is empty or malformed (%d rows); ignoring it.\n",
+                    basename(f), nrow(d)))
+      return(NULL)
     }
+    d
   }
-  cat("No readable cache found; building fresh.\n")
-  list(data = NULL, fmt = NA_character_)
+  gz  <- read_one(gz_file)
+  csv <- read_one(csv_file)
+  # A truncated gzip can read part-way without error, so when both copies exist
+  # (WEATHER_CACHE_KEEP_CSV) take whichever is more complete and say so. They are
+  # written in the same run, so any disagreement means one copy is damaged.
+  if (!is.null(gz) && !is.null(csv) && nrow(csv) > nrow(gz))
+    cat(sprintf("gz cache looks truncated (%d rows vs %d in the CSV); using the CSV.\n",
+                nrow(gz), nrow(csv)))
+  pick <- if (is.null(gz)) csv
+          else if (!is.null(csv) && nrow(csv) > nrow(gz)) csv else gz
+  if (is.null(pick)) {
+    cat("No readable cache found; building fresh.\n")
+    return(list(data = NULL, fmt = NA_character_))
+  }
+  used <- if (!is.null(gz) && identical(pick, gz)) gz_file else csv_file
+  cat(sprintf("Cache file: %s (%.0f KB); read %d rows, %d points\n",
+              basename(used), file.info(used)$size / 1024,
+              nrow(pick), length(unique(pick$pid))))
+  list(data = pick, fmt = if (grepl("\\.gz$", used)) "gz" else "csv")
 }
 cache <- read_cache()$data
 if (is.null(cache) || !all(c("infect","semi","wet_hours") %in% names(cache))) {
@@ -116,6 +155,19 @@ if (is.null(cache) || !all(c("infect","semi","wet_hours") %in% names(cache))) {
                       infect = integer(), semi = integer())
 }
 cache[, date := as.Date(date)]
+
+# Drop cached points that are not on the current target grid. This matters after a
+# change to GRID_RES_FINEST: points from the old grid do not coincide with the new
+# one, so they would never be refreshed again, yet would still be modelled - feeding
+# progressively staler weather into the map. Better to drop them than to map them.
+if (nrow(cache) > 0) {
+  orphans <- setdiff(unique(cache$pid), targets$pid)
+  if (length(orphans) > 0) {
+    cat(sprintf("Dropping %d cached point(s) not on the current %.2f deg grid (off-grid after a resolution change; they could never be refreshed).\n",
+                length(orphans), GRID_RES_FINEST))
+    cache <- cache[!pid %in% orphans]
+  }
+}
 
 # ---- Decide what to fetch --------------------------------------------------
 cost_new <- (CROP_AGE_DAYS / 7) * 0.75
@@ -312,8 +364,8 @@ csvdt[, `:=`(TEMP = round(TEMP, 1), RHUM = round(RHUM, 0), RAIN = round(RAIN, 1)
 write_cache <- function(dt) {
   ok_gz <- tryCatch({
     fwrite(dt, gz_file)
-    nrow(fread(gz_file, colClasses = list(character = "pid"))) == nrow(dt)
-  }, error = function(e) FALSE)
+    nrow(read_gz_dt(gz_file)) == nrow(dt)
+  }, error = function(e) { cat("gz verify error:", conditionMessage(e), "\n"); FALSE })
   if (ok_gz) {
     if (WEATHER_CACHE_KEEP_CSV) { fwrite(dt, csv_file); fmt <- "gz+csv" }
     else { if (file.exists(csv_file)) file.remove(csv_file); fmt <- "gz" }
