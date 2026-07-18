@@ -1,18 +1,47 @@
-name: Weekly leaf blast risk
+name: Weekly leaf blast risk (Monday ~7am AET email)
 
+# GitHub cron is UTC only, and eastern-Australia clocks shift an hour at daylight
+# saving. So two schedules bracket the change and the gate job below lets only the
+# one landing at 06:30 local (AEST or AEDT) proceed. The run takes ~25 min, so the
+# email arrives about 7am Monday, eastern-Australia time, all year.
 on:
   schedule:
-    # 06:00 Monday AEST (UTC+10) = 20:00 Sunday UTC. Queensland sites stay on AEST
-    # all year (no daylight saving), so this is 6am there every Monday.
-    - cron: '0 20 * * 0'
+    - cron: '30 20 * * 0'   # 06:30 Monday AEST (winter, UTC+10)
+    - cron: '30 19 * * 0'   # 06:30 Monday AEDT (summer, UTC+11)
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  blast:
+  # Cheap host-side gate: proceed only when it is ~06:30 in eastern Australia, so
+  # exactly one of the two seasonal schedules runs each week (the other exits here).
+  gate:
     runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual trigger; running."
+            echo "run=yes" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          H=$(TZ=Australia/Sydney date +%H)
+          echo "Local eastern-Australia hour: $H"
+          if [ "$H" = "06" ]; then
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "Off-hour (${H}:xx local); the other seasonal cron handles this."
+            echo "run=no" >> "$GITHUB_OUTPUT"
+          fi
+
+  blast:
+    needs: gate
+    if: needs.gate.outputs.run == 'yes'
+    runs-on: ubuntu-latest
+    # Single-batch run (~30 min). The 4500-call budget keeps it under the limits.
+    timeout-minutes: 60
     # Job-level env so the email step's `if:` can read it (a step cannot read its
     # own step-level env in its own `if:`).
     env:
@@ -41,7 +70,7 @@ jobs:
       - name: Set run date
         run: |
           RD=$(cat blast_outputs/run_date.txt 2>/dev/null || true)
-          [ -z "$RD" ] && RD=$(date -u +%F)
+          [ -z "$RD" ] && RD=$(TZ=Australia/Sydney date +%F)
           echo "RUN_DATE=$RD" >> "$GITHUB_ENV"
           echo "Using RUN_DATE=$RD"
 
