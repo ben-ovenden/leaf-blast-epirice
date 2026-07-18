@@ -1,0 +1,57 @@
+name: Midweek blast cache top-up
+
+# Silent midweek run: fetches another batch of weather (up to the 4500-call
+# budget), updates and commits the weather cache, and records a status line that
+# the Sunday email confirms. It does NOT run the town summary and sends NO email.
+# Together with the Sunday run this does ~9000 calls/week, enough to reach and
+# hold the 0.3 deg map, without the hourly-limit wait of a two-batch run.
+on:
+  schedule:
+    # 06:00 Thursday AEST (UTC+10) = 20:00 Wednesday UTC. ~3-4 days from the
+    # Sunday run, so the two runs stagger the refresh across the week.
+    - cron: '0 20 * * 3'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  topup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: rocker/geospatial:latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install extra R packages
+        run: |
+          pkgs <- c("data.table", "jsonlite")
+          need <- pkgs[!pkgs %in% rownames(installed.packages())]
+          if (length(need)) install.packages(need)
+        shell: Rscript {0}
+
+      # BLAST_MIDWEEK=1 makes the grid write midweek_status.txt for the Sunday email.
+      - name: Fetch and update cache (no email)
+        env:
+          BLAST_MIDWEEK: "1"
+        run: Rscript run_blast_grid.R
+
+      - name: Commit weather cache and status
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --local user.email "github-actions@github.com"
+          git config --local user.name "github-actions"
+          for f in weather_cache.csv.gz weather_cache.csv midweek_status.txt; do [ -f "blast_outputs/$f" ] && git add -f "blast_outputs/$f"; done
+          git add -u blast_outputs/ 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "Midweek cache top-up $(date +%F)"
+          git push
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blast-outputs-midweek
+          path: blast_outputs/
+          retention-days: 30
