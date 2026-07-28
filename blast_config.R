@@ -92,16 +92,42 @@ GRID_RES_LEVELS <- c(1.2, 0.6, 0.3) # coarse-to-fine while the cache is being bu
 GRID_MAX_FETCHES_PER_RUN <- 8500L   # >= grid size, so the whole grid fetches each run
 REFRESH_MIN_STALE_DAYS   <- 0L      # bring every point to end_date each run (uniform)
 DAILY_WEIGHTED_CAP       <- 9000    # weighted-call ceiling per run (< 10000/day limit)
-# Concurrency is the throughput lever: each archive fetch takes roughly 14 s, so
-# throughput is about GRID_CONC/14 per second. GRID_CONC 4 gave only ~17/min, far too
-# slow to refresh the whole grid in one run. 16 gives roughly 70/min.
-GRID_CONC           <- 16           # grid points fetched concurrently
+# Concurrency. GRID_CONC is only the STARTING value: the grid measures NET
+# successful fetches per minute over GRID_PROBE_CHUNKS chunks and hill climbs,
+# keeping whichever direction improves it. Net is what matters, since raising
+# concurrency raises the request rate but also the failure rate, and past some point
+# the extra failures cost more than the throughput gains. Measured at concurrency 4
+# the archive gave ~16.5 net/min at 2% failures; at 16 it gave ~22.7 net/min at 44%
+# failures, so the useful setting is somewhere between and varies with the archive's
+# mood. Hill climbing finds it per run instead of guessing. Because the pacer caps
+# the request rate, a higher concurrency cannot breach the API limits.
+GRID_CONC           <- 8            # starting concurrency (adapts during the run)
+GRID_CONC_MIN       <- 4L           # floor
+GRID_CONC_MAX       <- 24L          # ceiling
+GRID_FAIL_BACKOFF   <- 0.5          # failure rate above which we back off regardless
+GRID_PROBE_CHUNKS   <- 6L           # chunks per throughput measurement before adjusting
 # Rate cap. This MUST also respect the 5000/hour limit, not just 600/min: 70/min is
 # 4200/hour, leaving margin. (The old 400/min would have been 24000/hour; it never
 # bit only because real throughput was ~17/min, but it would breach at GRID_CONC 16.)
 GRID_TARGET_PER_MIN <- 70           # weighted calls/min (4200/hour, < 5000/hour)
-GRID_FETCH_TIMEOUT_S <- 45L         # per-point HTTP timeout (fail fast on a slow archive)
-GRID_MAX_MINUTES    <- 130L         # wall-clock fetch budget; stop, save and commit if hit
+# Per-point HTTP timeout. This interacts with concurrency: the archive slows under
+# load, so a timeout that is fine at low concurrency starts killing viable requests
+# at high concurrency. A 45 s limit produced 44% failures on refreshes and 55% on
+# the heavier add requests, failures tracking request size, which is the signature of
+# a timeout rather than throttling. 100 s gives requests room; the wall-clock budget
+# (GRID_MAX_MINUTES) is what protects against a genuinely stalled archive.
+GRID_FETCH_TIMEOUT_S <- 100L
+GRID_MAX_MINUTES    <- 200L         # wall-clock fetch budget, measured from run start
+GRID_RESERVE_MINUTES <- 25L         # time needed after fetching to model, render and commit
+# The workflow timeout must exceed GRID_MAX_MINUTES + GRID_RESERVE_MINUTES (225),
+# so the script's own graceful stop fires first and the run still saves its work.
+# weekly_blast.yml is set to 240, leaving 15 min of slack.
+# Share of the fetch budget reserved for adding new cells. Refresh runs first and
+# gets the rest. Without a reserve the grid stalls: once refreshing every cached
+# cell fills the budget there is never time to add more. At the throughput seen so
+# far (~23 successful fetches/min) refreshing ~2,987 cells already took the whole
+# 130 min budget, which is why this exists.
+GRID_ADD_RESERVE_FRAC <- 0.2
 # Fraction of cells that must reach the map's common window end. The window ends at
 # the newest date this fraction of cells has actually reached, and every cell is
 # truncated to it, so the map is one window of real weather. 1 = no cell dropped

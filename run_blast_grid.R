@@ -18,6 +18,10 @@
 # run tag and map filenames agree with the Monday-morning email.
 Sys.setenv(TZ = "Australia/Sydney")
 
+# Start of the run: the fetch deadline is measured from here, so time spent loading
+# the cache and building the target grid counts against the budget too.
+RUN_T0 <- Sys.time()
+
 SCRIPT_DIR <- tryCatch(
   normalizePath(dirname(sys.frame(1)$ofile), winslash = "/"),
   error = function(e) normalizePath(getwd(), winslash = "/"))
@@ -210,6 +214,9 @@ fetch_point <- function(lon, lat, start) {
              semi = as.integer(w$semi))
 }
 new_rows <- list()
+# Points actually attempted this run. The retry below must only revisit points that
+# were tried and failed, never points the time budget stopped us from reaching.
+attempted_pids <- character(0)
 # Parallel, rate-limited fetch. Points are fetched in chunks of GRID_CONC at once
 # (mclapply forks on Linux; serial on Windows), and each chunk is held to at least
 # a minimum duration so the weighted-call rate stays under GRID_TARGET_PER_MIN
@@ -239,77 +246,151 @@ account_and_maybe_pause <- function(weighted) {
   }
 }
 
-do_fetch <- function(tab, start_fun, label, cost) {
+do_fetch <- function(tab, start_fun, label, cost, deadline = fetch_deadline) {
   n <- nrow(tab); got <- 0L
-  min_chunk_s <- (GRID_CONC * cost) / (GRID_TARGET_PER_MIN / 60)  # hold the rate
+  # Concurrency adapts to whatever actually delivers the most SUCCESSFUL fetches per
+  # minute, which is not the same as the highest request rate. Raising concurrency
+  # raises the request rate but also the failure rate, and past some point the extra
+  # failures cost more than the extra throughput buys. So rather than chasing a gross
+  # rate, this measures net (successful) throughput over a window of chunks and hill
+  # climbs: keep moving concurrency the way that improved it, reverse when it drops.
+  # The pacer below still caps the request rate, so this cannot breach API limits.
+  conc     <- max(1L, as.integer(GRID_CONC))
+  conc_min <- if (exists("GRID_CONC_MIN")) as.integer(GRID_CONC_MIN) else 4L
+  conc_max <- if (exists("GRID_CONC_MAX")) as.integer(GRID_CONC_MAX) else 32L
+  fail_lim <- if (exists("GRID_FAIL_BACKOFF")) GRID_FAIL_BACKOFF else 0.5
+  probe_every <- if (exists("GRID_PROBE_CHUNKS")) as.integer(GRID_PROBE_CHUNKS) else 6L
+  win_ok <- 0L; win_secs <- 0; win_chunks <- 0L; win_tried <- 0L
+  last_net <- -1; step_dir <- 1L; conc_start <- conc
+  tried <- 0L; got <- 0L
   i <- 1L
   t_start <- Sys.time()
   while (i <= n) {
     # Wall-clock guard: if the archive is slow, stop starting new chunks once the
     # fetch budget is spent, so the run still models, saves and commits what it has
     # instead of being killed by the job timeout (which would lose all progress).
-    if (!is.na(fetch_deadline) && Sys.time() > fetch_deadline) {
-      cat(sprintf("  %s: fetch time budget (%d min) reached at %d/%d; stopping early and saving progress.\n",
-                  label, GRID_MAX_MINUTES, i - 1L, n))
+    if (!is.na(deadline) && Sys.time() > deadline) {
+      cat(sprintf("  %s: time budget reached at %d/%d; stopping this phase and moving on.\n",
+                  label, i - 1L, n))
       break
     }
-    j <- min(i + GRID_CONC - 1L, n)
+    j <- min(i + conc - 1L, n)
     t0 <- Sys.time()
     idx <- i:j
     chunk <- tryCatch(
       parallel::mclapply(idx, function(m)
-        fetch_point(tab$lon[m], tab$lat[m], start_fun(tab$pid[m])), mc.cores = GRID_CONC),
+        fetch_point(tab$lon[m], tab$lat[m], start_fun(tab$pid[m])), mc.cores = conc),
       error = function(e) lapply(idx, function(m)
         fetch_point(tab$lon[m], tab$lat[m], start_fun(tab$pid[m]))))
+    ok_n <- 0L
     for (r in chunk) if (is.data.frame(r) && nrow(r) > 0) {
-      new_rows[[length(new_rows) + 1L]] <<- r; got <- got + 1L
+      new_rows[[length(new_rows) + 1L]] <<- r; ok_n <- ok_n + 1L
     }
-    if (j %% 100 < GRID_CONC || j == n) cat(sprintf("  %s %d/%d (%d ok)\n", label, j, n, got))
+    got <- got + ok_n; tried <- tried + length(idx)
+    attempted_pids <<- c(attempted_pids, tab$pid[idx])
+    if (j %% 100 < conc || j == n) cat(sprintf("  %s %d/%d (%d ok)\n", label, j, n, got))
     el <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+    win_ok <- win_ok + ok_n; win_tried <- win_tried + length(idx)
+    win_secs <- win_secs + max(el, 0.01); win_chunks <- win_chunks + 1L
+    if (win_chunks >= probe_every) {
+      net <- win_ok / win_secs                       # successful fetches per second
+      wfail <- 1 - win_ok / max(1L, win_tried)
+      if (wfail > fail_lim) {
+        # Most requests are failing: back off regardless of throughput, both to stop
+        # hammering a struggling archive and because the work is largely wasted.
+        step_dir <- -1L
+      } else if (last_net >= 0 && net < last_net) {
+        step_dir <- -step_dir                        # that move made things worse
+      }
+      step <- max(1L, as.integer(round(conc * 0.25)))
+      conc <- min(conc_max, max(conc_min, conc + step_dir * step))
+      last_net <- net
+      win_ok <- 0L; win_tried <- 0L; win_secs <- 0; win_chunks <- 0L
+    }
+    min_chunk_s <- (conc * cost) / (GRID_TARGET_PER_MIN / 60)   # recomputed: conc varies
     if (pace_mult > 0 && el < min_chunk_s) Sys.sleep((min_chunk_s - el) * pace_mult)
     account_and_maybe_pause(length(idx) * cost)
     i <- j + 1L
   }
-  # Throughput and failure rate, so GRID_CONC can be tuned from real runs rather
-  # than guessed: if failures are low and the rate is well under GRID_TARGET_PER_MIN,
-  # concurrency can be raised; if failures climb, lower it.
+  # Gross and NET rates plus where concurrency settled. Net is the number that
+  # matters: it is the cells actually added to the map per minute.
   el_min <- as.numeric(difftime(Sys.time(), t_start, units = "mins"))
-  tried <- i - 1L
   if (tried > 0 && el_min > 0)
-    cat(sprintf("  %s done: %d/%d ok (%.1f%% failed) in %.1f min = %.0f fetches/min at GRID_CONC %d\n",
-                label, got, tried, 100 * (tried - got) / tried, el_min, tried / el_min, GRID_CONC))
+    cat(sprintf("  %s done: %d/%d ok (%.1f%% failed) in %.1f min; gross %.0f/min, NET %.1f/min; concurrency %d -> %d\n",
+                label, got, tried, 100 * (tried - got) / tried, el_min,
+                tried / el_min, got / el_min, conc_start, conc))
 }
-# Deadline for all fetching this run (refresh + add). Adds are fetched after
-# refreshes, so a slow archive spends the budget keeping existing points current
-# first, then adds whatever time remains.
+# Deadline for all fetching this run (refresh + add), measured from RUN_T0 (script
+# start) so cache loading and grid building count against it, not just fetching.
+# Adds are fetched after refreshes, so a slow archive spends the budget keeping
+# existing cells current first, then grows the grid with whatever time is left.
+# GRID_RESERVE_MINUTES is the time still needed after fetching for modelling,
+# rendering, saving and committing. The workflow's timeout-minutes must exceed
+# GRID_MAX_MINUTES + GRID_RESERVE_MINUTES, or the job is killed before this
+# script's own graceful stop can save anything.
 GRID_MAX_MINUTES <- if (exists("GRID_MAX_MINUTES")) GRID_MAX_MINUTES else 70L
+reserve_min <- if (exists("GRID_RESERVE_MINUTES")) GRID_RESERVE_MINUTES else 25L
 fetch_deadline <- as.POSIXct(NA)
 if (!is.na(GRID_MAX_MINUTES) && GRID_MAX_MINUTES > 0)
-  fetch_deadline <- Sys.time() + GRID_MAX_MINUTES * 60
+  fetch_deadline <- RUN_T0 + GRID_MAX_MINUTES * 60
+cat(sprintf("Fetch budget %.0f min from run start (%.0f min used so far); reserve %.0f min after fetching, so the workflow timeout should exceed %.0f min.\n",
+            as.numeric(GRID_MAX_MINUTES), as.numeric(difftime(Sys.time(), RUN_T0, units = "mins")),
+            as.numeric(reserve_min), as.numeric(GRID_MAX_MINUTES) + as.numeric(reserve_min)))
+# Refresh gets its own, earlier deadline so it cannot consume the entire budget.
+# Without this the grid stalls: once refreshing every cached cell fills the budget,
+# no time is ever left to add new ones and the map can never grow. Reserving a share
+# for adds costs a few cells on this run's map (unrefreshed cells are absent under
+# the "latest" window) and buys permanent growth.
+add_frac <- if (exists("GRID_ADD_RESERVE_FRAC")) GRID_ADD_RESERVE_FRAC else 0.2
+refresh_deadline <- fetch_deadline
+if (!is.na(fetch_deadline) && nrow(add) > 0 && add_frac > 0)
+  refresh_deadline <- RUN_T0 + GRID_MAX_MINUTES * 60 * (1 - add_frac)
 if (nrow(maintain) > 0) {
   last_by <- cache[, .(last = max(date)), by = pid]; setkey(last_by, pid)
   ms <- function(k) { l <- last_by[.(k), last]; if (length(l) == 0 || is.na(l)) emergence else max(emergence, l + 1) }
-  do_fetch(maintain, ms, "refresh", 1)
+  do_fetch(maintain, ms, "refresh", 1, deadline = refresh_deadline)
 }
-if (nrow(add) > 0) do_fetch(add, function(k) emergence, "add", cost_new)
+if (nrow(add) > 0) do_fetch(add, function(k) emergence, "add", cost_new, deadline = fetch_deadline)
 
-# Retry points that failed under concurrency, in a second parallel pass at modest
-# concurrency. Both refreshes and adds are retried: with the same-date filter a
+# Retry points that were ATTEMPTED and failed, in a second pass at modest
+# concurrency. Both refreshes and adds are retried: with the latest-date window a
 # point that misses end_date is dropped from this run's map, so a failed refresh
 # costs a visible cell, not just a delay.
+# Two bounds matter. Only attempted points are eligible, so points the time budget
+# stopped us reaching are left for next run rather than fetched here. And the retry
+# honours the same deadline, so it cannot run past the budget into the job timeout.
 fetched_pids <- if (length(new_rows) > 0) unique(rbindlist(new_rows)$pid) else character(0)
-failed_ref <- if (nrow(maintain) > 0) maintain[!pid %in% fetched_pids] else maintain[0]
-failed_add <- add[!pid %in% fetched_pids]
+tried_pids <- unique(attempted_pids)
+failed_ref <- if (nrow(maintain) > 0) maintain[pid %in% tried_pids & !pid %in% fetched_pids] else maintain[0]
+failed_add <- add[pid %in% tried_pids & !pid %in% fetched_pids]
 retry_one <- function(tab, start_fun, label) {
   if (nrow(tab) == 0) return(invisible())
+  if (!is.na(fetch_deadline) && Sys.time() > fetch_deadline) {
+    cat(sprintf("  skipping retry of %d failed %s point(s): fetch budget spent.\n",
+                nrow(tab), label))
+    return(invisible())
+  }
   cat(sprintf("  parallel retry for %d failed %s point(s)\n", nrow(tab), label))
-  rc <- min(GRID_CONC, 4L)
-  res <- tryCatch(
-    parallel::mclapply(seq_len(nrow(tab)), function(i)
-      fetch_point(tab$lon[i], tab$lat[i], start_fun(tab$pid[i])), mc.cores = rc),
-    error = function(e) lapply(seq_len(nrow(tab)), function(i)
-      fetch_point(tab$lon[i], tab$lat[i], start_fun(tab$pid[i]))))
-  for (r in res) if (is.data.frame(r) && nrow(r) > 0) new_rows[[length(new_rows) + 1L]] <<- r
+  rc <- max(1L, min(as.integer(GRID_CONC), 8L))
+  done <- 0L
+  i <- 1L
+  while (i <= nrow(tab)) {
+    if (!is.na(fetch_deadline) && Sys.time() > fetch_deadline) {
+      cat(sprintf("  %s retry stopped at %d/%d: fetch budget spent.\n", label, i - 1L, nrow(tab)))
+      break
+    }
+    j <- min(i + rc - 1L, nrow(tab)); idx <- i:j
+    res <- tryCatch(
+      parallel::mclapply(idx, function(k)
+        fetch_point(tab$lon[k], tab$lat[k], start_fun(tab$pid[k])), mc.cores = rc),
+      error = function(e) lapply(idx, function(k)
+        fetch_point(tab$lon[k], tab$lat[k], start_fun(tab$pid[k]))))
+    for (r in res) if (is.data.frame(r) && nrow(r) > 0) {
+      new_rows[[length(new_rows) + 1L]] <<- r; done <- done + 1L
+    }
+    i <- j + 1L
+  }
+  cat(sprintf("  %s retry recovered %d point(s)\n", label, done))
 }
 if (nrow(failed_ref) > 0) {
   last_by_r <- cache[, .(last = max(date)), by = pid]; setkey(last_by_r, pid)

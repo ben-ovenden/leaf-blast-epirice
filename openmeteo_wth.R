@@ -86,7 +86,9 @@ OPENMETEO_ARCHIVE_URL <- "https://archive-api.open-meteo.com/v1/archive"
 
 # Main adapter: fetch daily weather for one location and date range.
 get_openmeteo_wth <- function(lat, lon, start_date, end_date,
-                              timeout_seconds = 30) {
+                              timeout_seconds = 45) {
+  old <- options(timeout = timeout_seconds)   # was declared but never applied
+  on.exit(options(old), add = TRUE)
 
   url <- sprintf(
     paste0("%s?latitude=%.4f&longitude=%.4f&start_date=%s&end_date=%s",
@@ -177,8 +179,11 @@ get_openmeteo_grid <- function(lats, lons, start_date, end_date, pause = 0.8) {
 # is by variable count and period, not resolution), so one hourly fetch feeds
 # both EPIRICE (via daily aggregation) and BLASTAM.
 ################################################################################
-get_openmeteo_hourly <- function(lat, lon, start_date, end_date, timeout_seconds = 120) {
-  old <- options(timeout = max(timeout_seconds, getOption("timeout", 60)))
+get_openmeteo_hourly <- function(lat, lon, start_date, end_date, timeout_seconds = 45) {
+  # Cap each request so a slow/degraded archive fails fast and the loop moves on,
+  # rather than waiting the old 120 s per point (which turned a bad archive day
+  # into an hours-long run). Set it directly instead of max()-ing with the default.
+  old <- options(timeout = timeout_seconds)
   on.exit(options(old), add = TRUE)
   url <- sprintf(
     "%s?latitude=%.4f&longitude=%.4f&start_date=%s&end_date=%s&hourly=%s&timezone=UTC",
