@@ -181,6 +181,49 @@ days, which indicates whether the epidemic is building or easing.
 - The wet day proxy uses daily mean humidity and rainfall. It does not resolve
   the length of overnight leaf wetness directly.
 
+## How the map window works
+
+Every cell on the map is modelled over the same calendar window using only real
+weather. Nothing is padded or extrapolated. `GRID_WINDOW_MODE` decides how that
+shared window is chosen.
+
+**`"latest"` (default).** The window always ends at the archive edge, so the map is
+as current as the data allows. Cells that did not reach that date this run, because
+a fetch failed or the wall-clock budget stopped the run, are simply absent from the
+map; they stay in the cache and are refreshed next run. Freshness is fixed and the
+cell count varies. Gaps are interpolated over when the surface is drawn, so a small
+scatter of missing cells changes the picture very little.
+
+**`"coverage"`.** The window is pulled back to the newest date that
+`GRID_WINDOW_COVERAGE` of cells have reached, and every cell is truncated to it.
+Nearly all cells are mapped, but the map runs further behind. Useful only if the
+grid is refreshed on a rolling basis across several runs.
+
+## Throughput and resolution
+
+Resolution is limited by how many cells one run can refresh, because a cell fetched
+in an earlier run no longer reaches the current archive edge. Extra runs during the
+week do not help a `"latest"` map.
+
+Each archive fetch takes roughly 14 seconds, so throughput is about `GRID_CONC`/14
+per second. `GRID_CONC` is therefore the lever, not the API limits: at 4 the rate is
+only about 17/min, at 16 about 70/min, which refreshes the whole 0.3 deg grid
+(~7,700 land cells, ~33 km) in around 110 minutes.
+
+`GRID_TARGET_PER_MIN` must respect the 5,000/hour limit as well as 600/min. It is
+set to 70, which is 4,200/hour. Raising `GRID_CONC` without checking this would
+breach the hourly limit.
+
+Each fetch phase logs its actual rate and failure percentage, for example
+`refresh done: 6980/7000 ok (0.3% failed) in 99.2 min = 71 fetches/min at GRID_CONC 16`.
+Use that to tune: if failures stay low, `GRID_CONC` can be raised; if they climb,
+lower it. Failed cells are retried once in parallel before the map is drawn.
+
+The cache is built up over successive runs, since adding a new cell costs about 6.4
+weighted calls against a 10,000/day limit while refreshing an existing one costs
+about 1. Expect the grid to take a couple of months of weekly runs to fill, with the
+map growing steadily.
+
 ## EPIRICE leaf blast parameters
 
 `epirice_model.R` vendors the SEIR engine and the leaf blast parameterisation

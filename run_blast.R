@@ -167,14 +167,21 @@ map_growth_line <- function() {
   fmt <- if (length(s) >= 5) s[5] else NA
   kb  <- if (length(s) >= 6) as.numeric(s[6]) else NA
   rd  <- if (length(s) >= 7) s[7] else NA
+  wend <- if (length(s) >= 8) s[8] else NA
   chg <- if (is.na(prev) || prev <= 0) ""
          else if (now > prev) sprintf(" (up from %d at the last run)", prev)
          else " (steady)"
-  at_target <- !is.na(sp) && !is.na(finest) && sp <= finest * 1.05
-  # ~111 km per degree of latitude; east-west is less at southern latitudes.
-  km <- if (!is.na(finest)) sprintf(" (~%.0f km)", finest * 111) else ""
-  tail <- if (at_target) sprintf("; at target resolution%s", km)
-          else sprintf("; sharpening toward ~%.2f deg%s", finest, km)
+  # Fixed same-date grid: report its resolution and cell size, not the bbox-based
+  # spacing (which counts ocean) or any "sharpening" (the grid no longer builds up).
+  km <- if (!is.na(finest)) sprintf(" (~%.0f km cells)", finest * 111) else ""
+  # The map's window can end earlier than the town data when the grid is refreshed
+  # on a rolling basis, so state the map's own date rather than implying they match.
+  wtxt <- if (is.na(wend)) ", all over one common window" else {
+    d <- suppressWarnings(as.Date(wend))
+    if (is.na(d)) ", all over one common window"
+    else sprintf(", all modelled over one window to %s", format(d, "%d %b"))
+  }
+  tail <- sprintf(" on a %.1f deg grid%s%s", finest, km, wtxt)
   # Say which copy is in use: the one read this run, plus whether a backup exists.
   cache_bit <- if (is.na(fmt) || is.na(kb)) "" else {
     active <- if (!is.na(rd) && rd %in% c("gz", "csv")) rd
@@ -186,24 +193,26 @@ map_growth_line <- function() {
     sprintf(" Cache: %s active%s, %s.", active, extra,
             if (kb >= 1024) sprintf("%.1f MB", kb / 1024) else sprintf("%.0f KB", kb))
   }
-  sprintf("%d grid points at ~%.2f deg spacing%s%s.%s", now, sp, chg, tail, cache_bit)
+  sprintf("%d cells%s%s.%s", now, chg, tail, cache_bit)
 }
 mg <- map_growth_line()
 
-# Read the silent midweek fetch-only run's status (committed by that run) so this
-# email can confirm it ran and went well, or flag if it hasn't run recently.
+# Read the silent top-up run's status (committed by that run) so this email can
+# confirm the daily cache top-up ran and went well, or flag if it stalled.
 midweek_line <- function() {
   f <- file.path(SCRIPT_DIR, OUTPUT_DIR, "midweek_status.txt")
-  if (!file.exists(f)) return("Midweek top-up: no run recorded yet.")
+  if (!file.exists(f)) return(NULL)   # no separate top-up run: omit the line
   s <- tryCatch(strsplit(readLines(f, warn = FALSE)[1], "\\|")[[1]],
                 error = function(e) NULL)
   if (length(s) < 4) return(NULL)
   d <- suppressWarnings(as.Date(s[1])); pts <- as.integer(s[2]); added <- as.integer(s[4])
-  if (is.na(d) || as.integer(Sys.Date() - d) > 5)
-    sprintf("Midweek top-up: no run in the last 5 days (last %s) - check the midweek job.",
+  # A daily top-up runs every non-Monday, so the newest should be yesterday. Allow
+  # 2 days' slack before flagging a stall.
+  if (is.na(d) || as.integer(Sys.Date() - d) > 2)
+    sprintf("Daily top-up: no run in the last 2 days (last %s) - check the top-up job.",
             if (is.na(d)) "never" else format(d, "%d %b"))
   else
-    sprintf("Midweek top-up ran %s: +%d points, cache now %d (ok).",
+    sprintf("Daily top-up ran %s: +%d points, cache now %d (ok).",
             format(d, "%d %b"), added, pts)
 }
 mw <- midweek_line()
@@ -266,7 +275,7 @@ summary_lines <- c(summary_lines, "",
   # as fine print rather than at the top of the summary.
   if (!is.null(mg) || !is.null(mw)) "" else NULL,
   if (!is.null(mg)) paste0("Map:     ", mg) else NULL,
-  if (!is.null(mw)) paste0("Midweek: ", mw) else NULL,
+  if (!is.null(mw)) paste0("Top-up:  ", mw) else NULL,
   "",
   "Sent by Ben Ovenden, ben.ovenden@dpird.nsw.gov.au")
 
@@ -368,7 +377,7 @@ if (!is.null(mg))
                  "<b>Map:</b> %s</p>"), mg) else "",
 if (!is.null(mw))
   sprintf(paste0("<p style='font-size:11px;color:#9aa0a6;margin:2px 0 0;'>",
-                 "<b>Midweek:</b> %s</p>"), mw) else "",
+                 "<b>Top-up:</b> %s</p>"), mw) else "",
 "<p style='font-size:11px;color:#b0b5ba;margin:8px 0 0;'>Sent by Ben Ovenden, ",
 "<a href='mailto:ben.ovenden@dpird.nsw.gov.au' style='color:#b0b5ba;'>",
 "ben.ovenden@dpird.nsw.gov.au</a></p>",

@@ -31,7 +31,8 @@ suppressPackageStartupMessages({library(data.table); library(terra)})
 
 # One hourly fetch -> daily rows carrying both models' inputs.
 if (!exists("POINT_FETCH_FN")) POINT_FETCH_FN <- function(lat, lon, start_date, end_date) {
-  hw <- get_openmeteo_hourly(lat, lon, start_date, end_date)
+  to <- if (exists("GRID_FETCH_TIMEOUT_S")) GRID_FETCH_TIMEOUT_S else 45
+  hw <- get_openmeteo_hourly(lat, lon, start_date, end_date, timeout_seconds = to)
   if (is.null(hw) || nrow(hw) == 0) return(NULL)
   blastam_daily_from_hourly(hw)   # date, TEMP, RHUM, RAIN, wet_hours, temp_wet, infect
 }
@@ -175,22 +176,28 @@ if (nrow(cache) > 0) {
 cost_new <- (CROP_AGE_DAYS / 7) * 0.75
 cached_pids <- unique(cache$pid)
 last_by <- if (nrow(cache) > 0) cache[, .(last = max(date)), by = pid] else data.table(pid = character(), last = as.Date(character()))
-# Refresh only points stale by >= REFRESH_MIN_STALE_DAYS (most-stale first), capped
-# to the per-run budget; skip fresh/current points so their budget adds new points
-# instead. Two staggered runs a week then cover the grid ~weekly within the limits.
+# Cap the whole run by NUMBER OF FETCHES so a run always finishes inside the time
+# limit (cold fetches are the bottleneck, ~15-17/min). Refresh only points stale by
+# >= REFRESH_MIN_STALE_DAYS, most-stale first, up to that cap; fresh/current points
+# are skipped. Any leftover fetches go to adding new points, also kept under the
+# daily weighted-call ceiling. Across seven daily runs this covers the grid ~weekly.
+max_fetch  <- if (exists("GRID_MAX_FETCHES_PER_RUN")) GRID_MAX_FETCHES_PER_RUN else 1000L
+wt_cap     <- if (exists("DAILY_WEIGHTED_CAP")) DAILY_WEIGHTED_CAP else TARGET_CALLS_PER_RUN
 stale_days <- if (exists("REFRESH_MIN_STALE_DAYS")) REFRESH_MIN_STALE_DAYS else 0L
 eligible <- last_by[last < end_date & last <= (end_date - stale_days)][order(last)]
-n_refresh <- min(nrow(eligible), TARGET_CALLS_PER_RUN)
+n_refresh <- min(nrow(eligible), max_fetch)
 maintain <- targets[pid %in% eligible$pid[seq_len(n_refresh)]]
 to_add   <- targets[!pid %in% cached_pids]
 maintain_cost <- nrow(maintain) * 1
-remaining <- max(0, TARGET_CALLS_PER_RUN - maintain_cost)
-n_add <- min(nrow(to_add), floor(remaining / cost_new))
+# adds limited by (a) remaining fetch budget and (b) remaining weighted headroom
+n_add <- min(nrow(to_add),
+             max_fetch - n_refresh,
+             floor(max(0, wt_cap - maintain_cost) / cost_new))
 add <- if (n_add > 0) to_add[seq_len(n_add)] else to_add[0]
 skipped_fresh <- length(cached_pids) - nrow(eligible)
-cat(sprintf("Cache: %d points (%d fresh, skipped). Refresh %d, add %d new (~%.0f weighted, budget %d)\n",
+cat(sprintf("Cache: %d points (%d fresh, skipped). Refresh %d, add %d new (%d/%d fetches, ~%.0f weighted)\n",
             length(cached_pids), skipped_fresh, nrow(maintain), nrow(add),
-            maintain_cost + nrow(add) * cost_new, TARGET_CALLS_PER_RUN))
+            nrow(maintain) + nrow(add), max_fetch, maintain_cost + nrow(add) * cost_new))
 
 # ---- Fetch (per point, only missing dates) --------------------------------
 fetch_point <- function(lon, lat, start) {
@@ -236,7 +243,16 @@ do_fetch <- function(tab, start_fun, label, cost) {
   n <- nrow(tab); got <- 0L
   min_chunk_s <- (GRID_CONC * cost) / (GRID_TARGET_PER_MIN / 60)  # hold the rate
   i <- 1L
+  t_start <- Sys.time()
   while (i <= n) {
+    # Wall-clock guard: if the archive is slow, stop starting new chunks once the
+    # fetch budget is spent, so the run still models, saves and commits what it has
+    # instead of being killed by the job timeout (which would lose all progress).
+    if (!is.na(fetch_deadline) && Sys.time() > fetch_deadline) {
+      cat(sprintf("  %s: fetch time budget (%d min) reached at %d/%d; stopping early and saving progress.\n",
+                  label, GRID_MAX_MINUTES, i - 1L, n))
+      break
+    }
     j <- min(i + GRID_CONC - 1L, n)
     t0 <- Sys.time()
     idx <- i:j
@@ -254,7 +270,22 @@ do_fetch <- function(tab, start_fun, label, cost) {
     account_and_maybe_pause(length(idx) * cost)
     i <- j + 1L
   }
+  # Throughput and failure rate, so GRID_CONC can be tuned from real runs rather
+  # than guessed: if failures are low and the rate is well under GRID_TARGET_PER_MIN,
+  # concurrency can be raised; if failures climb, lower it.
+  el_min <- as.numeric(difftime(Sys.time(), t_start, units = "mins"))
+  tried <- i - 1L
+  if (tried > 0 && el_min > 0)
+    cat(sprintf("  %s done: %d/%d ok (%.1f%% failed) in %.1f min = %.0f fetches/min at GRID_CONC %d\n",
+                label, got, tried, 100 * (tried - got) / tried, el_min, tried / el_min, GRID_CONC))
 }
+# Deadline for all fetching this run (refresh + add). Adds are fetched after
+# refreshes, so a slow archive spends the budget keeping existing points current
+# first, then adds whatever time remains.
+GRID_MAX_MINUTES <- if (exists("GRID_MAX_MINUTES")) GRID_MAX_MINUTES else 70L
+fetch_deadline <- as.POSIXct(NA)
+if (!is.na(GRID_MAX_MINUTES) && GRID_MAX_MINUTES > 0)
+  fetch_deadline <- Sys.time() + GRID_MAX_MINUTES * 60
 if (nrow(maintain) > 0) {
   last_by <- cache[, .(last = max(date)), by = pid]; setkey(last_by, pid)
   ms <- function(k) { l <- last_by[.(k), last]; if (length(l) == 0 || is.na(l)) emergence else max(emergence, l + 1) }
@@ -262,18 +293,30 @@ if (nrow(maintain) > 0) {
 }
 if (nrow(add) > 0) do_fetch(add, function(k) emergence, "add", cost_new)
 
-# Serial retry (clean, non-forked connection) for add points that failed under
-# concurrency, so as much coverage as possible is filled this run rather than
-# waiting for the next weekly run.
+# Retry points that failed under concurrency, in a second parallel pass at modest
+# concurrency. Both refreshes and adds are retried: with the same-date filter a
+# point that misses end_date is dropped from this run's map, so a failed refresh
+# costs a visible cell, not just a delay.
 fetched_pids <- if (length(new_rows) > 0) unique(rbindlist(new_rows)$pid) else character(0)
+failed_ref <- if (nrow(maintain) > 0) maintain[!pid %in% fetched_pids] else maintain[0]
 failed_add <- add[!pid %in% fetched_pids]
-if (nrow(failed_add) > 0) {
-  cat(sprintf("  serial retry for %d failed add points\n", nrow(failed_add)))
-  for (i in seq_len(nrow(failed_add))) {
-    r <- fetch_point(failed_add$lon[i], failed_add$lat[i], emergence)
-    if (!is.null(r) && nrow(r) > 0) new_rows[[length(new_rows) + 1L]] <- r
-  }
+retry_one <- function(tab, start_fun, label) {
+  if (nrow(tab) == 0) return(invisible())
+  cat(sprintf("  parallel retry for %d failed %s point(s)\n", nrow(tab), label))
+  rc <- min(GRID_CONC, 4L)
+  res <- tryCatch(
+    parallel::mclapply(seq_len(nrow(tab)), function(i)
+      fetch_point(tab$lon[i], tab$lat[i], start_fun(tab$pid[i])), mc.cores = rc),
+    error = function(e) lapply(seq_len(nrow(tab)), function(i)
+      fetch_point(tab$lon[i], tab$lat[i], start_fun(tab$pid[i]))))
+  for (r in res) if (is.data.frame(r) && nrow(r) > 0) new_rows[[length(new_rows) + 1L]] <<- r
 }
+if (nrow(failed_ref) > 0) {
+  last_by_r <- cache[, .(last = max(date)), by = pid]; setkey(last_by_r, pid)
+  msr <- function(k) { l <- last_by_r[.(k), last]; if (length(l) == 0 || is.na(l)) emergence else max(emergence, l + 1) }
+  retry_one(failed_ref, msr, "refresh")
+}
+retry_one(failed_add, function(k) emergence, "add")
 if (length(new_rows) > 0)
   cache <- rbindlist(list(cache, rbindlist(new_rows)), use.names = TRUE)
 
@@ -297,13 +340,45 @@ model_pt <- function(dt) {
   }
   win <- if (exists("BLASTAM_WINDOW_DAYS")) BLASTAM_WINDOW_DAYS else 21L
   list(intensity = epi,
-       events = sum(dt$infect[dt$date > (end_date - win)], na.rm = TRUE))
+       events = sum(dt$infect[dt$date > (model_end - win)], na.rm = TRUE))
 }
-pm <- cache[, { m <- model_pt(.SD); .(lon = lon[1], lat = lat[1],
+# COMMON WINDOW, REAL WEATHER ONLY. With a rolling refresh, cells differ in how
+# current they are, so the map's window ends at the newest date that essentially
+# every cell has actually reached, and each cell's series is TRUNCATED to it. That
+# gives one shared calendar window using only real weather: nothing is padded or
+# extrapolated. The map therefore lags the newest data by about the refresh cycle,
+# which is the price of covering more cells than one run can fetch.
+# GRID_WINDOW_COVERAGE is the fraction of cells that must reach the window end;
+# setting it below 1 lets a few stragglers be dropped so the window stays fresher.
+pt_end <- cache[, .(mx = max(date)), by = pid]
+n_cache_pts <- nrow(pt_end)
+wmode <- if (exists("GRID_WINDOW_MODE")) GRID_WINDOW_MODE else "coverage"
+if (identical(wmode, "latest")) {
+  # LATEST: the window always ends at the archive edge. Cells that did not reach it
+  # this run (fetch failure, or the time budget stopping the run) are simply absent
+  # from the map. Freshness is fixed; the cell count is what varies.
+  model_end <- end_date
+} else {
+  # COVERAGE: pull the window back to the newest date GRID_WINDOW_COVERAGE of cells
+  # reached, so nearly every cell is mapped at the cost of a staler window.
+  cover <- if (exists("GRID_WINDOW_COVERAGE")) GRID_WINDOW_COVERAGE else 1
+  mx_sorted <- sort(pt_end$mx)
+  idx <- max(1L, ceiling((1 - cover) * length(mx_sorted)))
+  model_end <- min(mx_sorted[idx], end_date)
+}
+current_pids <- pt_end[mx >= model_end, pid]
+held_out <- n_cache_pts - length(current_pids)
+model_cache <- cache[pid %in% current_pids & date <= model_end]
+cat(sprintf("Window [%s] ends %s: %d of %d cells reach it, %d absent from this map (%d days behind the archive edge).\n",
+            wmode, format(model_end), length(current_pids), n_cache_pts, held_out,
+            as.integer(end_date - model_end)))
+
+pm <- model_cache[, { m <- model_pt(.SD); .(lon = lon[1], lat = lat[1],
               intensity = m$intensity, events = m$events) }, by = pid]
 pm_epi <- pm[!is.na(intensity)]
 map_spacing <- if (nrow(pm) > 0) sqrt(prod(ext[c(2,4)] - ext[c(1,3)]) / nrow(pm)) else NA
-cat(sprintf("Modelled %d points; effective spacing ~%.2f deg\n", nrow(pm), map_spacing))
+cat(sprintf("Modelled %d points (all over the same window to %s); effective spacing ~%.2f deg\n",
+            nrow(pm), format(model_end), map_spacing))
 
 # ---- Render helper (IDW surface -> PNG + GeoTIFF) -------------------------
 load_bundled <- function(fname) {
@@ -382,11 +457,14 @@ wc <- write_cache(csvdt)
 cat(sprintf("Cache saved: %d points as %s (%.0f KB)\nDone.\n",
             length(unique(cache$pid)), wc$fmt, wc$kb))
 
-# Stats line for the email: points, spacing, last run's points, target spacing,
-# stored format and size, and which format was actually read (the active one).
-writeLines(sprintf("%d|%.2f|%d|%.2f|%s|%.0f|%s",
-                   length(unique(cache$pid)), map_spacing,
-                   length(cached_pids), GRID_RES_FINEST, wc$fmt, wc$kb, read_fmt),
+# Stats line for the email: mapped points, spacing, last run's points, target
+# spacing, stored format and size, format actually read, and the common window end.
+# The count is the number MAPPED (nrow(pm)), matching map_spacing, not the whole
+# cache, since cells short of the common window are not on this run's map.
+writeLines(sprintf("%d|%.2f|%d|%.2f|%s|%.0f|%s|%s",
+                   nrow(pm), map_spacing,
+                   length(cached_pids), GRID_RES_FINEST, wc$fmt, wc$kb, read_fmt,
+                   format(model_end)),
            file.path(OUT, "map_stats.txt"))
 
 # On the silent midweek fetch-only run, record a status line (committed to the
