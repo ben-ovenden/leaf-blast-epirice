@@ -1,9 +1,8 @@
 name: Weekly leaf blast risk (Monday ~7am AET email)
 
 # GitHub cron is UTC only, and eastern-Australia clocks shift an hour at daylight
-# saving. So two schedules bracket the change and the gate job below lets only the
-# one landing at 06:30 local (AEST or AEDT) proceed. The run takes ~25 min, so the
-# email arrives about 7am Monday, eastern-Australia time, all year.
+# saving. Two schedules bracket the change and the gate job lets only the one
+# matching the current offset proceed.
 on:
   schedule:
     - cron: '30 20 * * 0'   # 06:30 Monday AEST (winter, UTC+10)
@@ -13,9 +12,14 @@ on:
 permissions:
   contents: write
 
+# Two runs must never write the weather cache at once. Without this a manual
+# dispatch overlapping the cron gives two runs pushing the same file and one of
+# them loses its fetches.
+concurrency:
+  group: blast-grid
+  cancel-in-progress: false
+
 jobs:
-  # Cheap host-side gate: proceed only when it is ~06:30 in eastern Australia, so
-  # exactly one of the two seasonal schedules runs each week (the other exits here).
   gate:
     runs-on: ubuntu-latest
     outputs:
@@ -27,12 +31,18 @@ jobs:
             echo "Manual trigger; running."
             echo "run=yes" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          H=$(TZ=Australia/Sydney date +%H)
-          echo "Local eastern-Australia hour: $H"
-          if [ "$H" = "06" ]; then
+          # Match the schedule that fired against the current UTC offset rather
+          # than against the local hour. GitHub cron routinely fires 5 to 30
+          # minutes late, and the old hour check ("is it 06?") silently skipped
+          # the entire week whenever a run started at 07:0x local.
+          OFF=$(TZ=Australia/Sydney date +%z)     # +1000 (AEST) or +1100 (AEDT)
+          SCHED='${{ github.event.schedule }}'
+          echo "Offset $OFF, schedule '$SCHED'"
+          if { [ "$OFF" = "+1000" ] && [ "$SCHED" = "30 20 * * 0" ]; } || \
+             { [ "$OFF" = "+1100" ] && [ "$SCHED" = "30 19 * * 0" ]; }; then
             echo "run=yes" >> "$GITHUB_OUTPUT"
           else
-            echo "Off-hour (${H}:xx local); the other seasonal cron handles this."
+            echo "The other seasonal cron handles this offset."
             echo "run=no" >> "$GITHUB_OUTPUT"
           fi
 
@@ -40,14 +50,10 @@ jobs:
     needs: gate
     if: needs.gate.outputs.run == 'yes'
     runs-on: ubuntu-latest
-    # Daily fetch-capped run (~60 min at the default 1000-fetch cap). 90 leaves
-    # headroom for slow archive days and the parallel retry.
-    # Must exceed GRID_MAX_MINUTES (200) plus modelling, rendering, commit and
-    # email, so the script's own wall-clock stop fires first and the run still
-    # saves and commits. A hard job timeout here would lose the whole run.
+    # Must exceed GRID_MAX_MINUTES (200) plus GRID_RESERVE_MINUTES (25), so the
+    # script's own graceful stop fires first and the run still saves and commits.
+    # A hard job timeout here would lose the whole run.
     timeout-minutes: 240
-    # Job-level env so the email step's `if:` can read it (a step cannot read its
-    # own step-level env in its own `if:`).
     env:
       MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
     # rocker/geospatial ships R with terra, sf and a matching GDAL already built,
@@ -60,12 +66,14 @@ jobs:
 
       - name: Install extra R packages
         run: |
-          pkgs <- c("data.table", "jsonlite")
+          # curl is now required: openmeteo_batch.R needs real HTTP status codes,
+          # which jsonlite::fromJSON(url) cannot expose.
+          pkgs <- c("data.table", "jsonlite", "curl")
           need <- pkgs[!pkgs %in% rownames(installed.packages())]
           if (length(need)) install.packages(need)
         shell: Rscript {0}
 
-      - name: Continental heatmap
+      - name: Continental heatmaps
         run: Rscript run_blast_grid.R
 
       - name: Site table and summary
@@ -78,23 +86,34 @@ jobs:
           echo "RUN_DATE=$RD" >> "$GITHUB_ENV"
           echo "Using RUN_DATE=$RD"
 
-      # Commit the cache and trends FIRST, so resolution progress is never lost
-      # even if the email step later fails.
-      - name: Commit trends history
+      # Commit the cache FIRST, and never let a missing optional file abort the
+      # step. `run:` uses bash -e, so a `git add` on a path that does not exist
+      # used to abort before `git push`, losing the cache as well as the trends.
+      - name: Commit cache and trends
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config --local user.email "github-actions@github.com"
           git config --local user.name "github-actions"
-          git add -f blast_outputs/town_trends.csv blast_outputs/blastam_trends.csv
-          for f in weather_cache.csv.gz weather_cache.csv; do [ -f "blast_outputs/$f" ] && git add -f "blast_outputs/$f"; done
+          for f in weather_cache.csv.gz weather_cache.csv fetch_failures.csv; do
+            [ -f "blast_outputs/$f" ] && git add -f "blast_outputs/$f" || true
+          done
+          for f in town_trends.csv blastam_trends.csv map_stats.txt midweek_status.txt; do
+            [ -f "blast_outputs/$f" ] && git add -f "blast_outputs/$f" || true
+          done
           git add -u blast_outputs/ 2>/dev/null || true
-          git diff --staged --quiet || git commit -m "Weekly run (trends + weather cache) $(date +%F)"
-          git push
+          if git diff --staged --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "Weekly run (cache + trends) $(date +%F)"
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+            for i in 1 2 3; do git push && break || sleep $((i*10)); done
+          fi
 
-      # Send the email with a Python stdlib script (send_email.py) rather than a
-      # JavaScript action: the send-mail action broke when GitHub forced actions
-      # onto Node 24. The script fails loudly if a secret or attachment is missing.
+      # Email via a Python stdlib script rather than a JavaScript action: the
+      # send-mail action broke when GitHub forced actions onto Node 24. The
+      # script fails loudly if a secret or attachment is missing.
       - name: Email summary and heatmaps
+        if: env.MAIL_USERNAME != ''
         env:
           MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
           MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
@@ -103,8 +122,8 @@ jobs:
           command -v python3 >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq python3; }
           python3 send_email.py
 
-      # Fallback copy of everything (including both heatmaps) kept for 90 days,
-      # in case an email fails to deliver. Runs even if an earlier step failed.
+      # Fallback copy of everything kept for 90 days, in case an email fails to
+      # deliver. Runs even if an earlier step failed.
       - name: Upload artifact
         if: always()
         uses: actions/upload-artifact@v4
