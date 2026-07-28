@@ -40,8 +40,12 @@ jobs:
     needs: gate
     if: needs.gate.outputs.run == 'yes'
     runs-on: ubuntu-latest
-    # Single-batch run (~30 min). The 4500-call budget keeps it under the limits.
-    timeout-minutes: 60
+    # Daily fetch-capped run (~60 min at the default 1000-fetch cap). 90 leaves
+    # headroom for slow archive days and the parallel retry.
+    # Must exceed GRID_MAX_MINUTES (130) plus modelling, rendering, commit and
+    # email, so the script's own wall-clock stop fires first and the run still
+    # saves and commits. A hard job timeout here would lose the whole run.
+    timeout-minutes: 170
     # Job-level env so the email step's `if:` can read it (a step cannot read its
     # own step-level env in its own `if:`).
     env:
