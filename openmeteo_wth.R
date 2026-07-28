@@ -1,16 +1,25 @@
 ################################################################################
 # openmeteo_wth.R
 #
-# Replacement for epicrop::get_wth(). Fetches daily weather from the Open-Meteo
-# historical archive (ERA5 reanalysis, free, no key) and returns it in the
-# schema the SEIR model expects:
+# Single point weather adapters for the Open-Meteo historical archive (ERA5).
+# The GRID path no longer lives here: see openmeteo_batch.R, which fetches many
+# locations per request. What remains is used by run_blast.R for the town table
+# and by the offline tests.
 #
-#   YYYYMMDD (Date), DOY (int), TEMP (mean C), RHUM (mean %), RAIN (mm),
-#   LAT, LON
+# Returns the schema the SEIR model expects:
+#   YYYYMMDD (Date), DOY (int), TEMP (mean C), RHUM (mean %), RAIN (mm), LAT, LON
 #
-# The archive has a lag of roughly 5 days behind real time, which is fine for a
-# weekly retrospective risk signal. Open-Meteo docs:
-# https://open-meteo.com/en/docs/historical-weather-api
+# The archive lags real time by roughly 5 days, which is why ARCHIVE_LAG_DAYS
+# exists. Docs: https://open-meteo.com/en/docs/historical-weather-api
+#
+# TIMEZONE. Everything here is UTC, deliberately and consistently. The previous
+# code used timezone=auto for daily aggregates and timezone=UTC for hourly, so
+# the two models were aggregated over different 24 hour windows. timezone=auto
+# is also wrong for a continental lattice: it returns different zones for
+# adjacent cells near state borders, making the daily aggregation window
+# discontinuous across the map. UTC has the incidental benefit that in eastern
+# Australia the "day" runs 10:00 to 10:00 local, keeping each night's dew period
+# inside a single day rather than splitting it at local midnight.
 ################################################################################
 
 suppressPackageStartupMessages({
@@ -18,44 +27,48 @@ suppressPackageStartupMessages({
   library(jsonlite)
 })
 
-# On Windows behind a corporate proxy or SSL inspection (e.g. a department
-# network), route web requests through the Windows system proxy and certificate
-# store, which usually succeeds where R's default method is blocked. This is a
-# no-op on Linux (GitHub Actions), which keeps the default and has open internet.
+# On Windows behind a corporate proxy or SSL inspection, route web requests
+# through the Windows system proxy and certificate store. No-op on Linux.
 if (.Platform$OS.type == "windows") {
   options(url.method = "wininet", download.file.method = "wininet")
 }
 
 OPENMETEO_ARCHIVE_URL <- "https://archive-api.open-meteo.com/v1/archive"
 
+.wth_cfg <- function(nm, default) if (exists(nm, inherits = TRUE)) get(nm, inherits = TRUE) else default
+
 # Parse an Open-Meteo daily JSON list into the wth schema. Separated from the
 # HTTP call so it can be tested offline.
 .parse_openmeteo_daily <- function(daily, lat, lon) {
 
-  if (is.null(daily) || is.null(daily$time) || length(daily$time) == 0) {
-    return(NULL)
-  }
+  if (is.null(daily) || is.null(daily$time) || length(daily$time) == 0) return(NULL)
 
   dt <- data.table(YYYYMMDD = as.Date(daily$time))
   dt[, DOY := as.integer(format(YYYYMMDD, "%j"))]
+  n <- nrow(dt)
+
+  # Recycle-safe getter. as.numeric(NULL) is numeric(0), and assigning a
+  # zero-length column into a data.table errors rather than returning NULL,
+  # which is how a missing variable used to crash the parse.
+  gv <- function(x) {
+    v <- suppressWarnings(as.numeric(x))
+    if (length(v) == 0L) rep(NA_real_, n) else v
+  }
 
   # TEMP: prefer daily mean, fall back to (max + min) / 2
-  temp_mean <- daily$temperature_2m_mean
-  if (is.null(temp_mean) || all(is.na(temp_mean))) {
-    temp_mean <- (as.numeric(daily$temperature_2m_max) +
-                    as.numeric(daily$temperature_2m_min)) / 2
-  }
-  dt[, TEMP := as.numeric(temp_mean)]
+  temp_mean <- gv(daily$temperature_2m_mean)
+  if (all(is.na(temp_mean)))
+    temp_mean <- (gv(daily$temperature_2m_max) + gv(daily$temperature_2m_min)) / 2
+  if (length(temp_mean) != n || all(is.na(temp_mean))) return(NULL)
+  dt[, TEMP := temp_mean]
 
   # RHUM: prefer daily mean, fall back to (max + min) / 2
-  rh_mean <- daily$relative_humidity_2m_mean
-  if (is.null(rh_mean) || all(is.na(rh_mean))) {
-    rh_mean <- (as.numeric(daily$relative_humidity_2m_max) +
-                  as.numeric(daily$relative_humidity_2m_min)) / 2
-  }
-  dt[, RHUM := as.numeric(rh_mean)]
+  rh_mean <- gv(daily$relative_humidity_2m_mean)
+  if (all(is.na(rh_mean)))
+    rh_mean <- (gv(daily$relative_humidity_2m_max) + gv(daily$relative_humidity_2m_min)) / 2
+  dt[, RHUM := rh_mean]
 
-  dt[, RAIN := as.numeric(daily$precipitation_sum)]
+  dt[, RAIN := gv(daily$precipitation_sum)]
   dt[, `:=`(LAT = lat, LON = lon)]
 
   setorder(dt, YYYYMMDD)
@@ -65,131 +78,109 @@ OPENMETEO_ARCHIVE_URL <- "https://archive-api.open-meteo.com/v1/archive"
 # Fill short internal gaps so the SEIR daily loop stays continuous. Carries the
 # last observation forward, then back-fills any leading NA. Stops if too much is
 # missing, since that means the fetch was incomplete.
-.fill_gaps <- function(dt, max_missing_frac = 0.1) {
+#
+# The run length guard is new: total missingness under 10% could previously still
+# be one unbroken 6 day block carried forward from a single value, which is not a
+# short gap in any useful sense.
+.fill_gaps <- function(dt, max_missing_frac = 0.1, max_run = 3L) {
   for (col in c("TEMP", "RHUM", "RAIN")) {
     v <- dt[[col]]
     miss <- sum(is.na(v))
-    if (miss > 0 && miss / length(v) > max_missing_frac) {
-      stop(sprintf("Too many missing values in %s (%d of %d)",
-                   col, miss, length(v)), call. = FALSE)
-    }
-    if (miss > 0) {
-      # carry forward
-      for (k in seq_along(v)[-1]) if (is.na(v[k])) v[k] <- v[k - 1]
-      # back-fill any leading NA
-      for (k in rev(seq_along(v))[-1]) if (is.na(v[k])) v[k] <- v[k + 1]
-      dt[[col]] <- v
-    }
+    if (miss == 0L) next
+    if (miss / length(v) > max_missing_frac)
+      stop(sprintf("Too many missing values in %s (%d of %d)", col, miss, length(v)),
+           call. = FALSE)
+    r <- rle(is.na(v))
+    longest <- if (any(r$values)) max(r$lengths[r$values]) else 0L
+    if (longest > max_run)
+      stop(sprintf("Gap of %d consecutive days in %s exceeds max_run=%d",
+                   longest, col, max_run), call. = FALSE)
+    for (k in seq_along(v)[-1]) if (is.na(v[k])) v[k] <- v[k - 1]
+    for (k in rev(seq_along(v))[-1]) if (is.na(v[k])) v[k] <- v[k + 1]
+    set(dt, j = col, value = v)
   }
   dt
 }
 
-# Main adapter: fetch daily weather for one location and date range.
+# Daily adapter for one location and date range.
 get_openmeteo_wth <- function(lat, lon, start_date, end_date,
-                              timeout_seconds = 45) {
-  old <- options(timeout = timeout_seconds)   # was declared but never applied
+                              timeout_seconds = .wth_cfg("OM_TIMEOUT_S", 60L)) {
+  old <- options(timeout = timeout_seconds)
   on.exit(options(old), add = TRUE)
 
   url <- sprintf(
     paste0("%s?latitude=%.4f&longitude=%.4f&start_date=%s&end_date=%s",
            "&daily=temperature_2m_mean,temperature_2m_max,temperature_2m_min,",
            "relative_humidity_2m_mean,relative_humidity_2m_max,",
-           "relative_humidity_2m_min,precipitation_sum&timezone=auto"),
+           "relative_humidity_2m_min,precipitation_sum&timezone=UTC&models=%s"),
     OPENMETEO_ARCHIVE_URL, lat, lon,
     format(as.Date(start_date), "%Y-%m-%d"),
-    format(as.Date(end_date), "%Y-%m-%d")
+    format(as.Date(end_date), "%Y-%m-%d"),
+    .wth_cfg("OPENMETEO_MODEL", "era5")
   )
 
   resp <- tryCatch(
-    withCallingHandlers(
-      jsonlite::fromJSON(url),
-      warning = function(w) invokeRestart("muffleWarning")
-    ),
+    withCallingHandlers(jsonlite::fromJSON(url),
+                        warning = function(w) invokeRestart("muffleWarning")),
     error = function(e) {
       warning("Open-Meteo fetch failed for (", lat, ", ", lon, "): ",
               conditionMessage(e), call. = FALSE)
       NULL
-    }
-  )
+    })
 
   if (is.null(resp) || is.null(resp$daily)) return(NULL)
-
   dt <- .parse_openmeteo_daily(resp$daily, lat, lon)
   if (is.null(dt)) return(NULL)
-
-  dt <- .fill_gaps(dt)
-  dt
+  tryCatch(.fill_gaps(dt), error = function(e) NULL)
 }
 
-################################################################################
-# Gridded fetch: many locations per request (Open-Meteo allows up to 1000
-# coordinates per call). Returns a list of per-point data.tables in the SEIR
-# schema, indexed to the input order. Used to build a risk heatmap.
-################################################################################
-
-# Parse one location element (from a simplifyVector = FALSE response) to schema
+# Parse one location element from a simplifyVector = FALSE response. Retained
+# because openmeteo_batch.R has its own hourly equivalent and this is the daily
+# one used by the offline tests.
 .parse_openmeteo_point <- function(el, lat, lon) {
   d <- el$daily
   if (is.null(d) || is.null(d$time) || length(d$time) == 0) return(NULL)
-  gv <- function(x) if (is.null(x)) NA_real_ else as.numeric(unlist(x))
+  n <- length(d$time)
+  dates <- as.Date(vapply(d$time, function(e) as.character(e)[1], character(1)))
+  # NULL-safe: unlist() drops JSON nulls, which shortens the vector and
+  # mis-aligns every later value against the date axis.
+  gv <- function(x) {
+    if (is.null(x)) return(rep(NA_real_, n))
+    v <- suppressWarnings(vapply(x, function(e)
+      if (is.null(e) || length(e) == 0L) NA_real_ else as.numeric(e)[1], numeric(1)))
+    if (length(v) != n) rep(NA_real_, n) else v
+  }
   tmean <- gv(d$temperature_2m_mean)
   if (all(is.na(tmean))) tmean <- (gv(d$temperature_2m_max) + gv(d$temperature_2m_min)) / 2
   rmean <- gv(d$relative_humidity_2m_mean)
   if (all(is.na(rmean))) rmean <- (gv(d$relative_humidity_2m_max) + gv(d$relative_humidity_2m_min)) / 2
-  dates <- as.Date(unlist(d$time))
-  dt <- data.table(
-    YYYYMMDD = dates,
-    DOY = as.integer(format(dates, "%j")),
-    TEMP = tmean, RHUM = rmean, RAIN = gv(d$precipitation_sum),
-    LAT = lat, LON = lon
-  )
+  dt <- data.table(YYYYMMDD = dates, DOY = as.integer(format(dates, "%j")),
+                   TEMP = tmean, RHUM = rmean, RAIN = gv(d$precipitation_sum),
+                   LAT = lat, LON = lon)
   setorder(dt, YYYYMMDD)
   dt[]
 }
 
-# Fetch weather for a set of grid points, one request per point.
+################################################################################
+# Hourly fetch, one point. Feeds BLASTAM its leaf wetness hours and is aggregated
+# to daily values for EPIRICE, so a single fetch serves both models.
 #
-# Multi-location requests do not help here: Open-Meteo's free quota is by data
-# volume, not request count, so the binding limit is 5,000 weighted calls/hour
-# and 600/minute. We therefore pace single-point requests (a short sleep) to stay
-# under the per-minute limit, and log progress so a long run is visibly moving.
-# The grid resolution in blast_config.R is chosen so the whole run fits the
-# hourly cap.
-get_openmeteo_grid <- function(lats, lons, start_date, end_date, pause = 0.8) {
-  stopifnot(length(lats) == length(lons))
-  n <- length(lats)
-  out <- vector("list", n)
-  got <- 0L
-  for (k in seq_len(n)) {
-    res <- tryCatch(
-      get_openmeteo_wth(lats[k], lons[k], start_date, end_date),
-      error = function(e) NULL)
-    if (!is.null(res)) { out[[k]] <- res; got <- got + 1L }  # never assign NULL
-    if (k %% 50 == 0 || k == n)
-      cat(sprintf("  ...fetched %d/%d cells (%d with data)\n", k, n, got))
-    if (pause > 0) Sys.sleep(pause)
-  }
-  cat(sprintf("  grid weather: %d of %d cells returned data\n", got, n))
-  out
-}
-
+# NOTE. For more than a handful of points use fetch_points_batched() in
+# openmeteo_batch.R instead. Multi location requests do not reduce the weighted
+# quota, because weight scales with locations, but the quota was never what
+# limited wall clock here: request latency was, and batching removes it.
 ################################################################################
-# Hourly fetch (for the BLASTAM leaf-wetness model). Returns hourly temp, RH and
-# precipitation for one point. Same weighted API cost as the daily request (cost
-# is by variable count and period, not resolution), so one hourly fetch feeds
-# both EPIRICE (via daily aggregation) and BLASTAM.
-################################################################################
-get_openmeteo_hourly <- function(lat, lon, start_date, end_date, timeout_seconds = 45) {
-  # Cap each request so a slow/degraded archive fails fast and the loop moves on,
-  # rather than waiting the old 120 s per point (which turned a bad archive day
-  # into an hours-long run). Set it directly instead of max()-ing with the default.
+get_openmeteo_hourly <- function(lat, lon, start_date, end_date,
+                                 timeout_seconds = .wth_cfg("OM_TIMEOUT_S", 60L)) {
   old <- options(timeout = timeout_seconds)
   on.exit(options(old), add = TRUE)
+  vars <- .wth_cfg("OM_HOURLY_VARS",
+                   c("temperature_2m", "relative_humidity_2m", "precipitation"))
   url <- sprintf(
-    "%s?latitude=%.4f&longitude=%.4f&start_date=%s&end_date=%s&hourly=%s&timezone=UTC",
+    "%s?latitude=%.4f&longitude=%.4f&start_date=%s&end_date=%s&hourly=%s&timezone=UTC&models=%s",
     OPENMETEO_ARCHIVE_URL, lat, lon,
     format(as.Date(start_date), "%Y-%m-%d"), format(as.Date(end_date), "%Y-%m-%d"),
-    "temperature_2m,relative_humidity_2m,precipitation")
+    paste(vars, collapse = ","), .wth_cfg("OPENMETEO_MODEL", "era5"))
   resp <- tryCatch(
     withCallingHandlers(jsonlite::fromJSON(url),
                         warning = function(w) invokeRestart("muffleWarning")),
@@ -200,5 +191,7 @@ get_openmeteo_hourly <- function(lat, lon, start_date, end_date, timeout_seconds
   dt <- as.POSIXct(h$time, format = "%Y-%m-%dT%H:%M", tz = "UTC")
   out <- data.table(dt = dt, temp = gv(h$temperature_2m),
                     rh = gv(h$relative_humidity_2m), rain = gv(h$precipitation))
-  out[!is.na(dt)]
+  out <- out[!is.na(dt)]
+  if (nrow(out) == 0L || all(is.na(out$temp))) return(NULL)
+  out
 }

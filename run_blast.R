@@ -2,22 +2,24 @@
 ################################################################################
 # run_blast.R
 #
-# Weekly rice leaf blast risk using the EPIRICE model (Savary et al. 2012),
-# driven by Open-Meteo weather. Run from git / GitHub Actions.
+# Weekly rice leaf blast risk for the monitoring towns, using EPIRICE (Savary
+# et al. 2012) and BLASTAM (Koshimizu 1988), driven by Open-Meteo weather.
 #
 #   Rscript run_blast.R
 #
 # Pipeline:
-#   1. For each site, fetch daily weather from emergence to the latest archive
-#      day (Open-Meteo ERA5).
-#   2. Run the EPIRICE leaf blast SEIR up to that day.
-#   3. Report current modelled intensity, its recent trend, and a risk band.
-#   4. Write a CSV, a text summary, and a PNG map; optionally email them.
+#   1. Fetch hourly weather for all towns in ONE batched request.
+#   2. Run both models per town over the rolling CROP_AGE_DAYS window.
+#   3. Report current intensity, its recent trend, a risk band, and BLASTAM days.
+#   4. Write a CSV, a text summary and an HTML body for the email step.
+#
+# CHANGES
+#   * Towns are fetched in a single batched request rather than 31 separate
+#     forked requests, which removes 31 round trips and the fork pool.
+#   * The mailR path is gone: the workflow sends mail with send_email.py.
+#   * The map growth line now compares like with like (see map_stats.txt).
 ################################################################################
 
-# Report all dates in Australian Eastern time (AEST/AEDT). The scheduled run
-# fires 20:00 UTC Sunday, which is Monday morning in eastern Australia, so the
-# email is stamped with the Monday (local) date, not the UTC Sunday.
 Sys.setenv(TZ = "Australia/Sydney")
 
 SCRIPT_DIR <- tryCatch(
@@ -25,18 +27,13 @@ SCRIPT_DIR <- tryCatch(
   error = function(e) normalizePath(getwd(), winslash = "/")
 )
 
+source(file.path(SCRIPT_DIR, "blast_config.R"))
 source(file.path(SCRIPT_DIR, "epirice_model.R"))
 source(file.path(SCRIPT_DIR, "blastam_model.R"))
 source(file.path(SCRIPT_DIR, "openmeteo_wth.R"))
-source(file.path(SCRIPT_DIR, "blast_config.R"))
+source(file.path(SCRIPT_DIR, "openmeteo_batch.R"))
 
-# Weather-fetch hook (tests inject synthetic data). Fetches hourly and returns
-# daily rows carrying both EPIRICE inputs and the BLASTAM night judgement.
-if (!exists("WTH_FN")) WTH_FN <- function(lat, lon, start_date, end_date) {
-  hw <- get_openmeteo_hourly(lat, lon, start_date, end_date)
-  if (is.null(hw) || nrow(hw) == 0) return(NULL)
-  blastam_daily_from_hourly(hw)
-}
+suppressPackageStartupMessages(library(data.table))
 
 classify <- function(intensity) {
   if (is.na(intensity)) return("no data")
@@ -45,144 +42,145 @@ classify <- function(intensity) {
   "high"
 }
 
-run_site <- function(name, lat, lon, emergence, end_date) {
-  na_row <- data.table(name = name, lat = lat, lon = lon,
-                       intensity = NA_real_, peak = NA_real_,
-                       trend7 = NA_real_, level = "no data",
-                       last_date = NA_character_, days = 0L,
-                       blast_events = NA_integer_, blast_recent = NA_integer_)
+na_row_for <- function(name, lat, lon, level = "no data") {
+  data.table(name = name, lat = lat, lon = lon,
+             intensity = NA_real_, peak = NA_real_, trend7 = NA_real_,
+             level = level, last_date = NA_character_, days = 0L,
+             blast_events = NA_integer_, blast_recent = NA_integer_)
+}
 
-  if (end_date <= as.Date(emergence) + MIN_DAYS) {
-    na_row[, level := "pre-season"]
-    return(na_row)
-  }
+# Model one town from its daily rows.
+model_town <- function(name, lat, lon, dd, emergence, end_date) {
+  if (is.null(dd) || nrow(dd) < MIN_DAYS) return(na_row_for(name, lat, lon))
 
-  dd <- tryCatch(
-    WTH_FN(lat = lat, lon = lon, start_date = emergence, end_date = end_date),
-    error = function(e) NULL
-  )
-  if (is.null(dd) || nrow(dd) < MIN_DAYS) return(na_row)
-
-  # BLASTAM: infection-favoured days (total over window, and last 7 days)
   bs <- blastam_score(dd$infect, dd$semi, as.Date(dd$date), end_date,
-                      window = if (exists("BLASTAM_WINDOW_DAYS")) BLASTAM_WINDOW_DAYS else 21L,
-                      recent = 7L)
+                      window = BLASTAM_WINDOW_DAYS, recent = 7L)
 
-  # EPIRICE: build daily weather and run the SEIR
   wth <- data.table(YYYYMMDD = as.Date(dd$date),
                     DOY = as.integer(format(as.Date(dd$date), "%j")),
-                    TEMP = dd$TEMP, RHUM = dd$RHUM, RAIN = dd$RAIN, LAT = lat, LON = lon)
+                    TEMP = dd$TEMP, RHUM = dd$RHUM, RAIN = dd$RAIN,
+                    LAT = lat, LON = lon)
   setorder(wth, YYYYMMDD)
   duration <- as.integer(min(120L, nrow(wth)))
-  lb <- tryCatch(
-    predict_leaf_blast(wth, emergence = emergence, duration = duration),
-    error = function(e) NULL
-  )
+  lb <- tryCatch(predict_leaf_blast(wth, emergence = emergence, duration = duration),
+                 error = function(e) NULL)
   if (is.null(lb) || nrow(lb) == 0) {
-    na_row[, `:=`(blast_events = bs$events, blast_recent = bs$recent)]
-    return(na_row)
+    r <- na_row_for(name, lat, lon)
+    r[, `:=`(blast_events = bs$events, blast_recent = bs$recent)]
+    return(r)
   }
-
   cur  <- lb$intensity[nrow(lb)]
-  peak <- max(lb$intensity, na.rm = TRUE)
-  trend7 <- if (nrow(lb) > 7) cur - lb$intensity[nrow(lb) - 7] else NA_real_
-
   data.table(name = name, lat = lat, lon = lon,
-             intensity = cur, peak = peak, trend7 = trend7,
+             intensity = cur, peak = max(lb$intensity, na.rm = TRUE),
+             trend7 = if (nrow(lb) > 7) cur - lb$intensity[nrow(lb) - 7] else NA_real_,
              level = classify(cur),
              last_date = as.character(lb$dates[nrow(lb)]),
              days = duration,
              blast_events = bs$events, blast_recent = bs$recent)
 }
 
-# ---- Run all sites --------------------------------------------------------
-cat("\nRice leaf blast risk (EPIRICE / Open-Meteo)\n")
+# ---- Run all towns ---------------------------------------------------------
+cat("\nRice leaf blast risk (EPIRICE + BLASTAM / Open-Meteo)\n")
 cat(strrep("=", 60), "\n")
 
 end_date <- Sys.Date() - ARCHIVE_LAG_DAYS
-# Use the same rolling window as the heatmap: assume a crop of age CROP_AGE_DAYS
+# Same rolling window as the heatmap: assume a crop of age CROP_AGE_DAYS
 # everywhere, so the table reflects current potential risk rather than a finished
-# past season. Per-site emergence overrides are still honoured if provided.
-rolling_emergence <- as.character(end_date - CROP_AGE_DAYS)
+# past season. Note this emergence date MOVES with every run, so the trends CSVs
+# are a rolling window series, not a cumulative season total.
+emergence <- end_date - CROP_AGE_DAYS
 sites <- as.data.table(MONITOR_TOWNS)
-if (!"emergence" %in% names(sites)) sites[, emergence := rolling_emergence]
+sites[, pid := sprintf("%s", name)]
 
 cat("Run date:   ", format(Sys.Date(), "%A %d %B %Y"), "\n")
 cat("Weather to: ", format(end_date, "%Y-%m-%d"), " (archive lag ",
     ARCHIVE_LAG_DAYS, " days)\n", sep = "")
-cat("Crop age:   ", CROP_AGE_DAYS, " days (emergence ", rolling_emergence, ")\n\n",
-    sep = "")
+cat("Crop age:   ", CROP_AGE_DAYS, " days (rolling emergence ",
+    format(emergence), ")\n\n", sep = "")
 
-options(timeout = max(120, getOption("timeout", 60)))  # slow archive requests
+# One batched request covers all towns. Previously this was 31 separate forked
+# requests, which cost 31 round trips for the same weighted quota.
+town_daily <- new.env(parent = emptyenv())
+on_town <- function(pid, lon, lat, hw) {
+  w <- tryCatch(blastam_daily_from_hourly(hw), error = function(e) NULL)
+  if (is.null(w) || nrow(w) == 0) return(NULL)
+  assign(pid, as.data.table(w), envir = town_daily)
+  data.table(pid = pid)          # non-empty return marks the point as ok
+}
+fr <- fetch_points_batched(sites[, .(pid, lon, lat)], emergence, end_date,
+                           on_point = on_town, label = "towns")
 
-# Towns are independent, and each is a separate (slow, cold) hourly request, so
-# fetch and model them concurrently. mclapply forks on Linux (the GitHub runner);
-# on Windows it falls back to serial automatically. TOWN_FETCH_CORES caps the
-# concurrency; 31 town requests * ~6.4 weighted calls stays well under the rate
-# limit even fired together.
-.cores <- if (exists("TOWN_FETCH_CORES")) TOWN_FETCH_CORES else 8L
-one_site <- function(k) {
+# Serial fallback for towns the batch did not deliver, on a clean connection.
+missing <- setdiff(sites$pid, ls(town_daily))
+if (length(missing) > 0) {
+  cat(sprintf("Serial fallback for %d town(s): %s\n",
+              length(missing), paste(missing, collapse = ", ")))
+  for (nm in missing) {
+    s <- sites[pid == nm]
+    hw <- tryCatch(get_openmeteo_hourly(s$lat, s$lon, emergence, end_date),
+                   error = function(e) NULL)
+    if (!is.null(hw) && nrow(hw) > 0) {
+      w <- tryCatch(blastam_daily_from_hourly(hw), error = function(e) NULL)
+      if (!is.null(w) && nrow(w) > 0) assign(nm, as.data.table(w), envir = town_daily)
+    }
+  }
+}
+
+results <- rbindlist(lapply(seq_len(nrow(sites)), function(k) {
   s <- sites[k]
-  run_site(s$name, s$lat, s$lon, s$emergence, end_date)
-}
-results_list <- tryCatch(
-  parallel::mclapply(seq_len(nrow(sites)), one_site, mc.cores = .cores),
-  error = function(e) lapply(seq_len(nrow(sites)), one_site))
-# Serial retry (clean, non-forked connection) for towns whose concurrent fetch
-# was dropped by the API ("no data") or whose fork failed outright.
-needs_retry <- function(r) (!is.data.frame(r)) ||
-  identical(as.character(r$level), "no data")
-retry <- which(vapply(results_list, needs_retry, logical(1)))
-if (length(retry) > 0) {
-  cat(sprintf("Serial retry for %d town(s) that returned no data...\n", length(retry)))
-  for (k in retry) results_list[[k]] <- one_site(k)
-}
-results <- rbindlist(results_list)
+  dd <- if (exists(s$pid, envir = town_daily, inherits = FALSE))
+    get(s$pid, envir = town_daily) else NULL
+  model_town(s$name, s$lat, s$lon, dd, emergence, end_date)
+}))
+
 for (k in seq_len(nrow(results))) {
   r <- results[k]
   msg <- if (is.na(r$intensity)) r$level else sprintf("%.1f%% (%s)", r$intensity * 100, r$level)
   cat(sprintf("%-14s ... %s\n", r$name, msg))
 }
 
-# Attach state and order by state then town (alphabetical within state)
+# Attach state and order by state then town
 st <- as.data.table(MONITOR_TOWNS)[, .(name, state)]
 results <- merge(results, st, by = "name", all.x = TRUE, sort = FALSE)
 results[is.na(state), state := "--"]
 setorder(results, state, name)
 
-# ---- Summary --------------------------------------------------------------
+# ---- Summary ---------------------------------------------------------------
 counts <- results[, .N, by = level]
 getn <- function(lv) { x <- counts[level == lv, N]; if (length(x)) x else 0L }
 
-# Read the grid's map stats (written by run_blast_grid.R) into a one-line note so
-# the reader can see the cache growing and the map sharpening week to week.
+# Read the grid's stats line (written by run_blast_grid.R).
+# Fields: mapped | mean_land_spacing | mapped_last_run | finest | fmt | kb |
+#         read_fmt | window_end | complete_res | weighted_spent
 map_growth_line <- function() {
   f <- file.path(SCRIPT_DIR, OUTPUT_DIR, "map_stats.txt")
   if (!file.exists(f)) return(NULL)
   s <- tryCatch(strsplit(readLines(f, warn = FALSE)[1], "\\|")[[1]],
                 error = function(e) NULL)
   if (length(s) < 4) return(NULL)
-  now <- as.integer(s[1]); sp <- as.numeric(s[2])
-  prev <- as.integer(s[3]); finest <- as.numeric(s[4])
-  fmt <- if (length(s) >= 5) s[5] else NA
-  kb  <- if (length(s) >= 6) as.numeric(s[6]) else NA
-  rd  <- if (length(s) >= 7) s[7] else NA
-  wend <- if (length(s) >= 8) s[8] else NA
+  now    <- as.integer(s[1])
+  finest <- as.numeric(s[4])
+  prev   <- as.integer(s[3])          # mapped LAST run, comparable with `now`
+  fmt    <- if (length(s) >= 5) s[5] else NA
+  kb     <- if (length(s) >= 6) as.numeric(s[6]) else NA
+  rd     <- if (length(s) >= 7) s[7] else NA
+  wend   <- if (length(s) >= 8) s[8] else NA
+  cres   <- if (length(s) >= 9 && nzchar(s[9])) as.numeric(s[9]) else NA
+  spent  <- if (length(s) >= 10) as.numeric(s[10]) else NA
+
   chg <- if (is.na(prev) || prev <= 0) ""
-         else if (now > prev) sprintf(" (up from %d at the last run)", prev)
+         else if (now > prev) sprintf(" (up from %d mapped last run)", prev)
+         else if (now < prev) sprintf(" (down from %d mapped last run)", prev)
          else " (steady)"
-  # Fixed same-date grid: report its resolution and cell size, not the bbox-based
-  # spacing (which counts ocean) or any "sharpening" (the grid no longer builds up).
-  km <- if (!is.na(finest)) sprintf(" (~%.0f km cells)", finest * 111) else ""
-  # The map's window can end earlier than the town data when the grid is refreshed
-  # on a rolling basis, so state the map's own date rather than implying they match.
-  wtxt <- if (is.na(wend)) ", all over one common window" else {
+  # State the COMPLETED lattice level, not a mean spacing. While the grid fills
+  # coarse to fine, coverage is a complete coarse level plus a partial finer one,
+  # and a single mean spacing implies a uniformity that is not there.
+  cbit <- if (is.na(cres)) "" else
+    sprintf(" Complete to %.2f deg (~%.0f km cells).", cres, cres * 111)
+  wtxt <- if (is.na(wend)) "" else {
     d <- suppressWarnings(as.Date(wend))
-    if (is.na(d)) ", all over one common window"
-    else sprintf(", all modelled over one window to %s", format(d, "%d %b"))
+    if (is.na(d)) "" else sprintf(" All cells modelled over one window to %s.", format(d, "%d %b"))
   }
-  tail <- sprintf(" on a %.1f deg grid%s%s", finest, km, wtxt)
-  # Say which copy is in use: the one read this run, plus whether a backup exists.
   cache_bit <- if (is.na(fmt) || is.na(kb)) "" else {
     active <- if (!is.na(rd) && rd %in% c("gz", "csv")) rd
               else if (grepl("^gz", fmt)) "gz" else "csv"
@@ -193,23 +191,21 @@ map_growth_line <- function() {
     sprintf(" Cache: %s active%s, %s.", active, extra,
             if (kb >= 1024) sprintf("%.1f MB", kb / 1024) else sprintf("%.0f KB", kb))
   }
-  sprintf("%d cells%s%s.%s", now, chg, tail, cache_bit)
+  qbit <- if (is.na(spent)) "" else sprintf(" Used ~%.0f weighted API calls.", spent)
+  sprintf("%d cells on a %.2f deg lattice%s.%s%s%s%s",
+          now, finest, chg, cbit, wtxt, cache_bit, qbit)
 }
 mg <- map_growth_line()
 
-# Read the silent top-up run's status (committed by that run) so this email can
-# confirm the daily cache top-up ran and went well, or flag if it stalled.
 midweek_line <- function() {
   f <- file.path(SCRIPT_DIR, OUTPUT_DIR, "midweek_status.txt")
-  if (!file.exists(f)) return(NULL)   # no separate top-up run: omit the line
+  if (!file.exists(f)) return(NULL)
   s <- tryCatch(strsplit(readLines(f, warn = FALSE)[1], "\\|")[[1]],
                 error = function(e) NULL)
   if (length(s) < 4) return(NULL)
   d <- suppressWarnings(as.Date(s[1])); pts <- as.integer(s[2]); added <- as.integer(s[4])
-  # A daily top-up runs every non-Monday, so the newest should be yesterday. Allow
-  # 2 days' slack before flagging a stall.
   if (is.na(d) || as.integer(Sys.Date() - d) > 2)
-    sprintf("Daily top-up: no run in the last 2 days (last %s) - check the top-up job.",
+    sprintf("Daily top-up: no run in the last 2 days (last %s); check the top-up job.",
             if (is.na(d)) "never" else format(d, "%d %b"))
   else
     sprintf("Daily top-up ran %s: +%d points, cache now %d (ok).",
@@ -222,13 +218,13 @@ summary_lines <- c(
   strrep("=", 60),
   paste0("Generated:  ", format(Sys.Date(), "%A %d %B %Y")),
   paste0("Models:     EPIRICE (Savary et al. 2012) + BLASTAM (Koshimizu 1988)"),
-  paste0("Weather:    Open-Meteo ERA5 archive, to ", format(end_date, "%Y-%m-%d")),
+  paste0("Weather:    Open-Meteo ", OPENMETEO_MODEL, " archive, to ", format(end_date, "%Y-%m-%d")),
   "",
-  sprintf("EPIRICE bands  High:%d  Moderate:%d  Low:%d  Pre-season:%d  No data:%d",
-          getn("high"), getn("moderate"), getn("low"),
-          getn("pre-season"), getn("no data")),
+  sprintf("EPIRICE bands  High:%d  Moderate:%d  Low:%d  No data:%d",
+          getn("high"), getn("moderate"), getn("low"), getn("no data")),
   "",
-  sprintf("Town detail: EPIRICE intensity + BLASTAM favourable days (last %d), by state:", BLASTAM_WINDOW_DAYS),
+  sprintf("Town detail: EPIRICE intensity + BLASTAM favourable days (last %d), by state:",
+          BLASTAM_WINDOW_DAYS),
   strrep("-", 60)
 )
 cur_state <- ""
@@ -268,11 +264,13 @@ summary_lines <- c(summary_lines, "",
   "is estimated from hourly humidity (>=90%) and rain; both models read low in",
   "cool, dry weather.",
   "",
+  "Reading the trends CSVs: emergence is taken as (latest weather date minus",
+  sprintf("%d days) and therefore MOVES each run, so a row is a rolling %d day", CROP_AGE_DAYS, CROP_AGE_DAYS),
+  "window through time, not a cumulative season total.",
+  "",
   "Bands and thresholds are provisional; calibrate against field observations.",
   "",
   if (exists("CITATION")) CITATION else NULL,
-  # Run status (map growth, cache in use, midweek top-up) sits after the citation
-  # as fine print rather than at the top of the summary.
   if (!is.null(mg) || !is.null(mw)) "" else NULL,
   if (!is.null(mg)) paste0("Map:     ", mg) else NULL,
   if (!is.null(mw)) paste0("Top-up:  ", mw) else NULL,
@@ -282,18 +280,17 @@ summary_lines <- c(summary_lines, "",
 summary_text <- paste(summary_lines, collapse = "\n")
 cat("\n", summary_text, "\n", sep = "")
 
-# ---- Write outputs --------------------------------------------------------
+# ---- Write outputs ---------------------------------------------------------
 OUT <- file.path(SCRIPT_DIR, OUTPUT_DIR)
 dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
 run_tag <- format(Sys.Date(), "%Y-%m-%d")
 
 fwrite(results, file.path(OUT, sprintf("blast_results_%s.csv", run_tag)))
 writeLines(summary_text, file.path(OUT, sprintf("blast_summary_%s.txt", run_tag)))
-# Stable "latest" copies so automation can reference a fixed filename
 fwrite(results, file.path(OUT, "blast_results_latest.csv"))
 writeLines(summary_text, file.path(OUT, "blast_summary_latest.txt"))
 
-# ---- Pretty HTML email body ----------------------------------------------
+# ---- HTML email body -------------------------------------------------------
 band_bg <- function(l) switch(l, low = "#E8F1F8", moderate = "#FDB147",
                               high = "#E8492B", "#EFEFEF")
 band_fg <- function(l) if (identical(l, "high")) "#FFFFFF" else "#22272B"
@@ -341,10 +338,11 @@ sprintf("<div style='font-size:13px;opacity:.9;'>%s</div>", format(Sys.Date(), "
 "</div>",
 "<div style='padding:16px 20px;border:1px solid #E0E0E0;border-top:none;border-radius:0 0 6px 6px;'>",
 sprintf(paste0("<p style='margin:0 0 12px;'>Two models for %d monitoring towns, from ",
-        "Open-Meteo ERA5 weather to %s. <b>EPIRICE intensity</b> is how much disease the ",
-        "season has built up; <b>BLASTAM days</b> is how many of the last 21 days favoured a ",
-        "new infection. Both are weather-driven potentials, not field measurements.</p>"),
-        nrow(results), format(end_date, "%d %b %Y")),
+        "Open-Meteo %s weather to %s. <b>EPIRICE intensity</b> is how much disease the ",
+        "rolling %d day window has built up; <b>BLASTAM days</b> is how many of the last %d days ",
+        "favoured a new infection. Both are weather-driven potentials, not field measurements.</p>"),
+        nrow(results), OPENMETEO_MODEL, format(end_date, "%d %b %Y"),
+        CROP_AGE_DAYS, BLASTAM_WINDOW_DAYS),
 "<p style='margin:0 0 14px;'>",
 "<span style='font-size:12px;color:#6b7378;margin-right:8px;'>EPIRICE bands:</span>",
 pill("High", getn("high"), "#E8492B", "#fff"),
@@ -356,7 +354,7 @@ pill("Low", getn("low"), "#E8F1F8", "#22272B"),
 "<th style='padding:6px 8px;'>Town</th>",
 "<th style='padding:6px 8px;text-align:right;'>EPIRICE %</th>",
 "<th style='padding:6px 8px;'>Risk</th>",
-"<th style='padding:6px 8px;text-align:right;'>7-day pts</th>",
+"<th style='padding:6px 8px;text-align:right;'>7 day pts</th>",
 "<th style='padding:6px 8px;text-align:right;'>BLASTAM days</th></tr></thead><tbody>",
 paste(row_html, collapse = ""),
 "</tbody></table>",
@@ -366,12 +364,13 @@ paste0("<p style='font-size:12px;color:#6b7378;margin:14px 0 0;'><b>EPIRICE</b> 
        "&ge;10&nbsp;h, the mean temperature during wetness is 15-32&deg;C, and the preceding ",
        "5-day mean temperature is 20-30&deg;C (upper bounds raised from Japan's 25&deg;C for warm conditions). EPIRICE says how much disease may build; BLASTAM ",
        "flags when infection windows open. Leaf wetness is estimated from humidity (&ge;90%) and ",
-       "rain; both read low in cool, dry weather. Two maps and two trends CSVs are attached. ",
-       "Values are provisional.</p>"),
+       "rain; both read low in cool, dry weather. Emergence moves with each run, so the trends ",
+       "CSVs are a rolling window rather than a season total. Two maps and two trends CSVs are ",
+       "attached. Values are provisional.</p>"),
 paste0("<p style='font-size:11px;color:#9aa0a6;margin:10px 0 0;'>EPIRICE: Savary ",
        "<em>et al.</em> 2012 (Crop Prot. 34:6-17); epicrop (A.H. Sparks). BLASTAM: ",
        "Koshimizu 1988 (Bull. Tohoku Natl. Agric. Exp. Stn. 78:67-121); Hayashi &amp; ",
-       "Koshimizu 1988. Weather: Open-Meteo ERA5 (CC BY 4.0).</p>"),
+       "Koshimizu 1988. Weather: Open-Meteo ERA5 (CC BY 4.0), non-commercial research use.</p>"),
 if (!is.null(mg))
   sprintf(paste0("<p style='font-size:11px;color:#9aa0a6;margin:8px 0 0;'>",
                  "<b>Map:</b> %s</p>"), mg) else "",
@@ -384,7 +383,7 @@ if (!is.null(mw))
 "</div></div>")
 writeLines(html, file.path(OUT, "blast_summary_latest.html"))
 
-# ---- Rolling trends CSVs (last HISTORY_RUNS runs, one column per run) ------
+# ---- Rolling trends CSVs ---------------------------------------------------
 # Wide format: one row per town, one column per run date, so a row reads left to
 # right as the trend. Persisted in the repo so they accumulate across runs.
 write_trends <- function(values, file_name) {
@@ -398,9 +397,11 @@ write_trends <- function(values, file_name) {
   hist <- merge(hist, today, by = "town", all = TRUE)
   ord <- c(results$name, setdiff(hist$town, results$name))
   hist <- hist[match(ord, town)]
-  keep_n <- if (exists("HISTORY_RUNS")) HISTORY_RUNS else 10L
   dcols <- setdiff(names(hist), "town")
-  dcols <- dcols[order(as.Date(dcols))]
+  # Guard against a stray non-date column corrupting the ordering.
+  parsed <- suppressWarnings(as.Date(dcols))
+  dcols <- dcols[!is.na(parsed)][order(parsed[!is.na(parsed)])]
+  keep_n <- HISTORY_RUNS
   if (length(dcols) > keep_n) dcols <- tail(dcols, keep_n)
   hist <- hist[, c("town", dcols), with = FALSE]
   fwrite(hist, f)
@@ -409,12 +410,12 @@ write_trends <- function(values, file_name) {
 write_trends(round(results$intensity * 100, 3), "town_trends.csv")     # EPIRICE %
 write_trends(as.integer(results$blast_events),  "blastam_trends.csv")  # BLASTAM days
 
+# ---- Optional simple town point map ----------------------------------------
 band_col <- function(level) {
   vapply(level, function(l) switch(l,
     low = COL_LOW, moderate = COL_MODERATE, high = COL_HIGH, COL_NODATA),
     character(1))
 }
-
 if (isTRUE(MAKE_MAP)) {
   map_file <- file.path(OUT, sprintf("blast_map_%s.png", run_tag))
   png(map_file, width = MAP_WIDTH, height = MAP_HEIGHT, res = 120)
@@ -423,13 +424,13 @@ if (isTRUE(MAKE_MAP)) {
   yr <- range(results$lat) + c(-2, 2)
   plot(results$lon, results$lat, type = "n", xlim = xr, ylim = yr,
        xlab = "Longitude", ylab = "Latitude",
-       main = sprintf("Rice leaf blast risk  %s", run_tag))
+       main = sprintf("Rice leaf blast risk, weather to %s", format(end_date)))
   grid(col = "#E4E7E9")
   points(results$lon, results$lat, pch = 21, cex = 3,
          bg = band_col(results$level), col = "#22272B", lwd = 1.5)
   text(results$lon, results$lat, labels = results$name, pos = 3,
        offset = 1, cex = 0.8, col = "#22272B")
-  legend("topright", legend = c("Low", "Moderate", "High", "No data / pre-season"),
+  legend("topright", legend = c("Low", "Moderate", "High", "No data"),
          pt.bg = c(COL_LOW, COL_MODERATE, COL_HIGH, COL_NODATA),
          pch = 21, pt.cex = 2, bty = "n")
   par(op); dev.off()
@@ -438,27 +439,4 @@ if (isTRUE(MAKE_MAP)) {
 }
 
 cat("Results: ", file.path(OUT, sprintf("blast_results_%s.csv", run_tag)), "\n")
-
-# ---- Optional email -------------------------------------------------------
-if (isTRUE(SEND_EMAIL) && nzchar(EMAIL_FROM) && nzchar(EMAIL_PASSWORD) &&
-    nzchar(EMAIL_TO)) {
-  if (!requireNamespace("mailR", quietly = TRUE)) {
-    cat("\nEmail skipped: install.packages('mailR') to enable.\n")
-  } else {
-    att <- c(file.path(OUT, sprintf("blast_summary_%s.txt", run_tag)),
-             file.path(OUT, sprintf("blast_results_%s.csv", run_tag)))
-    if (isTRUE(MAKE_MAP)) att <- c(att, file.path(OUT, sprintf("blast_map_%s.png", run_tag)))
-    tryCatch({
-      mailR::send.mail(
-        from = EMAIL_FROM, to = strsplit(EMAIL_TO, ",")[[1]],
-        subject = sprintf("Leaf blast risk %s", run_tag),
-        body = summary_text,
-        smtp = list(host.name = EMAIL_SMTP_HOST, port = EMAIL_SMTP_PORT,
-                    user.name = EMAIL_FROM, passwd = EMAIL_PASSWORD, ssl = TRUE),
-        authenticate = TRUE, send = TRUE, attach.files = att)
-      cat("\nEmail sent to", EMAIL_TO, "\n")
-    }, error = function(e) cat("\nEmail failed:", conditionMessage(e), "\n"))
-  }
-}
-
 cat("\nDone.\n")
