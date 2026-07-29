@@ -257,6 +257,21 @@ BLASTAM_HEAT_COLOURS <- c("#BFE0F5", "#FFF6B0", "#FDB147", "#E8492B", "#8B0000")
 # directly comparable. 2 means 2% intensity and above is the deepest red.
 HEAT_MAX <- 2
 
+# Colour stretch exponent. 1 = linear. Below 1 expands the low end.
+#
+# WHY. Measured on the 2026-07-29 run: EPIRICE peaked at about 0.03% against a
+# 2% scale, so the map used 1.5% of its colour ramp and rendered as one flat
+# blue. These models are strongly seasonal, so a scale set for wet-season peaks
+# leaves the map uninformative for most of the year. Lowering HEAT_MAX instead
+# would break week-to-week comparability the moment the wet season arrives.
+#
+# A power stretch keeps the anchor fixed (2% is still the deepest red, every
+# week) while making low values legible. The legend is labelled with TRUE values,
+# so nothing is misrepresented; only the spacing of the colours changes. Set to 1
+# to go back to linear.
+HEAT_STRETCH <- 1            # linear. 0.5 gives a sqrt stretch if you want one
+BLASTAM_STRETCH <- 1         # BLASTAM already uses a reasonable share of its ramp
+
 # BLASTAM reporting window: count FAVOURABLE infection days over the most recent
 # BLASTAM_WINDOW_DAYS, to show where infection pressure is building now.
 BLASTAM_WINDOW_DAYS <- 21
@@ -266,8 +281,9 @@ BLASTAM_WINDOW_DAYS <- 21
 # the map gains a spurious east-west gradient of about 1/21. One day makes the
 # window longitude-neutral across the continent.
 BLASTAM_END_LAG_DAYS <- 1L
-# Deepest colour at this many favourable days within the window. PROVISIONAL:
-# lower it (e.g. 14) to make building pressure show up more strongly.
+# Deepest colour at this many favourable days within the window. 21 = every day
+# in the window favourable, which is the true ceiling and is reachable in a
+# tropical wet season, so it stays as the fixed anchor.
 BLASTAM_HEAT_MAX <- 21
 
 # Overlay layers on the heatmap
@@ -343,14 +359,15 @@ CITATION <- paste(
   "  adapted from cropsim (Hijmans et al. 2009). Framework: Zadoks (1971).",
   "BLASTAM (infection days): infection-warning model of Koshimizu, Y. (1988),",
   "  A forecasting method for occurrence of rice leaf blast with AMeDAS data,",
-  "  Bull. Tohoku Natl. Agric. Exp. Stn. 78: 67-121; program in Hayashi, T. and",
-  "  Koshimizu, Y. (1988), ibid. 78: 123-138 [in Japanese]. A day is favourable",
-  "  when leaf wetness >=10 h, the mean temperature during wetness is within",
-  "  bounds, and the preceding 5-day mean is within bounds. Original Japanese",
-  "  bounds 15-25 C and 20-25 C; the upper bounds are RAISED here to 15-32 C and",
-  "  20-30 C for warmer Australian conditions (a deliberate deviation, since",
-  "  blast infects up to ~32 C given leaf wetness). Leaf wetness estimated from",
-  "  hourly humidity and rainfall.",
+  "  Bull. Tohoku Natl. Agric. Exp. Stn. 78: 67-121; Hayashi & Koshimizu (1988)",
+  "  ibid. 78: 123-138 [in Japanese]. A night is favourable when (1) leaf wetness",
+  "  >= minimum hours (temperature-dependent, Barksdale & Jones 1965 curve, from",
+  "  ~12 h at 16 C to ~8 h at 27 C; Koshimizu used a fixed 10 h), (2) mean temp",
+  "  during wetness 15-32 C, and (3) preceding 5-day mean temp 20-30 C.",
+  "  Deviations from Koshimizu: temperature-dependent wetness threshold (Barksdale",
+  "  & Jones 1965); upper bounds raised from 25 C to 32/30 C for tropical",
+  "  Australia; heavy rain (>=4 mm/h) excluded from wet count (Yoshino 1988);",
+  "  wetness from hourly ERA5 RH (>=90%) rather than AMeDAS energy balance.",
   "Weather: Open-Meteo ERA5 archive (data CC BY 4.0), non-commercial research use.",
   sep = "\n"
 )

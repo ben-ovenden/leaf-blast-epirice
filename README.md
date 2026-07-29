@@ -1,361 +1,538 @@
-# Weekly blast risk (EPIRICE + BLASTAM, Open-Meteo)
+# Leaf blast risk: EPIRICE + BLASTAM, Open-Meteo
 
-> **Migration note (cache schema version 2).** The BLASTAM night window used to be
-> applied to UTC timestamps. Over Australia the 15:00-09:00 window then lands at
-> roughly 01:00-19:00 local, missing the evening dew onset and including the
-> middle of the day. On a test series carrying 13 wet hours every local night it
-> returned 8 wet hours and zero favourable days. Hours are now converted to local
-> solar time from longitude before the day and night windows are applied.
->
-> Every `infect`, `semi`, `wet_hours` and `temp_wet` value written under schema
-> version 1 is therefore wrong and cannot be reused. `run_blast_grid.R` checks
-> `blast_outputs/cache_version.txt` and discards the cache on a mismatch, so the
-> first run after this change rebuilds from scratch: about 7,700 points at 4.8
-> weighted calls each, roughly four days of the free daily quota. Expect four
-> daily runs before the 0.3 deg grid is complete again.
+> **Cache schema version 2.** If you are upgrading from an earlier version,
+> `run_blast_grid.R` will discard the existing cache and rebuild it. The
+> 2026-07-29 run confirmed that every infect/semi/wet\_hours/temp\_wet value
+> written under schema version 1 was wrong (the BLASTAM night window was applied
+> in UTC rather than local solar time) and cannot be reused. Expect four or five
+> daily runs before the 0.3 degree grid is full again.
 
-A small, self contained pipeline that runs two complementary blast models each
-week from GitHub Actions, using free Open-Meteo weather, and writes two risk
-maps, a town table and a summary, and emails them out.
+A compact, self-contained pipeline that runs two complementary leaf blast models
+each week from GitHub Actions, using free Open-Meteo ERA5 weather. Two risk
+maps, a 31-town table and an HTML summary are emailed every Monday morning.
 
-## What this is
+---
 
-Two models, run from one weather fetch:
+## What it does
 
-- **EPIRICE** (Savary *et al.* 2012), a mechanistic SEIR epidemic simulation.
-  From an emergence date it steps through the season day by day, tracking
-  healthy, latent, infectious and removed leaf sites, and reports leaf blast
-  **intensity** (the proportion of leaf tissue diseased). It answers: how much
-  disease has the season built up? The SEIR engine and leaf blast parameters are
-  vendored into `epirice_model.R` so no package install is needed.
-- **BLASTAM** (`blastam_model.R`), the Japanese infection-warning model of
-  Koshimizu (1988). For each day it judges whether conditions favoured a new
-  infection, and counts the favourable **infection days in the last 21 days** (`BLASTAM_WINDOW_DAYS`). A day is favourable
-  when leaf wetness is at least 10 hours, the mean temperature during wetness is
-  within bounds, and the preceding 5-day mean temperature is within bounds. The
-  original Japanese bounds are 15-25 C and 20-25 C; here the upper bounds are
-  raised to 15-32 C and 20-30 C for warmer northern-Australian conditions (a
-  deliberate, documented deviation, since blast infects up to about 32 C given
-  adequate leaf wetness). Leaf wetness is estimated from hourly humidity (>=90%)
-  and rainfall, since ERA5 has no measured leaf-wetness variable. See
-  `blastam_model.R` for parameters and refs.
+One hourly weather fetch per grid point feeds both models at no extra API cost.
 
-The two are complementary: BLASTAM flags when infection windows open (early
-warning), while EPIRICE estimates the disease that may follow. Each run produces
-a map and a rolling trends CSV for each model.
+**EPIRICE** (Savary *et al.* 2012) is a mechanistic SEIR epidemic simulation.
+From a rolling crop emergence date it steps day by day, tracking healthy, latent,
+infectious and removed leaf sites, and reports **intensity**: the proportion of
+leaf tissue diseased (0 to 100%). It answers: *how much disease has the season
+built up?* It is cumulative and slow to respond; it reads near zero in cool, dry
+conditions regardless of recent infection events.
 
-`openmeteo_wth.R` fetches the Open-Meteo historical archive. A single hourly
-fetch per point feeds BLASTAM (leaf-wetness nights) and is aggregated to the
-daily fields EPIRICE expects, so both models share the same weather at no extra
-API cost.
-A day counts as wet, and therefore infection favourable, when mean relative
-humidity is at or above 90 per cent or rainfall is at or above 5 mm, which are
-the published thresholds.
+**BLASTAM** (Koshimizu 1988) is a Japanese infection-warning model. For each
+night it asks whether leaf wetness, night temperature and antecedent temperature
+together favoured a new *Magnaporthe oryzae* infection event, and counts
+**favourable infection days in the last 21 days**. It answers: *where is
+infection pressure building right now?* It responds quickly to humid, wet spells
+and fires before disease is visible.
+
+The two are complementary. BLASTAM flags when infection windows open, useful for
+timing fungicide decisions; EPIRICE estimates the disease that may follow. Both
+are weather-driven potentials, not field measurements.
+
+---
 
 ## Files
 
 | File | Role |
 | --- | --- |
-| `epirice_model.R` | Vendored SEIR engine and exact leaf blast parameters |
-| `openmeteo_wth.R` | Open-Meteo weather adapter (replaces NASA POWER) |
-| `blast_config.R` | Your sites, season, risk bands, output and email settings |
-| `run_blast.R` | Runner: fetch weather, run model, write map, table, summary |
-| `run_blast_grid.R` | Continental risk **heatmap**: runs the model on a grid |
-| `blastam_model.R` | BLASTAM infection-warning model and its parameters |
-| `send_email.py` | Sends the summary email (Python stdlib, no Node action) |
-| `.github/workflows/weekly_blast.yml` | Monday run: models, emails, commits |
-| `.github/workflows/midweek_blast.yml` | Silent midweek run: tops up the cache only |
+| `blast_config.R` | All configurable settings: sites, thresholds, grid, API, output |
+| `epirice_model.R` | Vendored SEIR engine and leaf blast parameters from epicrop |
+| `blastam_model.R` | BLASTAM infection-warning model, with full parameter notes |
+| `openmeteo_wth.R` | Single-point Open-Meteo adapter (used by run\_blast.R fallback) |
+| `openmeteo_batch.R` | Batched Open-Meteo fetcher used by both grid and town runs |
+| `run_blast.R` | Town table runner: fetch, model, write CSV, HTML and text summary |
+| `run_blast_grid.R` | Continental heatmap runner: fill the cache, model, render maps |
+| `send_email.py` | Python stdlib email sender (replaces the broken Node 24 action) |
+| `test_offline.R` | Offline regression tests (no network, runs in seconds, in CI) |
+| `australia_land.geojson` | Land polygon for masking ocean and clipping the map |
+| `australia_rivers.geojson` | River overlay |
+| `australia_roads.geojson` | Road overlay |
+| `.github/workflows/weekly_blast.yml` | Monday workflow: test → fetch → model → email → commit |
 
-## Two outputs
-
-`run_blast.R` gives the site level view: a table, a summary and a point map for
-your monitoring locations. `run_blast_grid.R` gives a continental **heatmap**: it
-runs EPIRICE on a grid of points and renders a continuous risk surface as a PNG
-and a GeoTIFF. Both are driven by the same Open-Meteo weather and the same model.
-
-### About the heatmap
-
-The heatmap follows the approach of Savary *et al.* (2012), who mapped potential
-epidemics on a grid. Each week it assumes a crop of age `CROP_AGE_DAYS` at every
-land cell and colours the modelled leaf blast intensity. It covers all land,
-including coastal cells, and is clipped to the coastline so the ocean is blank.
-Coastline, rivers, roads, towns and your monitoring sites are drawn on top. Read
-it as a potential risk surface: it shades the land as if rice were grown
-everywhere, so most of it is a weather driven potential, not actual crop or
-measured disease.
-
-Colours run from light blue (low) to dark red (high) on a FIXED scale set by
-`HEAT_MAX`, so a given colour means the same intensity every week. That value is
-provisional: EPIRICE intensity is near zero in the dry season and rises in the
-wet, so run once through a favourable month with `HEAT_MAX <- NULL` to read the
-peak, then set `HEAT_MAX` a little above it. Until then, dry-season maps read
-low, which is the correct signal.
-
-Output files are date stamped, for example `epirice_heatmap_2026-07-10.png` and `blastam_heatmap_2026-07-10.png` and the
-matching GeoTIFF, with a `_latest.png` copy of each for convenience.
-
-Grid settings live in `blast_config.R`:
-
-- Dynamic resolution with a weather cache. Each run keeps a weather cache
-  (committed to the repo, retaining `CACHE_HISTORY_DAYS` of history). It is written as
-  `weather_cache.csv.gz`. `WEATHER_CACHE_KEEP_CSV` is now FALSE: the plain copy
-  was 16.4 MB against 2.1 MB for the gz and both were committed on every run.
-  The writer checks the gzip magic bytes before accepting the file, because
-  `fwrite()` decides whether to compress from the file extension and a temp file
-  named `.tmp` silently produced an uncompressed cache under a `.gz` name. Reading prefers the gz,
-  falls back to the CSV if the gz is missing, malformed or truncated, and writing
-  falls back to CSV if the gz cannot be verified.
-  Points already in the cache only need their newest days fetched, which is cheap,
-  so the spare API budget is spent ADDING new points. The map therefore fills
-  coarse to fine over successive runs, reaching about 0.3 degree (~7,700 land
-  points over the continent) in roughly four daily runs from cold, then holds
-  there. Each run spends up to `DAILY_WEIGHTED_CAP` (9,000) weighted calls,
-  inside the free daily limit of 10,000, paced to stay under the 5,000 an hour
-  ceiling. Each run refreshes only points at
-  least `REFRESH_MIN_STALE_DAYS` old, so the two runs share the refresh load.
-  Changing `GRID_RES_FINEST` discards cached points that no longer sit on the new
-  grid, since they could never be refreshed again.
-- `GRID_RES_FINEST`: the finest resolution the map refines toward (default 0.3).
-- `GRID_RES_LEVELS`: the coarse-to-fine fill order (each a whole multiple of
-  `GRID_RES_FINEST`).
-- `DAILY_WEIGHTED_CAP`: weighted-call budget per run (9,000, under the 10,000 a
-  day free ceiling). `TARGET_CALLS_PER_RUN` is an alias kept for older scripts.
-- `GRID_TARGET_PER_MIN`: sustained weighted calls per minute (80 = 4,800 an hour,
-  under the 5,000 an hour ceiling). Not a fetch rate.
-- `OM_BATCH_SIZE`: locations per request (25).
-- `OPENMETEO_MODEL`: the reanalysis to pin. `"era5"` is 0.25 deg and carries all
-  three hourly variables. `"era5_land"` is 0.1 deg but confirm it serves
-  `relative_humidity_2m` before switching, and restate the map resolution if you
-  do. Leaving this unset lets the API mix products between variables.
-- `CACHE_SCHEMA_VERSION`: bump whenever a change alters the VALUES stored in the
-  cache. On a mismatch the cache is discarded rather than partially refreshed.
-- `GRID_EXTENT`: the mapped area. Default is the Australian continent.
-- `LAND_ONLY`: keeps land points and clips the surface to the coast, using the
-  bundled `australia_land.geojson` (read with terra, no `sf`).
-- `SHOW_COAST`, `SHOW_TOWNS`, `SHOW_ROADS`, `SHOW_RIVERS`: overlay toggles. Coast,
-  rivers and roads come from the bundled GeoJSON files. `MONITOR_TOWNS` is the
-  editable list of towns, highlighted on the map and tracked in the trends CSV.
-- `CROP_AGE_DAYS`: the trailing crop age and weather window (default 60).
-- `HEAT_MAX`: fixes the colour scale (deepest red at this %); `NULL` auto-scales.
-
-A note on magnitude: EPIRICE intensity values are often small in absolute terms,
-especially early in a crop. The heatmap is most useful for the spatial pattern
-and its change over the season, rather than the absolute percentage.
+---
 
 ## Setup
 
-1. Put these files in a new repository.
-2. Edit `blast_config.R`:
-   - `SITES`: name, latitude, longitude for each monitoring location.
-   - `EMERGENCE_DATE`: transplanting or emergence date for the current crop.
-     Optionally add an `emergence` column to `SITES` for per site dates.
-   - Risk band cut points, if you have grounds to change them.
-3. Commit and push. In the repository, open Settings, Actions, General, and
-   under Workflow permissions choose read and write.
-4. Trigger a first run from the Actions tab (Run workflow), or wait for the
-   schedule. The main run is timed to deliver the email about 7am Monday,
-   Australian Eastern time; a second, silent workflow runs midweek to top up the
-   weather cache and sends nothing. The Monday email confirms in its fine print
-   that the midweek run happened.
+### Secrets (GitHub → Settings → Secrets → Actions)
 
-Each run writes to `blast_outputs/`: a dated map, table and summary, plus
-`*_latest` copies, and commits them back to the repository.
+| Secret | Value |
+| --- | --- |
+| `MAIL_USERNAME` | Gmail address used to send (e.g. `wwai.pathology@gmail.com`) |
+| `MAIL_PASSWORD` | Gmail App Password (not the account password) |
+| `MAIL_TO` | Comma-separated recipient addresses |
 
-## Run it locally first
+The email is sent over SMTP SSL on port 465. App Passwords require 2FA enabled
+on the sending account.
 
-```bash
-Rscript -e 'install.packages(c("data.table","jsonlite"))'
-Rscript run_blast.R
+### Configuration
+
+Edit `blast_config.R` and commit. The main things to change:
+
+- `MONITOR_TOWNS` — the 31 sites tracked in the town table and trends CSVs.
+- `CROP_AGE_DAYS` — the rolling crop age assumed everywhere (default 60 days).
+- `INTENSITY_LOW_MAX`, `INTENSITY_MODERATE_MAX` — risk band thresholds. Calibrate
+  against field observations; current values are provisional.
+- `GRID_EXTENT` — the mapped area (default: Australian continent).
+
+---
+
+## Running locally
+
+```r
+source("blast_config.R")
+source("epirice_model.R")
+source("blastam_model.R")
+source("openmeteo_wth.R")
+source("openmeteo_batch.R")
+Rscript run_blast.R       # town table
+Rscript run_blast_grid.R  # continental heatmap
 ```
 
-The Open-Meteo archive lags real time by several days, so the run reports up to
-about six days ago. That is set by `ARCHIVE_LAG_DAYS` in the config. Dates are
-reported in Australian Eastern time (AEST/AEDT).
+Required packages: `data.table`, `jsonlite`, `curl`, `terra`. The workflow
+installs them inside the `rocker/geospatial` container; locally use
+`install.packages(c("data.table","jsonlite","curl","terra"))`.
 
-## Email (required)
+Run the offline tests first:
 
-Email is how the two heatmaps leave the runner: the PNGs are NOT committed to the
-repo, so email is their delivery path (with the run artifact as a 90-day fallback
-copy). Email is sent by the workflow, not by R, which avoids a Java dependency.
+```r
+Rscript test_offline.R
+```
 
-Add three repository secrets: `MAIL_USERNAME` (a Gmail address), `MAIL_PASSWORD`
-(a Gmail app password, not the account password), and `MAIL_TO` (recipient, or a
-comma separated list). If any is missing the email step fails loudly (a red run)
-rather than skipping silently, so a delivery problem is visible. The maps are
-still recoverable for 90 days from the run's uploaded artifact.
+All 20 tests must pass before a run is meaningful. Each test guards a bug that
+was actually shipped.
 
-Each email carries: the combined town table (EPIRICE and BLASTAM), the two
-heatmap PNGs, and the two trends CSVs.
+---
 
-## Reading the output
+## Outputs
 
-Intensity is the modelled proportion of diseased leaf sites. The risk bands
-(low, moderate, high) are provisional cut points in the config. They only change
-the labelling and the map colours, not the model. Before relying on the bands,
-compare a season or two of modelled intensity against your own field
-observations and adjust the cut points so the labels match what you see. The
-`trend7` figure in the summary is the change in intensity over the last seven
-days, which indicates whether the epidemic is building or easing.
+### Town table (`run_blast.R`)
 
-## Scope and limits
+- `blast_outputs/blast_results_latest.csv` — one row per town, EPIRICE intensity
+  and BLASTAM infection days for the current run.
+- `blast_outputs/blast_summary_latest.txt` — plain text summary for the email.
+- `blast_outputs/blast_summary_latest.html` — HTML email body.
+- `blast_outputs/town_trends.csv` — wide table, one column per run date,
+  EPIRICE intensity (%). Rolling `HISTORY_RUNS` (default 10) runs kept.
+- `blast_outputs/blastam_trends.csv` — same layout, BLASTAM favourable days.
 
-- The model estimates unmanaged disease risk from weather. It does not account
-  for fungicide programmes, cultivar resistance, or nitrogen status, all of
-  which change actual disease.
-- Weather is ERA5 reanalysis on a grid of roughly 10 to 25 km, not a station in
-  your canopy, so it is a regional signal rather than a paddock measurement.
-- The wet day proxy uses daily mean humidity and rainfall. It does not resolve
-  the length of overnight leaf wetness directly.
+**Important:** emergence is computed as `end_date − CROP_AGE_DAYS` and
+therefore **moves with each run**. The trends CSVs are a rolling 60-day window
+through time, not a cumulative season total.
 
-## How the map window works
+### Heatmap (`run_blast_grid.R`)
 
-Every cell on the map is modelled over the same calendar window using only real
-weather. Nothing is padded or extrapolated. `GRID_WINDOW_MODE` decides how that
-shared window is chosen.
+- `blast_outputs/epirice_heatmap_YYYY-MM-DD.png` and `_latest.png` — EPIRICE
+  potential risk surface.
+- `blast_outputs/blastam_heatmap_YYYY-MM-DD.png` and `_latest.png` — BLASTAM
+  infection-day surface.
+- `blast_outputs/epirice_heatmap_YYYY-MM-DD.tif` — matching GeoTIFF (set
+  `WRITE_GEOTIFF <- FALSE` to suppress).
 
-**`"latest"` (default).** The window always ends at the archive edge, so the map is
-as current as the data allows. Cells that did not reach that date this run, because
-a fetch failed or the wall-clock budget stopped the run, are simply absent from the
-map; they stay in the cache and are refreshed next run. Freshness is fixed and the
-cell count varies. Gaps are interpolated over when the surface is drawn, so a small
-scatter of missing cells changes the picture very little.
+The date in the filename is the **run date**, not the data date. The data window
+ends 6 days before the run (ERA5 archive lag) and the map title states both.
 
-**`"coverage"`.** The window is pulled back to the newest date that
-`GRID_WINDOW_COVERAGE` of cells have reached, and every cell is truncated to it.
-Nearly all cells are mapped, but the map runs further behind. Useful only if the
-grid is refreshed on a rolling basis across several runs.
+The heatmap colours every land cell as if rice were grown there; it is a
+potential risk surface driven by weather, not a map of actual crops or measured
+disease. Interpret accordingly.
 
-## Throughput and resolution
+**Colour scale.** `HEAT_MAX` (default 2%) is the fixed ceiling for EPIRICE;
+`BLASTAM_HEAT_MAX` (default 21 days) is the fixed ceiling for BLASTAM. Both
+stay fixed week to week so colours are directly comparable across runs. A flat
+blue map in July is the correct signal for the Australian winter; the scale is
+not wrong. Set `HEAT_STRETCH <- 0.5` for a square-root stretch that makes low
+values more legible without changing the anchor.
 
-Resolution is limited by how many cells one run can refresh, because a cell fetched
-in an earlier run no longer reaches the current archive edge. Extra runs during the
-week do not help a `"latest"` map.
+---
 
-Fetching is batched: `OM_BATCH_SIZE` locations go into one request. The weighted
-cost is unchanged, because weight scales with the number of locations, but round
-trips fall by a factor of about 25, and round trips are what actually governed
-wall clock before.
+## Weather cache and API
 
-The binding limit is the free tier quota, not the network. Weight per location is
-`max(1, nvars/10) * max(1, ndays/14)`, so a 67 day fetch of three hourly
-variables costs about 4.8 weighted calls and a 20 day refresh about 1.4. Against
-10,000 weighted calls a day that is roughly 1,900 new points, or a full refresh
-of about 7,000 existing ones.
+### Open-Meteo weighted calls
 
-Resolution follows directly. Under `GRID_WINDOW_MODE = "latest"` every mapped
-cell must reach the same end date, so the whole grid has to be refreshed inside
-one day's quota. That caps the grid near 7,000 points, which over the Australian
-land mass is about 0.31 deg, so 0.3 deg is close to the practical ceiling for
-this mode. To go finer, switch to `"coverage"` and let the refresh spread across
-the week. Every cell is still truncated to one common end date, so the map is not
-a mosaic, but that date sits up to a week further back. The weekly ceiling is then
-around 50,000 points, or about 0.12 deg, and ERA5-Land's native 0.1 deg is the
-floor below which nothing is gained.
+Open-Meteo charges in **weighted calls**, not in requests:
 
-`GRID_TARGET_PER_MIN` is in WEIGHTED CALLS per minute, not fetches. It is set to
-80, which is 4,800 an hour against the 5,000 an hour ceiling. Do not read it as a
-fetch rate: at about 4.8 weighted per point, 80 weighted a minute is roughly 17
-points a minute.
+```
+weight per location = max(1, n_variables / 10) × max(1, n_days / 14)
+```
 
-Each phase logs its status tally, for example
-`add status: ok=1751 empty=0 quota=0 http=0 transport=35`. A non-zero `quota`
-means the daily or hourly limit was hit and the run stopped fetching; `http` and
-`transport` failures are retried once, within a reserved slice of both the wall
-clock and the weighted budget.
+The 14-day floor means a 1-day top-up and a 14-day fetch cost identically.
+Three variables over 67 days costs ~4.8 weighted calls per point; a 14-day
+refresh costs exactly 1.0.
 
-## EPIRICE leaf blast parameters
+Free tier limits: 10,000 weighted calls per day, 5,000 per hour, 600 per
+minute. This pipeline uses at most 9,000 per day (`DAILY_WEIGHTED_CAP`) and
+paces at 80 per minute (`GRID_TARGET_PER_MIN`) to stay under the hourly cap.
+`GRID_TARGET_PER_MIN` is in **weighted calls per minute**, not fetches; at ~4.8
+weighted per point, 80/min is about 17 points per minute.
 
-`epirice_model.R` vendors the SEIR engine and the leaf blast parameterisation
-from the `epicrop` package (Sparks and colleagues), which implements EPIRICE
-(Savary *et al.* 2012). The parameters are used exactly as published; the values
-are listed here for reference and are not meant to be edited casually.
+Fetching is batched: `OM_BATCH_SIZE` (25) locations per request. Weighted cost
+is unchanged but HTTP round trips fall by a factor of 25, which is what governs
+wall clock. The `openmeteo_batch.R` fetcher uses `curl` directly so HTTP 429
+quota-exceeded responses are distinguishable from transport failures and stop the
+run immediately rather than burning three hours confirming the quota is spent.
 
-Each day the model moves leaf sites through healthy, latent, infectious and
-removed states. New infection is the basic infection rate `RcOpt` scaled by four
-modifiers: crop age (`RcA`), temperature (`RcT`), a leaf-wetness switch (on when
-RH is at least `rhlim` or rain at least `rainlim`), and the fraction of sites
-still free to infect. The daily output is intensity, the proportion of leaf
-tissue diseased (0 to 1), reported as the EPIRICE %.
+### Weather cache
 
-| Parameter | Value | Meaning |
+`blast_outputs/weather_cache.csv.gz` stores daily EPIRICE inputs and BLASTAM
+night judgements for every cached grid point. The cache is committed to the
+repository so each run only fetches the latest days, not the full history.
+
+- Points already cached need only an 8-day tail fetched (`REFRESH_TAIL_DAYS`).
+  Combined with the 6-day BLASTAM lead-in, the actual fetch is 14 days, costing
+  exactly 1.0 weighted calls per point.
+- New points need the full window: `CROP_AGE_DAYS` (60) + lead-in (6) = 67
+  days, costing ~4.8 weighted per point.
+- The spare budget after refreshing all existing points is spent adding new ones.
+- The cache is written to a `.tmp.gz` temp path, read back to verify the row
+  count and the gzip magic bytes, then renamed atomically, so a cancelled job
+  cannot corrupt it.
+- `CACHE_KEEP_HISTORY` retains `CACHE_HISTORY_DAYS` (120) of weather beyond the
+  modelling window, at roughly 25 MB per year once the grid is full. Do not raise
+  this significantly while the cache is committed to git.
+- `CACHE_SCHEMA_VERSION` (currently 2): bump this whenever a change alters the
+  **values** stored in the cache, not just its columns. On a mismatch the cache
+  is discarded entirely rather than partially refreshed, which would mix old and
+  new definitions on the same map.
+
+### Failure ledger
+
+`blast_outputs/fetch_failures.csv` tracks points that failed repeatedly. After
+`FAIL_LEDGER_MAX_STRIKES` (4) consecutive failures a point is benched with
+exponential cooloff, so it is not retried every run when the failure is
+structural (offshore cell, bad coordinate).
+
+### Grid fill and resolution
+
+The 7,721 land-cell target at 0.3 deg takes about 8–9 daily runs from cold.
+Subsequent runs refresh the whole grid in one pass. Progress:
+
+| Run | Points | Spacing |
 | --- | --- | --- |
-| `onset` | 15 | days after emergence before the epidemic can start |
-| `duration` | 120 (published); run at `CROP_AGE_DAYS`, default 60 | season length simulated (days) |
-| `rhlim` | 90 | relative humidity (%) at or above which leaves count as wet |
-| `rainlim` | 5 | rainfall (mm) at or above which leaves count as wet |
-| `H0` | 600 | initial healthy sites |
-| `I0` | 1 | initial infective site at onset |
-| `RcOpt` | 1.14 | optimum daily basic infection rate |
-| `p` | 5 | latent period (days) |
-| `i` | 20 | infectious period (days) |
-| `a` | 1 | aggregation exponent on the free-sites correction |
-| `Sx` | 30000 | maximum sites (carrying capacity) |
-| `RRS` | 0.01 | relative senescence rate |
-| `RRG` | 0.1 | relative growth rate |
+| 1 (cold) | ~1,800 | 0.60 deg complete |
+| 2 | ~3,600 | 0.60 deg complete |
+| 4 | ~6,600 | 0.60 complete, 0.30 partial |
+| 8–9 | 7,721 | 0.30 deg complete |
 
-Temperature response `RcT` (relative infection rate vs mean air temperature):
+Points are added in a bit-reversed Morton (Z-order) sequence within each
+resolution level, so any partial run is a spatially uniform sample of the
+continent rather than a south-to-north front. Cape York, the Top End and the
+Kimberley receive proportional coverage from the first run.
 
-| Temp (C) | 10 | 15 | 20 | 25 | 30 | 35 | 40 | 45 |
+`GRID_WINDOW_MODE = "latest"` (default) ends every cell at the archive edge on
+the same date, keeping the map comparable across longitude. Cells that missed
+the refresh this run are absent rather than stale.
+
+---
+
+## EPIRICE: parameters and deviations
+
+The SEIR engine and leaf blast parameterisation are vendored from the `epicrop`
+package (Sparks and colleagues) into `epirice_model.R`. This means no package
+install is needed and the version is fixed.
+
+### How it works
+
+Each day the model moves leaf sites through healthy (H), latent/exposed (E),
+infectious (I) and removed (R) states. New infections per day = Rc × H ×
+(I / Sx)^a, where Rc is the basic infection rate modulated by four multipliers:
+
+- **RcA**: crop age modifier (young tissue is most susceptible)
+- **RcT**: temperature modifier (peaks at the optimum)
+- **Wetness switch**: on when daily mean RH ≥ `rhlim` or daily rainfall ≥
+  `rainlim`; off otherwise (no wetness = no infection regardless of temperature)
+- **Free-site fraction**: infection rate falls as tissue becomes occupied
+
+Daily output is intensity = I / Sx (infectious sites / maximum sites), reported
+as a percentage.
+
+### Published parameters (Savary et al. 2012, Table 2)
+
+| Parameter | Value | Description |
+| --- | --- | --- |
+| `onset` | 15 days | Days after emergence before the epidemic can start |
+| `duration` | 120 days | Full season (run here at `CROP_AGE_DAYS` = 60) |
+| `rhlim` | 90% | Daily mean RH at or above which leaves count as wet |
+| `rainlim` | 5 mm | Daily rainfall at or above which leaves count as wet |
+| `H0` | 600 | Initial healthy sites |
+| `I0` | 1 | Initial infective site at onset |
+| `RcOpt` | 1.14 | Optimum basic infection rate corrected for removals |
+| `p` | 5 days | Latent period |
+| `i` | 20 days | Infectious period |
+| `a` | 1 | Aggregation exponent on the free-sites fraction |
+| `Sx` | 30,000 | Maximum leaf sites per unit area |
+| `RRS` | 0.01 | Relative senescence rate |
+| `RRG` | 0.1 | Relative leaf growth rate |
+
+**Temperature response `RcT`** — relative infection rate vs daily mean
+air temperature (as published, Table 2 of Savary *et al.* 2012):
+
+| Temp (°C) | 10 | 15 | 20 | 25 | 30 | 35 | 40 | 45 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Rc | 0 | 0.5 | 1.0 | 0.6 | 0.2 | 0.05 | 0.01 | 0 |
+| RcT | 0 | 0.5 | 0.6 | **1.0** | 0.6 | 0.2 | 0.05 | 0 |
 
-The curve peaks at 20 C. The `epicrop` author reports that Table 2 of Savary
-*et al.* 2012 prints the optimum as 25 C in error and codes the response peak at
-20 C, which is the value vendored here. This is the package author's reading of
-the source rather than a published erratum, so treat it as such. Note this is a
-different, cooler temperature response than the 15 to 32 C bounds used in BLASTAM,
-so the two models will not agree on warm days by design.
+**Crop-age response `RcA`**: 1.0 for the first 10 days, declining to 0.01 by
+day 90. Full 25-point table in `epirice_model.R`.
 
-Crop-age response `RcA` (relative infection rate vs crop age in days) is a
-25-point curve from 1.0 for the first ~10 days, decaying to 0.01 by about day 90
-(young tissue is far more susceptible). See `epirice_model.R` for the full curve.
+### Deviation from epicrop: RcT peak at 25°C
 
-Two things in this deployment differ from a stock run: `duration` is set to
-`CROP_AGE_DAYS` (default 60) rather than the published 120, so results are
-"disease built up in a crop of that age", not a full-season figure; and the
-weather is Open-Meteo ERA5 rather than NASA POWER. The parameters themselves are
-unchanged.
+The `epicrop` package source carries a code comment: *"The optimum temperature
+for leaf blast as presented in Table 2 of Savary et al. 2012 has a typo. The
+optimal value should be 20°C, not 25°C as shown."* That comment corrects the
+table to a 20°C peak.
+
+**This implementation uses the published 25°C peak for the following reasons:**
+
+1. The biological literature consistently places the optimum for spore
+   germination, infection and lesion formation at 25–28°C (*M. oryzae*:
+   Barksdale & Jones 1965; UC IPM California rice blast guide; Advances in Rice
+   Blast, ScienceDirect 2025). A 20°C optimum conflicts with this.
+2. The consequence for northern Australia is large. At 28°C daily mean (typical
+   North Queensland wet season), the 20°C curve gives RcT = 0.36 and the 25°C
+   curve gives RcT = 0.76, approximately a 2-fold difference in predicted
+   infection rate. Using the 20°C peak would systematically under-predict risk
+   at exactly the temperatures and location this tool is built for.
+3. The epicrop note is a package author's reading of the paper, not a published
+   erratum. It may reflect the original cropsim parameterisation for temperate
+   Philippines/Japan rather than a correction to the literature.
+
+To restore the epicrop 20°C version, change the `RcT` coefficient vector in
+`epirice_model.R` from `c(0, 0.5, 0.6, 1, 0.6, 0.2, 0.05, 0)` to
+`c(0, 0.5, 1, 0.6, 0.2, 0.05, 0.01, 0)`.
+
+### Two differences from a stock epicrop run
+
+1. `duration` is set to `CROP_AGE_DAYS` (60) rather than 120, so each run
+   reports "disease built up in a 60-day-old crop", not a full season.
+2. Weather is Open-Meteo ERA5 rather than NASA POWER. Column names are mapped
+   in `openmeteo_wth.R`.
+
+### Why EPIRICE can read near zero in July
+
+The wetness gate (`rhlim = 90%` daily mean) is a much higher bar than BLASTAM's
+hourly RH threshold. A day where nights reach 100% RH but afternoons drop to
+60% will have a daily mean of perhaps 75–80% and will not open the EPIRICE
+wetness gate. BLASTAM will detect those nights correctly. Both models are
+behaving; they answer different questions.
+
+---
+
+## BLASTAM: parameters and deviations
+
+`blastam_model.R` implements the infection-warning model of Koshimizu (1988),
+operated across Japan on the AMeDAS automated weather network.
+
+### How it works
+
+For each night the model asks three questions:
+
+1. Was the leaf wetness duration long enough?
+2. Was the temperature during the wetness period within the favourable range?
+3. Has the background temperature of the past five days been warm enough?
+
+If all three say yes, the night is **favourable**. If the wetness threshold is
+met but exactly one temperature criterion fails, the night is
+**semi-favourable**. Results are stored per day as `infect` (0/1/NA) and `semi`
+(0/1/NA); NA means the night could not be judged (incomplete hourly series or
+insufficient lead-in). The BLASTAM score reported in the email and the map is
+the count of favourable nights over the past `BLASTAM_WINDOW_DAYS` (21) days.
+
+### Original criteria (Koshimizu 1988)
+
+| Criterion | Original value |
+| --- | --- |
+| Leaf wetness duration | ≥ 10 hours (fixed) |
+| Temperature during wetness | 15–25°C |
+| Preceding 5-day mean temperature | 20–25°C |
+| Night window | 15:00 to 09:00, local Japan Standard Time |
+| Leaf wetness estimation | Energy balance from AMeDAS sunshine, wind, rainfall |
+| Heavy rain | Hours ≥ 4 mm/h excluded (Yoshino 1988, via Hayashi & Koshimizu) |
+
+### Our five deviations, and why
+
+**Deviation 1 — Temperature-dependent wetness threshold (replaces fixed 10 h)**
+
+Koshimizu's 10-hour threshold was calibrated empirically for Tohoku, where
+wetness-period temperatures are typically 15–20°C. The biology shows the required
+wetness duration decreases with temperature (Barksdale & Jones 1965; Kato 1974):
+
+| Wetness-period temp | Required hours |
+| --- | --- |
+| 15.6°C (60°F) | 12.2 h |
+| 18.3°C (65°F) | 10.9 h |
+| 21.1°C (70°F) | 9.7 h |
+| 23.9°C (75°F) | 8.6 h |
+| 26.7°C (80°F) | 7.7 h |
+
+*Source: Barksdale & Jones (1965), lower 95% confidence interval.*
+
+For Tohoku the 10 h approximation is reasonable. For Australia it biases in both
+directions: at 17°C nights the required threshold is 11.5 h but we were scoring
+against 10 h (over-counting); at 26°C nights the threshold is 7.9 h but we were
+demanding 10 h (under-counting, by roughly 41% of qualifying nights in the
+measured cache data).
+
+The Barksdale & Jones curve is implemented as `blastam_bj_min_hours()`, a linear
+interpolation with flat extrapolation outside the range. Set
+`BLASTAM_USE_BJ_THRESHOLD <- FALSE` to restore the original fixed 10 h.
+
+**Deviation 2 — Upper temperature bounds raised for tropical Australia**
+
+| Bound | Koshimizu 1988 | This implementation |
+| --- | --- | --- |
+| Wetness-period mean, upper | 25°C | **32°C** |
+| Preceding 5-day mean, upper | 25°C | **30°C** |
+| Lower bounds (both) | unchanged | unchanged |
+
+The Japanese 25°C caps were calibrated for temperate Tohoku (July–August mean
+temperatures 23–25°C). They exclude the entire tropical wet-season temperature
+range (26–32°C), where blast is most active. The shortest required wetness
+duration for infection occurs near 25–28°C (Barksdale & Jones 1965; Kato 1974),
+exactly where the original upper bound cuts off. These upper bounds are
+deliberately raised; the lower bounds are not changed.
+
+To restore the original bounds: `BLASTAM_TWET_MAX <- 25` and
+`BLASTAM_PREV5_MAX <- 25` in `blast_config.R` or `blastam_model.R`.
+
+**Deviation 3 — Heavy rain exclusion stated explicitly**
+
+Hours with hourly precipitation ≥ `BLASTAM_RAIN_HEAVY` (4 mm/h, matching
+Yoshino 1988) are excluded from the infection-conducive wet count. Heavy rain
+washes conidia off the leaf surface, making those hours unfavourable for
+infection even though the leaf is physically wet. Koshimizu's energy-balance
+estimator handled this implicitly; our RH proxy does not, so it must be stated.
+Set `BLASTAM_RAIN_HEAVY <- Inf` to disable.
+
+**Deviation 4 — Leaf wetness estimated from hourly RH**
+
+| Original | This implementation |
+| --- | --- |
+| Energy balance from AMeDAS sunshine, wind and rain | RH ≥ 90% or rain ≥ 0.2 mm/h, excluding rain ≥ 4 mm/h (Deviation 3) |
+
+ERA5 provides no measured leaf-wetness variable. RH ≥ 90% is the standard
+humidity proxy for leaf wetness. The 0.2 mm/h rain threshold picks up drizzle
+that RH may lag. Mean temperature during the wet period (`temp_wet`) is the mean
+during infection-conducive wet hours, which differs from the AMeDAS
+energy-balance approach. Absolute wet-hour counts are provisional until
+calibrated against field leaf-wetness data.
+
+**Deviation 5 — Local solar time rather than political timezone**
+
+The 15:00–09:00 window is applied in local solar time (longitude / 15 h) rather
+than Japan Standard Time or the local political timezone. Political zone
+boundaries jump at state lines and would introduce a step discontinuity in
+wet-hour counts across the continental map. Solar time follows the sun, which
+governs dew formation and leaf drying.
+
+### Completeness and lead-in
+
+A night can only be judged when both the previous evening (hours ≥ 15:00 local)
+and the following morning (hours < 09:00 local) are present, and when five
+preceding days of temperature exist for the 5-day mean. Where either is
+unavailable, `infect` and `semi` are stored as NA rather than 0.
+
+Callers fetch `BLASTAM_LEADIN_DAYS` (6) extra days and discard them: one day
+because the first local solar day is partial, and five days for the preceding
+5-day mean. The 8-day refresh tail (`REFRESH_TAIL_DAYS`) plus the 6-day lead-in
+totals exactly 14 days, which is the API's minimum charge unit, giving a refresh
+cost of exactly 1.0 weighted calls per point.
+
+### BLASTAM scores in the email
+
+The email reports two numbers per town. The first (`BLASTAM days`) is the count
+of **favourable** nights in the last 21 days. The second in parentheses
+(`7d N`) is the count of favourable nights in the last 7 days, which shows
+whether the trend is building. Semi-favourable nights are tracked separately and
+reported in `blast_results_latest.csv` but not in the email table.
+
+---
+
+## Workflow
+
+The Monday workflow (`.github/workflows/weekly_blast.yml`) runs:
+
+1. **Offline tests** — `Rscript test_offline.R`. 20 tests, no network. Fails the
+   run before three hours of fetching are spent on broken code.
+2. **Continental heatmaps** — `Rscript run_blast_grid.R`. Fetches weather, runs
+   both models on the grid, renders two PNG heatmaps and two GeoTIFFs.
+3. **Town table** — `Rscript run_blast.R`. Fetches weather for the 31 monitoring
+   sites, runs both models, writes the CSV, text and HTML summary.
+4. **Commit** — pushes the updated cache, trends CSVs, failure ledger, version
+   file and map stats. The cache is committed first so a failed email step does
+   not lose the fetched data.
+5. **Email** — `python3 send_email.py`. Sends the HTML summary with four
+   attachments (two heatmap PNGs, two trends CSVs) via Gmail SMTP SSL.
+6. **Upload artifact** — saves all `blast_outputs/` to the Actions artifact
+   store for 90 days as a fallback if email fails.
+
+Two seasonal cron entries bracket the daylight saving change:
+
+```yaml
+- cron: '30 20 * * 0'   # 06:30 Monday AEST (winter, UTC+10)
+- cron: '30 19 * * 0'   # 06:30 Monday AEDT (summer, UTC+11)
+```
+
+The gate job matches the fired schedule against the current UTC offset, so a
+late-firing cron (GitHub routinely fires 5–30 minutes late) does not skip the
+week.
+
+A `concurrency` group prevents two simultaneous runs from clobbering the cache.
+
+---
 
 ## Attribution
 
-Please retain the attribution in `epirice_model.R` and `blastam_model.R`, and
-cite the models if you publish or distribute results.
+Please retain the attribution comments in `epirice_model.R` and
+`blastam_model.R`, and cite the primary publications if you publish or
+distribute results.
 
-EPIRICE:
+**EPIRICE:**
 
 Savary, S., Nelson, A., Willocquet, L., Pangga, I., and Aunario, J. (2012).
 Modeling and mapping potential epidemics of rice diseases globally. *Crop
-Protection* 34: 6 to 17. doi:10.1016/j.cropro.2011.11.009.
+Protection* 34: 6–17. doi:10.1016/j.cropro.2011.11.009
 
 epicrop package (vendored SEIR engine and leaf blast parameters): Adam H. Sparks
-and colleagues. Check the epicrop licence before redistributing the model code
-itself. Framework: Zadoks, J.C. (1971). *Phytopathology* 61: 600 to 610.
+and colleagues (Department of Primary Industries and Regional Development, WA;
+IRRI). Check the epicrop licence before redistributing the model code. Framework:
+Zadoks, J.C. (1971). A formal definition of host–pathogen interaction in
+epidemiological terms. *Phytopathology* 61: 600–610.
 
-BLASTAM:
+**BLASTAM:**
 
-Koshimizu, Y. (1988). A forecasting method for occurrence of rice leaf blast
-with AMeDAS data. *Bulletin of the Tohoku National Agricultural Experiment
-Station* 78: 67 to 121. [in Japanese]
+Koshimizu, Y. (1988). A forecasting method for occurrence of rice leaf blast with
+AMeDAS data. *Bulletin of the Tohoku National Agricultural Experiment Station* 78:
+67–121. [in Japanese]
 
 Hayashi, T. and Koshimizu, Y. (1988). Computer program BLASTAM for forecasting
 occurrence of rice leaf blast. *Bulletin of the Tohoku National Agricultural
-Experiment Station* 78: 123 to 138. [in Japanese]
+Experiment Station* 78: 123–138. [in Japanese]
+
+Barksdale, T.H. and Jones, M.W. (1965). Minimum conditions of temperature and
+dew period for infection of rice by *Piricularia oryzae*. *Phytopathology* 55:
+1037–1040. [basis for the temperature-dependent wetness threshold, Deviation 1]
+
+Kato, H. (1974). Epidemiology of blast. *Review of Plant Protection Research*
+7: 1–20. [temperature–wetness interaction, Deviation 1]
 
 Maehara, H. and Yamada, M. (2025). Annual changes in the timing and frequency of
 favorable conditions for rice leaf blast infection estimated by BLASTAM in
 Fukushima Prefecture. *Annual Report of the Society of Plant Protection of North
-Japan* 76: 41 to 46. doi:10.11455/kitanihon.2025.76_41.
+Japan* 76: 41–46. doi:10.11455/kitanihon.2025.76\_41
 
-The infection criteria follow the operational Japanese BLASTAM (leaf wetness at
-least 10 hours; mean temperature during wetness and preceding 5-day mean within
-bounds), with the upper temperature bounds deliberately raised from the Japanese
-25 C to 32 C (wetness period) and 30 C (5-day mean) for warmer
-northern-Australian conditions. Set both maxima back to 25 in `blastam_model.R`
-to reproduce the original. Leaf wetness is estimated from hourly humidity and
-rainfall, since ERA5 has no measured leaf-wetness variable.
+**Weather:**
 
-Weather:
+Open-Meteo historical ERA5 archive, data licensed CC BY 4.0. Non-commercial
+research use. Hersbach, H. *et al.* (2020). The ERA5 global reanalysis.
+*Quarterly Journal of the Royal Meteorological Society* 146: 1999–2049.
+doi:10.1002/qj.3803
 
-Open-Meteo historical (ERA5) archive, data licensed CC BY 4.0.
-Hersbach, H. et al. (2020). The ERA5 global reanalysis. *Quarterly Journal of
-the Royal Meteorological Society* 146: 1999 to 2049. doi:10.1002/qj.3803.
+ERA5 native resolution is 0.25 deg (~28 km). A 0.3 deg model lattice matches
+this driver; finer grids buy interpolation rather than information unless
+`OPENMETEO_MODEL` is switched to `"era5_land"` (0.1 deg, ~11 km). Confirm that
+`relative_humidity_2m` is served by ERA5-Land before switching, and restate the
+map resolution in any publications if you do.
