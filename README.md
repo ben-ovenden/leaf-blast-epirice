@@ -7,9 +7,9 @@
 > in UTC rather than local solar time) and cannot be reused. Expect four or five
 > daily runs before the 0.3 degree grid is full again.
 
-A compact, self-contained pipeline that runs two complementary leaf blast models
-each week from GitHub Actions, using free Open-Meteo ERA5 weather. Two risk
-maps, a 31-town table and an HTML summary are emailed every Monday morning.
+A self-contained pipeline that runs two complementary leaf blast models each
+week from GitHub Actions, using free Open-Meteo ERA5 weather. Two risk maps, a
+31-town table and an HTML summary are emailed every Monday morning.
 
 ---
 
@@ -34,6 +34,40 @@ and fires before disease is visible.
 The two are complementary. BLASTAM flags when infection windows open, useful for
 timing fungicide decisions; EPIRICE estimates the disease that may follow. Both
 are weather-driven potentials, not field measurements.
+
+### Relationship to previous Australian work
+
+The most directly comparable prior study is Lanoiselet, Cother and Ash (2002),
+which used CLIMEX (climate matching) and a custom DYMEX population model to ask
+whether *M. grisea* could establish in the NSW rice belt. That study ran over
+four BOM station locations (Finley, Griffith, Hay, Yanco) for the 1988–1999
+period and found conditions favourable in 10 of 11 seasons at one or more
+locations, with Yanco most at risk and Griffith least, driven primarily by
+relative humidity.
+
+This system extends that work in several ways. Coverage expands from four points
+in the southern rice belt to approximately 7,700 land cells at 0.3 deg across
+the whole continent, including the tropical north and the wild *Oryza* country
+most relevant to incursion pathways from Southeast Asia. The weather input is
+hourly ERA5 reanalysis rather than daily BOM min/max data, giving a real
+diurnal cycle rather than a modelled sine wave. And it runs operationally every
+week rather than as a one-time risk assessment.
+
+The biological framing is different too. Lanoiselet's DYMEX model tracked spore
+populations explicitly (production rate, UV mortality, latent period, per-lesion
+fecundity) and asked how many infection events would occur in a season. This
+system uses EPIRICE for the epidemic accumulation question and BLASTAM for the
+infection-event question, making the two roles explicit rather than merged.
+
+Both systems share the same fundamental limitation described in Lanoiselet's
+paper: weather is measured at ambient height, but in-canopy relative humidity
+in irrigated paddocks averages at least 20 percentage points higher than ambient
+(measured directly with data loggers at Yanco during the 2000–01 season). Both
+systems therefore likely under-count infection-conducive hours, particularly in
+the Murrumbidgee and Murray irrigation areas where evapotranspiration from the
+flooded surface adds substantially to the rice canopy microclimate. Quantifying
+this offset requires in-canopy data loggers deployed alongside ERA5-driven model
+runs.
 
 ---
 
@@ -287,18 +321,34 @@ table to a 20°C peak.
 
 **This implementation uses the published 25°C peak for the following reasons:**
 
-1. The biological literature consistently places the optimum for spore
-   germination, infection and lesion formation at 25–28°C (*M. oryzae*:
-   Barksdale & Jones 1965; UC IPM California rice blast guide; Advances in Rice
-   Blast, ScienceDirect 2025). A 20°C optimum conflicts with this.
-2. The consequence for northern Australia is large. At 28°C daily mean (typical
+1. Empirical infection-rate data directly support a 24–25°C optimum. Hashioka
+   (1965), used in the Lanoiselet *et al.* (2002) DYMEX model for the Australian
+   rice belt, measured the minimum time required for conidial germination and
+   penetration: 6 h at 24°C, 8 h at 28°C, 10 h at 32°C. Converting to a rate
+   (1/hours), infection is fastest at 24°C and declines on both sides. This is
+   the same data used to parameterise the temperature slope in DYMEX and it
+   places the infection optimum squarely at 24–25°C, not 20°C.
+
+2. The broader biological literature is consistent. The optimum for spore
+   germination, infection, lesion formation and sporulation is reported at 25–28°C
+   across multiple sources (Barksdale & Jones 1965; UC IPM California rice blast
+   guide; Advances in Rice Blast, ScienceDirect 2025).
+
+3. The consequence for northern Australia is large. At 28°C daily mean (typical
    North Queensland wet season), the 20°C curve gives RcT = 0.36 and the 25°C
-   curve gives RcT = 0.76, approximately a 2-fold difference in predicted
+   curve gives RcT = 0.76: approximately a 2-fold difference in predicted
    infection rate. Using the 20°C peak would systematically under-predict risk
    at exactly the temperatures and location this tool is built for.
-3. The epicrop note is a package author's reading of the paper, not a published
+
+4. The epicrop note is a package author's reading of the paper, not a published
    erratum. It may reflect the original cropsim parameterisation for temperate
-   Philippines/Japan rather than a correction to the literature.
+   Philippines/Japan rather than a correction to the biological literature.
+
+Note that sporulation peaks at a cooler temperature than infection. Kato and
+Kozaka (1974) measured 399 spores per day per lesion at 20°C but only 271 at
+25°C and 131 at 32°C. EPIRICE uses a single RcT for both infection and disease
+development, so the chosen peak is a compromise. The 25°C value better represents
+the infection step, which is the mechanistic basis for the SEIR transition.
 
 To restore the epicrop 20°C version, change the `RcT` coefficient vector in
 `epirice_model.R` from `c(0, 0.5, 0.6, 1, 0.6, 0.2, 0.05, 0)` to
@@ -311,13 +361,20 @@ To restore the epicrop 20°C version, change the `RcT` coefficient vector in
 2. Weather is Open-Meteo ERA5 rather than NASA POWER. Column names are mapped
    in `openmeteo_wth.R`.
 
-### Why EPIRICE can read near zero in July
+### Why EPIRICE reads near zero in July, and what that means
 
 The wetness gate (`rhlim = 90%` daily mean) is a much higher bar than BLASTAM's
 hourly RH threshold. A day where nights reach 100% RH but afternoons drop to
 60% will have a daily mean of perhaps 75–80% and will not open the EPIRICE
-wetness gate. BLASTAM will detect those nights correctly. Both models are
-behaving; they answer different questions.
+wetness gate. BLASTAM detects those nights correctly. Both models are behaving;
+they answer different questions.
+
+There is a second, independent reason for low July readings: July is midwinter in
+the southern rice belt and early dry season in the tropical north. The
+Lanoiselet *et al.* (2002) DYMEX model, run over October–April at four southern
+NSW locations, found conditions favourable in 10 of 11 seasons — but that model
+ran only during the rice-growing season when temperatures and humidity are both
+higher. A flat blue map in July is biologically plausible.
 
 ---
 
@@ -373,7 +430,7 @@ wetness duration decreases with temperature (Barksdale & Jones 1965; Kato 1974):
 For Tohoku the 10 h approximation is reasonable. For Australia it biases in both
 directions: at 17°C nights the required threshold is 11.5 h but we were scoring
 against 10 h (over-counting); at 26°C nights the threshold is 7.9 h but we were
-demanding 10 h (under-counting, by roughly 41% of qualifying nights in the
+demanding 10 h (under-counting by roughly 41% of qualifying nights in the
 measured cache data).
 
 The Barksdale & Jones curve is implemented as `blastam_bj_min_hours()`, a linear
@@ -415,10 +472,19 @@ Set `BLASTAM_RAIN_HEAVY <- Inf` to disable.
 
 ERA5 provides no measured leaf-wetness variable. RH ≥ 90% is the standard
 humidity proxy for leaf wetness. The 0.2 mm/h rain threshold picks up drizzle
-that RH may lag. Mean temperature during the wet period (`temp_wet`) is the mean
-during infection-conducive wet hours, which differs from the AMeDAS
+that the RH sensor may lag. Mean temperature during the wet period (`temp_wet`)
+is the mean during infection-conducive wet hours, which differs from the AMeDAS
 energy-balance approach. Absolute wet-hour counts are provisional until
 calibrated against field leaf-wetness data.
+
+The Lanoiselet *et al.* (2002) DYMEX model required 100% RH for infection, based
+on the free-water requirement for conidial germination (Hemmi & Imura 1939; Ou
+1985). That threshold appears very strict but was applied to a simulated sine-wave
+diurnal cycle, so a day where the minimum RH was 60% and the maximum was 100%
+would still produce infection-conducive hours. The BLASTAM hourly RH ≥ 90%
+approach, applied to real hourly ERA5 observations, is functionally similar: both
+capture the wet portion of the diurnal cycle. Neither uses the published 100%
+free-water threshold directly.
 
 **Deviation 5 — Local solar time rather than political timezone**
 
@@ -448,6 +514,48 @@ of **favourable** nights in the last 21 days. The second in parentheses
 (`7d N`) is the count of favourable nights in the last 7 days, which shows
 whether the trend is building. Semi-favourable nights are tracked separately and
 reported in `blast_results_latest.csv` but not in the email table.
+
+---
+
+## Known limitations
+
+### Ambient versus in-canopy humidity
+
+Both EPIRICE and BLASTAM are driven by ERA5 ambient air humidity, which
+corresponds roughly to a Stevenson screen at field-bank height. Lanoiselet *et
+al.* (2002) placed data loggers directly in the rice canopy at Yanco during the
+2000–01 season and found in-canopy RH averaged at least 20 percentage points
+higher than the ambient reading, with the difference influenced by wind speed,
+rainfall and evapotranspiration. The offset is large enough to be practically
+significant: at an ambient ERA5 hourly RH of 72%, the in-canopy value would
+exceed the BLASTAM 90% threshold. Both EPIRICE's daily mean gate and BLASTAM's
+hourly wetness count are therefore likely to under-count infection-conducive
+conditions in irrigated paddocks, and model outputs should be read as
+conservative lower bounds rather than direct estimates.
+
+Quantifying this offset requires simultaneous in-canopy loggers and ERA5-driven
+model runs at the same site. The Yanco data collected by Lanoiselet may still
+exist in CSIRO or NSW Agriculture records and would provide a starting point.
+
+### No validation against field outbreaks
+
+Australia remains free of blast in cultivated rice, so direct field validation is
+not possible here. Lanoiselet *et al.* (2002) validated their DYMEX model against
+the California 1996–1999 outbreak (first recorded blast in California) with
+reasonable skill: the model predicted infection events at the outbreak site and
+relatively few in a nearby disease-free area, though timing did not match
+perfectly. A similar validation of BLASTAM and EPIRICE against documented outbreaks
+in climatically similar regions (northern Japan, the Sacramento Valley) would
+strengthen confidence in the parameterisation. The 25°C RcT choice is best tested
+against tropical incidence data from the Philippines or northern Thailand.
+
+### Rolling emergence and seasonal interpretation
+
+Emergence is computed as `end_date − CROP_AGE_DAYS` and moves with every run.
+The EPIRICE output is therefore "disease that would accumulate in a 60-day-old
+crop given current weather", not a seasonal total. The BLASTAM window of 21 days
+is similarly rolling. Neither output can be read as a season-to-date progression.
+For season-total analysis, a fixed emergence date would be needed.
 
 ---
 
@@ -502,6 +610,11 @@ IRRI). Check the epicrop licence before redistributing the model code. Framework
 Zadoks, J.C. (1971). A formal definition of host–pathogen interaction in
 epidemiological terms. *Phytopathology* 61: 600–610.
 
+Hashioka, Y. (1965). Effects of environmental factors on development of causal
+fungus, infection, disease development, and epidemiology in rice blast disease.
+In: *The Rice Blast Disease*. J Hopkins Press: Baltimore, pp. 153–161. [empirical
+basis for the 24–25°C infection-rate optimum used in the RcT curve]
+
 **BLASTAM:**
 
 Koshimizu, Y. (1988). A forecasting method for occurrence of rice leaf blast with
@@ -517,12 +630,25 @@ dew period for infection of rice by *Piricularia oryzae*. *Phytopathology* 55:
 1037–1040. [basis for the temperature-dependent wetness threshold, Deviation 1]
 
 Kato, H. (1974). Epidemiology of blast. *Review of Plant Protection Research*
-7: 1–20. [temperature–wetness interaction, Deviation 1]
+7: 1–20. [temperature–wetness interaction, Deviations 1 and 2]
 
 Maehara, H. and Yamada, M. (2025). Annual changes in the timing and frequency of
 favorable conditions for rice leaf blast infection estimated by BLASTAM in
 Fukushima Prefecture. *Annual Report of the Society of Plant Protection of North
 Japan* 76: 41–46. doi:10.11455/kitanihon.2025.76\_41
+
+**Prior Australian modelling:**
+
+Lanoiselet, V., Cother, E.J. and Ash, G.J. (2002). CLIMEX and DYMEX simulations
+of the potential occurrence of rice blast disease in south-eastern Australia.
+*Australasian Plant Pathology* 31: 1–7. doi:10.1071/AP01070
+
+This is the earliest peer-reviewed Australian application of computational blast
+risk modelling, using a DYMEX population model validated against the California
+1996–1999 outbreak. Key data on in-canopy humidity and temperature–infection
+relationships from that study directly inform model choices here. The current
+system extends that work from four BOM point locations in the NSW rice belt to a
+continental operational grid.
 
 **Weather:**
 
