@@ -55,9 +55,19 @@ key_of <- function(lon, lat) paste0(sprintf("%.4f", lon), "_", sprintf("%.4f", l
 CACHE_COLS <- c("pid","lon","lat","date","TEMP","RHUM","RAIN","wet_hours","temp_wet","infect","semi")
 
 # Hourly JSON for one point -> the daily cache rows both models read.
-if (!exists("GRID_ON_POINT")) GRID_ON_POINT <- function(pid, lon, lat, hw) {
-  w <- tryCatch(blastam_daily_from_hourly(hw), error = function(e) NULL)
+#
+# TWO THINGS MATTER HERE.
+#  * lon is passed so BLASTAM applies its 15:00-09:00 window in LOCAL SOLAR time.
+#    Without it the window lands on UTC, which over Australia is roughly 01:00 to
+#    19:00 local: it misses the evening dew onset entirely.
+#  * keep_from drops the lead-in days. The first four days of any fetch have no
+#    preceding 5-day mean, so their infect is NA; writing them would overwrite
+#    good cached values with NA on every short refresh.
+make_on_point <- function(keep_from) function(pid, lon, lat, hw) {
+  w <- tryCatch(blastam_daily_from_hourly(hw, lon = lon), error = function(e) NULL)
   if (is.null(w) || nrow(w) == 0) return(NULL)
+  w <- w[date >= keep_from]
+  if (nrow(w) == 0) return(NULL)
   data.table(pid = pid, lon = lon, lat = lat, date = as.Date(w$date),
              TEMP = w$TEMP, RHUM = w$RHUM, RAIN = w$RAIN,
              wet_hours = w$wet_hours, temp_wet = w$temp_wet,
@@ -167,9 +177,25 @@ read_cache <- function() {
               nrow(pick), length(unique(pick$pid))))
   list(data = pick, fmt = if (grepl("\\.gz$", used)) "gz" else "csv")
 }
+# Schema version gate. A cache written under an older definition of the stored
+# values must be discarded, not refreshed: a 14 day refresh would leave the older
+# days holding the old definition and the map would silently mix the two.
+ver_file <- file.path(OUT, if (exists("CACHE_VERSION_FILE")) CACHE_VERSION_FILE else "cache_version.txt")
+want_ver <- if (exists("CACHE_SCHEMA_VERSION")) CACHE_SCHEMA_VERSION else 1L
+have_ver <- suppressWarnings(as.integer(tryCatch(readLines(ver_file, warn = FALSE)[1],
+                                                 error = function(e) NA)))
+if (is.na(have_ver)) have_ver <- 1L
+
 cache_in <- read_cache()
 cache <- cache_in$data
 read_fmt <- if (is.na(cache_in$fmt)) "none" else cache_in$fmt
+if (!is.null(cache) && have_ver != want_ver) {
+  cat(sprintf("Cache schema is version %d, this code writes version %d; discarding %d cached point(s) and rebuilding.\n",
+              have_ver, want_ver, length(unique(cache$pid))))
+  cat("  (version 2 moved the BLASTAM night window from UTC to local solar time, so every stored infect value from version 1 is wrong.)\n")
+  cache <- NULL
+  read_fmt <- "none"
+}
 if (is.null(cache) || !all(c("infect","semi","wet_hours") %in% names(cache))) {
   if (!is.null(cache)) cat("Cache lacks BLASTAM columns; rebuilding from scratch.\n")
   cache <- data.table(pid = character(), lon = numeric(), lat = numeric(),
@@ -213,10 +239,19 @@ if (length(benched) > 0)
 # Weighted cost. The API charges max(1, nvars/10) * max(1, ndays/14) per
 # location, with a 14 day FLOOR. That floor is why a refresh costs 1 regardless
 # of how few days it needs, and why refreshes take a full 14 day tail below.
-n_days_add <- as.integer(end_date - emergence) + 1L
+# Every fetch carries BLASTAM_LEADIN_DAYS of extra history that is computed and
+# then discarded: one day for the local solar shift (the first local day is
+# partial) plus five for the preceding 5-day mean temperature.
+lead <- BLASTAM_LEADIN_DAYS
+add_keep_from   <- emergence
+add_fetch_from  <- emergence - lead
+n_days_add <- as.integer(end_date - add_fetch_from) + 1L
 cost_new   <- om_weight_per_location(n_days_add, length(OM_HOURLY_VARS))
-tail_start <- max(emergence, end_date - (REFRESH_TAIL_DAYS - 1L))
-cost_ref   <- om_weight_per_location(as.integer(end_date - tail_start) + 1L,
+
+tail_start      <- max(emergence, end_date - (REFRESH_TAIL_DAYS - 1L))
+ref_keep_from   <- tail_start
+ref_fetch_from  <- tail_start - lead
+cost_ref   <- om_weight_per_location(as.integer(end_date - ref_fetch_from) + 1L,
                                      length(OM_HOURLY_VARS))
 
 cached_pids <- unique(cache$pid)
@@ -233,9 +268,13 @@ maintain  <- targets[pid %in% eligible$pid[seq_len(n_refresh)]]
 maintain_cost <- nrow(maintain) * cost_ref
 
 to_add <- targets[!pid %in% cached_pids & !pid %in% benched]
+# Hold back a slice of the weighted budget so the retry pass has something to
+# spend. Planning adds up to the full cap leaves the retry with a budget of zero.
+retry_wfrac <- if (exists("GRID_RETRY_WEIGHT_FRAC")) GRID_RETRY_WEIGHT_FRAC else 0.05
+plan_cap <- wt_cap * (1 - retry_wfrac)
 n_add <- min(nrow(to_add),
              max_fetch - nrow(maintain),
-             floor(max(0, wt_cap - maintain_cost) / cost_new))
+             floor(max(0, plan_cap - maintain_cost) / cost_new))
 add <- if (n_add > 0) to_add[seq_len(n_add)] else to_add[0]
 
 skipped_fresh <- length(cached_pids) - nrow(eligible)
@@ -280,10 +319,10 @@ all_ledger <- list()
 spent <- 0
 quota_hit <- FALSE
 
-run_phase <- function(tab, start_date, deadline, label) {
+run_phase <- function(tab, fetch_from, keep_from, deadline, label) {
   if (nrow(tab) == 0L || isTRUE(quota_hit)) return(invisible())
-  r <- fetch_points_batched(tab[, .(pid, lon, lat)], start_date, end_date,
-                            on_point = GRID_ON_POINT,
+  r <- fetch_points_batched(tab[, .(pid, lon, lat)], fetch_from, end_date,
+                            on_point = make_on_point(keep_from),
                             deadline = deadline,
                             budget = max(0, wt_cap - spent),
                             label = label)
@@ -296,8 +335,8 @@ run_phase <- function(tab, start_date, deadline, label) {
 
 # Refresh first: keeping existing cells current matters more than growing, since
 # under "latest" window mode a stale cell drops off the map entirely.
-run_phase(maintain, tail_start, refresh_deadline, "refresh")
-run_phase(add,      emergence,  add_deadline,     "add")
+run_phase(maintain, ref_fetch_from, ref_keep_from, refresh_deadline, "refresh")
+run_phase(add,      add_fetch_from, add_keep_from, add_deadline,     "add")
 
 # ---- Retry -----------------------------------------------------------------
 # Only points that were ATTEMPTED and failed with a transport or HTTP error.
@@ -322,8 +361,8 @@ if (length(retryable) > 0 && !quota_hit && ok_frac < retry_min_ok) {
   rt_add <- add[pid %in% retryable]
   cat(sprintf("Retrying %d refresh and %d add point(s) that failed with a transport or HTTP error.\n",
               nrow(rt_ref), nrow(rt_add)))
-  run_phase(rt_ref, tail_start, fetch_deadline, "refresh-retry")
-  run_phase(rt_add, emergence,  fetch_deadline, "add-retry")
+  run_phase(rt_ref, ref_fetch_from, ref_keep_from, fetch_deadline, "refresh-retry")
+  run_phase(rt_add, add_fetch_from, add_keep_from, fetch_deadline, "add-retry")
 }
 
 # ---- Update the failure ledger ---------------------------------------------
@@ -377,8 +416,10 @@ model_pt <- function(dt) {
     if (!is.null(lb) && nrow(lb) > 0) epi <- lb$intensity[nrow(lb)]
   }
   win <- BLASTAM_WINDOW_DAYS
+  lagd <- if (exists("BLASTAM_END_LAG_DAYS")) BLASTAM_END_LAG_DAYS else 0L
+  bend <- model_end - lagd
   list(intensity = epi,
-       events = sum(dt$infect[dt$date > (model_end - win)], na.rm = TRUE))
+       events = sum(dt$infect[dt$date > (bend - win) & dt$date <= bend], na.rm = TRUE))
 }
 
 # COMMON WINDOW, REAL WEATHER ONLY. Cells differ in how current they are, so the
@@ -399,8 +440,11 @@ if (identical(wmode, "latest")) {
 }
 current_pids <- pt_end[mx >= model_end, pid]
 held_out <- n_cache_pts - length(current_pids)
+# NOTE the >= . With `>` this yields CROP_AGE_DAYS rows starting one day after
+# emergence, and SEIR's "dates do not align" check then throws for every point,
+# silently emptying the EPIRICE map via model_pt()'s tryCatch.
 model_cache <- cache[pid %in% current_pids &
-                     date > (model_end - CROP_AGE_DAYS) & date <= model_end]
+                     date >= (model_end - CROP_AGE_DAYS) & date <= model_end]
 cat(sprintf("Window [%s] ends %s: %d of %d cells reach it, %d absent (%d days behind the archive edge).\n",
             wmode, format(model_end), length(current_pids), n_cache_pts, held_out,
             as.integer(end_date - model_end)))
@@ -517,20 +561,33 @@ csvdt[, `:=`(TEMP = round(TEMP, 1), RHUM = round(RHUM, 0), RAIN = round(RAIN, 1)
              temp_wet = round(temp_wet, 1), wet_hours = round(wet_hours, 0),
              lon = round(lon, 4), lat = round(lat, 4))]
 
+# True if the file starts with the gzip magic bytes. fwrite() decides whether to
+# compress from the FILE EXTENSION, so a temp file named ".tmp" is written as
+# plain text and then renamed to ".gz". read_gz_dt() reads it back happily,
+# because gzfile() transparently handles uncompressed input, so the verify passes
+# and an 8x larger file is committed under a .gz name. Hence both the ".tmp.gz"
+# naming below and this explicit check.
+is_gzip <- function(f) {
+  con <- file(f, "rb"); on.exit(close(con), add = TRUE)
+  identical(as.integer(readBin(con, "raw", 2L)), c(31L, 139L))
+}
+
 # Write to a temp path, verify, then rename. A job cancelled mid write used to
 # leave a truncated cache that the next run had to detect and discard.
 write_cache <- function(dt) {
-  tmp_gz <- paste0(gz_file, ".tmp")
+  tmp_gz <- paste0(gz_file, ".tmp.gz")     # extension must survive, see is_gzip()
   ok_gz <- tryCatch({
     fwrite(dt, tmp_gz)
-    n <- nrow(read_gz_dt(tmp_gz))
-    n == nrow(dt)
+    if (!is_gzip(tmp_gz)) {
+      cat("gz cache was NOT compressed (data.table built without zlib?); using plain CSV.\n")
+      FALSE
+    } else nrow(read_gz_dt(tmp_gz)) == nrow(dt)
   }, error = function(e) { cat("gz verify error:", conditionMessage(e), "\n"); FALSE })
   if (ok_gz) {
     file.rename(tmp_gz, gz_file)
     if (WEATHER_CACHE_KEEP_CSV) {
-      tmp_csv <- paste0(csv_file, ".tmp"); fwrite(dt, tmp_csv); file.rename(tmp_csv, csv_file)
-      fmt <- "gz+csv"
+      tmp_csv <- paste0(csv_file, ".tmp.csv"); fwrite(dt, tmp_csv)
+      file.rename(tmp_csv, csv_file); fmt <- "gz+csv"
     } else {
       if (file.exists(csv_file)) file.remove(csv_file); fmt <- "gz"
     }
@@ -538,11 +595,12 @@ write_cache <- function(dt) {
   }
   unlink(tmp_gz)
   cat("gz cache write/verify failed; falling back to plain CSV.\n")
-  tmp_csv <- paste0(csv_file, ".tmp"); fwrite(dt, tmp_csv); file.rename(tmp_csv, csv_file)
+  tmp_csv <- paste0(csv_file, ".tmp.csv"); fwrite(dt, tmp_csv); file.rename(tmp_csv, csv_file)
   if (file.exists(gz_file)) file.remove(gz_file)
   list(fmt = "csv", kb = file.info(csv_file)$size / 1024)
 }
 wc <- write_cache(csvdt)
+writeLines(as.character(want_ver), ver_file)
 cat(sprintf("Cache saved: %d points, %d rows as %s (%.0f KB)\n",
             length(unique(cache$pid)), nrow(cache), wc$fmt, wc$kb))
 

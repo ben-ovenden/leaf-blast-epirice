@@ -150,6 +150,11 @@ GRID_RESERVE_MINUTES <- 25L    # modelling, rendering, saving and committing
 # phase ran to the full deadline and the retry could never start, which stranded
 # 617 attempted points on the 2026-07-28 run.
 GRID_RETRY_RESERVE_MINUTES <- 20L
+# Share of the WEIGHTED budget held back for the retry pass. Without it the add
+# phase plans right up to DAILY_WEIGHTED_CAP, the retry is handed a budget of
+# zero and stops immediately, which is the quota-flavoured version of the
+# wall-clock bug above.
+GRID_RETRY_WEIGHT_FRAC <- 0.05
 # The workflow timeout must exceed GRID_MAX_MINUTES + GRID_RESERVE_MINUTES.
 
 # Share of the fetch budget reserved for adding new cells. Refresh runs first.
@@ -187,16 +192,40 @@ MASK_UNCOVERED  <- TRUE
 WEATHER_CACHE_GZ   <- "weather_cache.csv.gz"   # primary: gzipped
 WEATHER_CACHE_CSV  <- "weather_cache.csv"      # fallback: plain CSV
 # Write saves the gz to a temp path, reads it back to verify, then renames, so a
-# cancelled job cannot leave a truncated cache in place. KEEP_CSV additionally
-# writes the CSV alongside a good gz. Set FALSE once gz has proven itself.
-WEATHER_CACHE_KEEP_CSV <- TRUE
+# cancelled job cannot leave a truncated cache in place.
+#
+# KEEP_CSV is now FALSE. The plain CSV is 16.4 MB against 2.1 MB for the gz, and
+# BOTH were being committed on every run, so each run added about 18.5 MB of
+# permanently unprunable git history. The gz has verified cleanly for many runs
+# and the reader still falls back to a CSV if one is present.
+WEATHER_CACHE_KEEP_CSV <- FALSE
 
-# Retain weather beyond the modelling window. Previously the cache was pruned to
-# the 60 day window every run, so weather already paid for was discarded and no
-# past map could be reproduced. Retention costs nothing to acquire and roughly
-# 25 MB gzipped per year at 0.3 deg.
+# Retain weather beyond the modelling window, so a past map can be reproduced and
+# retrospective analysis does not need the whole grid fetched again. Weather
+# already fetched costs nothing to re-acquire.
+#
+# SIZE. Measured on the real cache: 61 days x 4,592 points is 2.1 MB gzipped, so
+# roughly 0.034 MB per day of history at the current point count, and about three
+# times that once the 0.3 deg grid is full. 120 days is therefore about 4 MB per
+# commit, which is liveable weekly. Do NOT raise this much further while the
+# cache is committed to git: 400 days at a full grid would be roughly 40 MB per
+# run, or 2 GB of unprunable history a year. For longer retention, move the cache
+# to a release asset or an orphan branch and raise this then.
 CACHE_KEEP_HISTORY <- TRUE
-CACHE_HISTORY_DAYS <- 400L
+CACHE_HISTORY_DAYS <- 120L
+
+# Cache schema version. BUMP THIS whenever a change alters the VALUES stored in
+# the cache, not just its columns. On a mismatch the cache is discarded and
+# rebuilt, because a partial refresh would otherwise leave the map mixing old and
+# new definitions with no way to tell them apart.
+#
+#  1  original
+#  2  BLASTAM night window moved from UTC to local solar time, daily aggregates
+#     moved to local solar days, and unjudgeable nights now store NA rather than
+#     0. Every infect/semi/wet_hours/temp_wet value written under version 1 is
+#     wrong and cannot be reused.
+CACHE_SCHEMA_VERSION <- 2L
+CACHE_VERSION_FILE   <- "cache_version.txt"
 
 # Ledger of points whose fetch failed, so repeat failures can be deprioritised
 # rather than retried in the same order every run.
@@ -220,6 +249,12 @@ HEAT_MAX <- 2
 # BLASTAM reporting window: count FAVOURABLE infection days over the most recent
 # BLASTAM_WINDOW_DAYS, to show where infection pressure is building now.
 BLASTAM_WINDOW_DAYS <- 21
+# End the window this many days before the data edge. A night needs the FOLLOWING
+# morning's hours, and how much of that morning falls inside a UTC fetch depends
+# on longitude, so without this the westernmost cells lose their final night and
+# the map gains a spurious east-west gradient of about 1/21. One day makes the
+# window longitude-neutral across the continent.
+BLASTAM_END_LAG_DAYS <- 1L
 # Deepest colour at this many favourable days within the window. PROVISIONAL:
 # lower it (e.g. 14) to make building pressure show up more strongly.
 BLASTAM_HEAT_MAX <- 21

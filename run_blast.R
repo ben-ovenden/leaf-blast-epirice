@@ -46,14 +46,19 @@ na_row_for <- function(name, lat, lon, level = "no data") {
   data.table(name = name, lat = lat, lon = lon,
              intensity = NA_real_, peak = NA_real_, trend7 = NA_real_,
              level = level, last_date = NA_character_, days = 0L,
-             blast_events = NA_integer_, blast_recent = NA_integer_)
+             blast_events = NA_integer_, blast_recent = NA_integer_,
+             blast_unjudged = NA_integer_)
 }
 
 # Model one town from its daily rows.
 model_town <- function(name, lat, lon, dd, emergence, end_date) {
   if (is.null(dd) || nrow(dd) < MIN_DAYS) return(na_row_for(name, lat, lon))
 
-  bs <- blastam_score(dd$infect, dd$semi, as.Date(dd$date), end_date,
+  # End the window BLASTAM_END_LAG_DAYS early so it is longitude-neutral: a night
+  # needs the following morning, and how much of it a UTC fetch captures depends
+  # on longitude.
+  lagd <- if (exists("BLASTAM_END_LAG_DAYS")) BLASTAM_END_LAG_DAYS else 0L
+  bs <- blastam_score(dd$infect, dd$semi, as.Date(dd$date), end_date - lagd,
                       window = BLASTAM_WINDOW_DAYS, recent = 7L)
 
   wth <- data.table(YYYYMMDD = as.Date(dd$date),
@@ -66,7 +71,8 @@ model_town <- function(name, lat, lon, dd, emergence, end_date) {
                  error = function(e) NULL)
   if (is.null(lb) || nrow(lb) == 0) {
     r <- na_row_for(name, lat, lon)
-    r[, `:=`(blast_events = bs$events, blast_recent = bs$recent)]
+    r[, `:=`(blast_events = bs$events, blast_recent = bs$recent,
+             blast_unjudged = bs$unjudged)]
     return(r)
   }
   cur  <- lb$intensity[nrow(lb)]
@@ -76,7 +82,8 @@ model_town <- function(name, lat, lon, dd, emergence, end_date) {
              level = classify(cur),
              last_date = as.character(lb$dates[nrow(lb)]),
              days = duration,
-             blast_events = bs$events, blast_recent = bs$recent)
+             blast_events = bs$events, blast_recent = bs$recent,
+             blast_unjudged = bs$unjudged)
 }
 
 # ---- Run all towns ---------------------------------------------------------
@@ -100,14 +107,20 @@ cat("Crop age:   ", CROP_AGE_DAYS, " days (rolling emergence ",
 
 # One batched request covers all towns. Previously this was 31 separate forked
 # requests, which cost 31 round trips for the same weighted quota.
+# lon is passed so BLASTAM applies its night window in LOCAL SOLAR time, and the
+# fetch carries BLASTAM_LEADIN_DAYS of lead-in (one day for the solar shift, five
+# for the preceding 5-day mean) which is then discarded.
+fetch_from <- emergence - BLASTAM_LEADIN_DAYS
 town_daily <- new.env(parent = emptyenv())
 on_town <- function(pid, lon, lat, hw) {
-  w <- tryCatch(blastam_daily_from_hourly(hw), error = function(e) NULL)
+  w <- tryCatch(blastam_daily_from_hourly(hw, lon = lon), error = function(e) NULL)
   if (is.null(w) || nrow(w) == 0) return(NULL)
+  w <- w[date >= emergence]
+  if (nrow(w) == 0) return(NULL)
   assign(pid, as.data.table(w), envir = town_daily)
   data.table(pid = pid)          # non-empty return marks the point as ok
 }
-fr <- fetch_points_batched(sites[, .(pid, lon, lat)], emergence, end_date,
+fr <- fetch_points_batched(sites[, .(pid, lon, lat)], fetch_from, end_date,
                            on_point = on_town, label = "towns")
 
 # Serial fallback for towns the batch did not deliver, on a clean connection.
@@ -117,11 +130,14 @@ if (length(missing) > 0) {
               length(missing), paste(missing, collapse = ", ")))
   for (nm in missing) {
     s <- sites[pid == nm]
-    hw <- tryCatch(get_openmeteo_hourly(s$lat, s$lon, emergence, end_date),
+    hw <- tryCatch(get_openmeteo_hourly(s$lat, s$lon, fetch_from, end_date),
                    error = function(e) NULL)
     if (!is.null(hw) && nrow(hw) > 0) {
-      w <- tryCatch(blastam_daily_from_hourly(hw), error = function(e) NULL)
-      if (!is.null(w) && nrow(w) > 0) assign(nm, as.data.table(w), envir = town_daily)
+      w <- tryCatch(blastam_daily_from_hourly(hw, lon = s$lon), error = function(e) NULL)
+      if (!is.null(w) && nrow(w) > 0) {
+        w <- w[date >= emergence]
+        if (nrow(w) > 0) assign(nm, as.data.table(w), envir = town_daily)
+      }
     }
   }
 }

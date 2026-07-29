@@ -1,5 +1,19 @@
 # Weekly blast risk (EPIRICE + BLASTAM, Open-Meteo)
 
+> **Migration note (cache schema version 2).** The BLASTAM night window used to be
+> applied to UTC timestamps. Over Australia the 15:00-09:00 window then lands at
+> roughly 01:00-19:00 local, missing the evening dew onset and including the
+> middle of the day. On a test series carrying 13 wet hours every local night it
+> returned 8 wet hours and zero favourable days. Hours are now converted to local
+> solar time from longitude before the day and night windows are applied.
+>
+> Every `infect`, `semi`, `wet_hours` and `temp_wet` value written under schema
+> version 1 is therefore wrong and cannot be reused. `run_blast_grid.R` checks
+> `blast_outputs/cache_version.txt` and discards the cache on a mismatch, so the
+> first run after this change rebuilds from scratch: about 7,700 points at 4.8
+> weighted calls each, roughly four days of the free daily quota. Expect four
+> daily runs before the 0.3 deg grid is complete again.
+
 A small, self contained pipeline that runs two complementary blast models each
 week from GitHub Actions, using free Open-Meteo weather, and writes two risk
 maps, a town table and a summary, and emails them out.
@@ -83,26 +97,38 @@ matching GeoTIFF, with a `_latest.png` copy of each for convenience.
 Grid settings live in `blast_config.R`:
 
 - Dynamic resolution with a weather cache. Each run keeps a weather cache
-  (committed to the repo, pruned to the 60 day window). It is written as
-  `weather_cache.csv.gz`, with a plain `weather_cache.csv` copy kept alongside
-  while gzip is being proven (`WEATHER_CACHE_KEEP_CSV`). Reading prefers the gz,
+  (committed to the repo, retaining `CACHE_HISTORY_DAYS` of history). It is written as
+  `weather_cache.csv.gz`. `WEATHER_CACHE_KEEP_CSV` is now FALSE: the plain copy
+  was 16.4 MB against 2.1 MB for the gz and both were committed on every run.
+  The writer checks the gzip magic bytes before accepting the file, because
+  `fwrite()` decides whether to compress from the file extension and a temp file
+  named `.tmp` silently produced an uncompressed cache under a `.gz` name. Reading prefers the gz,
   falls back to the CSV if the gz is missing, malformed or truncated, and writing
   falls back to CSV if the gz cannot be verified.
   Points already in the cache only need their newest days fetched, which is cheap,
   so the spare API budget is spent ADDING new points. The map therefore fills
   coarse to fine over successive runs, reaching about 0.3 degree (~7,700 land
-  points over the continent) in roughly ten weeks, then holds there. Two runs a
-  week (Monday and a silent midweek top-up) each spend up to 4,500 weighted calls,
-  keeping every run inside the free Open-Meteo hourly limit (5,000 weighted calls)
-  and the weekly total inside the daily limit. Each run refreshes only points at
+  points over the continent) in roughly four daily runs from cold, then holds
+  there. Each run spends up to `DAILY_WEIGHTED_CAP` (9,000) weighted calls,
+  inside the free daily limit of 10,000, paced to stay under the 5,000 an hour
+  ceiling. Each run refreshes only points at
   least `REFRESH_MIN_STALE_DAYS` old, so the two runs share the refresh load.
   Changing `GRID_RES_FINEST` discards cached points that no longer sit on the new
   grid, since they could never be refreshed again.
 - `GRID_RES_FINEST`: the finest resolution the map refines toward (default 0.3).
 - `GRID_RES_LEVELS`: the coarse-to-fine fill order (each a whole multiple of
   `GRID_RES_FINEST`).
-- `TARGET_CALLS_PER_RUN`: weighted-call budget per run (default 4,000, under the
-  5,000 per hour cap). Larger fills faster but risks rate limits.
+- `DAILY_WEIGHTED_CAP`: weighted-call budget per run (9,000, under the 10,000 a
+  day free ceiling). `TARGET_CALLS_PER_RUN` is an alias kept for older scripts.
+- `GRID_TARGET_PER_MIN`: sustained weighted calls per minute (80 = 4,800 an hour,
+  under the 5,000 an hour ceiling). Not a fetch rate.
+- `OM_BATCH_SIZE`: locations per request (25).
+- `OPENMETEO_MODEL`: the reanalysis to pin. `"era5"` is 0.25 deg and carries all
+  three hourly variables. `"era5_land"` is 0.1 deg but confirm it serves
+  `relative_humidity_2m` before switching, and restate the map resolution if you
+  do. Leaving this unset lets the API mix products between variables.
+- `CACHE_SCHEMA_VERSION`: bump whenever a change alters the VALUES stored in the
+  cache. On a mismatch the cache is discarded rather than partially refreshed.
 - `GRID_EXTENT`: the mapped area. Default is the Australian continent.
 - `LAND_ONLY`: keeps land points and clips the surface to the coast, using the
   bundled `australia_land.geojson` (read with terra, no `sf`).
@@ -205,24 +231,37 @@ Resolution is limited by how many cells one run can refresh, because a cell fetc
 in an earlier run no longer reaches the current archive edge. Extra runs during the
 week do not help a `"latest"` map.
 
-Each archive fetch takes roughly 14 seconds, so throughput is about `GRID_CONC`/14
-per second. `GRID_CONC` is therefore the lever, not the API limits: at 4 the rate is
-only about 17/min, at 16 about 70/min, which refreshes the whole 0.3 deg grid
-(~7,700 land cells, ~33 km) in around 110 minutes.
+Fetching is batched: `OM_BATCH_SIZE` locations go into one request. The weighted
+cost is unchanged, because weight scales with the number of locations, but round
+trips fall by a factor of about 25, and round trips are what actually governed
+wall clock before.
 
-`GRID_TARGET_PER_MIN` must respect the 5,000/hour limit as well as 600/min. It is
-set to 70, which is 4,200/hour. Raising `GRID_CONC` without checking this would
-breach the hourly limit.
+The binding limit is the free tier quota, not the network. Weight per location is
+`max(1, nvars/10) * max(1, ndays/14)`, so a 67 day fetch of three hourly
+variables costs about 4.8 weighted calls and a 20 day refresh about 1.4. Against
+10,000 weighted calls a day that is roughly 1,900 new points, or a full refresh
+of about 7,000 existing ones.
 
-Each fetch phase logs its actual rate and failure percentage, for example
-`refresh done: 6980/7000 ok (0.3% failed) in 99.2 min = 71 fetches/min at GRID_CONC 16`.
-Use that to tune: if failures stay low, `GRID_CONC` can be raised; if they climb,
-lower it. Failed cells are retried once in parallel before the map is drawn.
+Resolution follows directly. Under `GRID_WINDOW_MODE = "latest"` every mapped
+cell must reach the same end date, so the whole grid has to be refreshed inside
+one day's quota. That caps the grid near 7,000 points, which over the Australian
+land mass is about 0.31 deg, so 0.3 deg is close to the practical ceiling for
+this mode. To go finer, switch to `"coverage"` and let the refresh spread across
+the week. Every cell is still truncated to one common end date, so the map is not
+a mosaic, but that date sits up to a week further back. The weekly ceiling is then
+around 50,000 points, or about 0.12 deg, and ERA5-Land's native 0.1 deg is the
+floor below which nothing is gained.
 
-The cache is built up over successive runs, since adding a new cell costs about 6.4
-weighted calls against a 10,000/day limit while refreshing an existing one costs
-about 1. Expect the grid to take a couple of months of weekly runs to fill, with the
-map growing steadily.
+`GRID_TARGET_PER_MIN` is in WEIGHTED CALLS per minute, not fetches. It is set to
+80, which is 4,800 an hour against the 5,000 an hour ceiling. Do not read it as a
+fetch rate: at about 4.8 weighted per point, 80 weighted a minute is roughly 17
+points a minute.
+
+Each phase logs its status tally, for example
+`add status: ok=1751 empty=0 quota=0 http=0 transport=35`. A non-zero `quota`
+means the daily or hourly limit was hit and the run stopped fetching; `http` and
+`transport` failures are retried once, within a reserved slice of both the wall
+clock and the weighted budget.
 
 ## EPIRICE leaf blast parameters
 
