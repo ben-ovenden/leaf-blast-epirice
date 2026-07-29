@@ -108,7 +108,39 @@ build_targets <- function() {
   }
   lv[is.na(lv)] <- length(GRID_RES_LEVELS) + 1L
   g[, lvl := lv]
-  setorder(g, lvl, lat, lon)
+
+  # PROGRESSIVE WITHIN-LEVEL ORDERING.
+  # setorder(g, lvl, lat, lon) filled each level from the south, so a level that
+  # ran out of budget partway left a horizontal band unsampled. On the
+  # 2026-07-29 run that band was everything north of -17.6 deg: Cape York, the
+  # Top End and the Kimberley held only the 1.2 deg lattice while the south had
+  # 0.6, giving the tropics 14% coverage against 23% for the continent. That is
+  # the worst possible bias here, since the tropics are where blast risk is.
+  #
+  # Ordering by a bit-reversed Morton (Z-order) index instead makes ANY prefix a
+  # spatially uniform sample of the level: the map thins evenly and sharpens
+  # evenly rather than growing as a front moving north.
+  g[, `:=`(ci = as.integer(round((lon - ext[1]) / fin)),
+           ri = as.integer(round((lat - ext[3]) / fin)))]
+  nbits <- max(1L, as.integer(ceiling(log2(max(g$ci, g$ri) + 1))))
+  bitrev <- function(x, bits) {
+    r <- integer(length(x)); x <- as.integer(x)
+    for (b in seq_len(bits)) {
+      r <- bitwOr(bitwShiftL(r, 1L), bitwAnd(x, 1L)); x <- bitwShiftR(x, 1L)
+    }
+    r
+  }
+  morton <- function(i, j, bits) {
+    k <- numeric(length(i))
+    for (b in 0:(bits - 1L))
+      k <- k + bitwAnd(bitwShiftR(i, b), 1L) * 2^(2 * b + 1) +
+               bitwAnd(bitwShiftR(j, b), 1L) * 2^(2 * b)
+    k
+  }
+  g[, ord := morton(bitrev(ci, nbits), bitrev(ri, nbits), nbits)]
+  setorder(g, lvl, ord)
+  g[, c("ci", "ri", "ord") := NULL]
+
   g[, pid := key_of(lon, lat)]
   g[]
 }
@@ -263,25 +295,44 @@ wt_cap     <- DAILY_WEIGHTED_CAP
 stale_days <- REFRESH_MIN_STALE_DAYS
 
 eligible <- last_by[last < end_date & last <= (end_date - stale_days)][order(last)]
-n_refresh <- min(nrow(eligible), max_fetch)
-maintain  <- targets[pid %in% eligible$pid[seq_len(n_refresh)]]
-maintain_cost <- nrow(maintain) * cost_ref
 
-to_add <- targets[!pid %in% cached_pids & !pid %in% benched]
 # Hold back a slice of the weighted budget so the retry pass has something to
 # spend. Planning adds up to the full cap leaves the retry with a budget of zero.
 retry_wfrac <- if (exists("GRID_RETRY_WEIGHT_FRAC")) GRID_RETRY_WEIGHT_FRAC else 0.05
 plan_cap <- wt_cap * (1 - retry_wfrac)
-n_add <- min(nrow(to_add),
-             max_fetch - nrow(maintain),
-             floor(max(0, plan_cap - maintain_cost) / cost_new))
+
+# A short tail can only close a gap it actually spans. A point whose last row
+# predates ref_keep_from - 1 would be left with a hole between that row and the
+# tail, so it is refetched over the FULL window instead of topped up. Without
+# this split the short tail silently produces discontinuous series.
+tail_ok   <- eligible[last >= (ref_keep_from - 1L)]
+tail_late <- eligible[last <  (ref_keep_from - 1L)]
+
+n_refresh <- min(nrow(tail_ok), max_fetch)
+maintain  <- targets[pid %in% tail_ok$pid[seq_len(n_refresh)]]
+maintain_cost <- nrow(maintain) * cost_ref
+
+n_restale <- max(0L, min(nrow(tail_late),
+                         max_fetch - nrow(maintain),
+                         floor(max(0, plan_cap - maintain_cost) / cost_new)))
+restale <- if (n_restale > 0) targets[pid %in% tail_late$pid[seq_len(n_restale)]] else targets[0]
+restale_cost <- nrow(restale) * cost_new
+
+to_add <- targets[!pid %in% cached_pids & !pid %in% benched]
+n_add <- max(0L, min(nrow(to_add),
+                     max_fetch - nrow(maintain) - nrow(restale),
+                     floor(max(0, plan_cap - maintain_cost - restale_cost) / cost_new)))
 add <- if (n_add > 0) to_add[seq_len(n_add)] else to_add[0]
 
 skipped_fresh <- length(cached_pids) - nrow(eligible)
-cat(sprintf("Cache: %d points (%d fresh, skipped). Refresh %d @ %.2f, add %d new @ %.2f (%d/%d fetches, ~%.0f of %.0f weighted)\n",
+cat(sprintf("Cache: %d points (%d fresh, skipped). Refresh %d @ %.2f, refetch %d stale @ %.2f, add %d new @ %.2f (%d/%d fetches, ~%.0f of %.0f weighted)\n",
             length(cached_pids), skipped_fresh, nrow(maintain), cost_ref,
-            nrow(add), cost_new, nrow(maintain) + nrow(add), max_fetch,
-            maintain_cost + nrow(add) * cost_new, wt_cap))
+            nrow(restale), cost_new, nrow(add), cost_new,
+            nrow(maintain) + nrow(restale) + nrow(add), max_fetch,
+            maintain_cost + restale_cost + nrow(add) * cost_new, wt_cap))
+if (nrow(tail_late) > nrow(restale))
+  cat(sprintf("  %d point(s) fell behind the %d day tail and are queued for a full refetch on a later run.\n",
+              nrow(tail_late) - nrow(restale), REFRESH_TAIL_DAYS))
 
 # ---- Deadlines -------------------------------------------------------------
 # Measured from RUN_T0 so cache loading and grid building count against the
@@ -336,6 +387,7 @@ run_phase <- function(tab, fetch_from, keep_from, deadline, label) {
 # Refresh first: keeping existing cells current matters more than growing, since
 # under "latest" window mode a stale cell drops off the map entirely.
 run_phase(maintain, ref_fetch_from, ref_keep_from, refresh_deadline, "refresh")
+run_phase(restale,  add_fetch_from, add_keep_from, refresh_deadline, "refetch")
 run_phase(add,      add_fetch_from, add_keep_from, add_deadline,     "add")
 
 # ---- Retry -----------------------------------------------------------------
@@ -358,8 +410,8 @@ if (length(retryable) > 0 && !quota_hit && ok_frac < retry_min_ok) {
               100 * ok_frac, attempted))
 } else if (length(retryable) > 0 && !quota_hit) {
   rt_ref <- maintain[pid %in% retryable]
-  rt_add <- add[pid %in% retryable]
-  cat(sprintf("Retrying %d refresh and %d add point(s) that failed with a transport or HTTP error.\n",
+  rt_add <- rbind(restale[pid %in% retryable], add[pid %in% retryable])
+  cat(sprintf("Retrying %d refresh and %d add/refetch point(s) that failed with a transport or HTTP error.\n",
               nrow(rt_ref), nrow(rt_add)))
   run_phase(rt_ref, ref_fetch_from, ref_keep_from, fetch_deadline, "refresh-retry")
   run_phase(rt_add, add_fetch_from, add_keep_from, fetch_deadline, "add-retry")
@@ -448,6 +500,20 @@ model_cache <- cache[pid %in% current_pids &
 cat(sprintf("Window [%s] ends %s: %d of %d cells reach it, %d absent (%d days behind the archive edge).\n",
             wmode, format(model_end), length(current_pids), n_cache_pts, held_out,
             as.integer(end_date - model_end)))
+
+# SEIR indexes the weather vector by POSITION, so a missing day would shift every
+# later day by one and be modelled silently. Drop any point whose window is not a
+# continuous run of dates.
+shape <- model_cache[, .(n = .N, span = as.integer(max(date) - min(date)) + 1L), by = pid]
+gappy <- shape[n != span, pid]
+if (length(gappy) > 0) {
+  cat(sprintf("Dropping %d point(s) with gaps in the modelling window; they will be refetched.\n",
+              length(gappy)))
+  model_cache <- model_cache[!pid %in% gappy]
+}
+short <- shape[n == span & n < (CROP_AGE_DAYS + 1L), .N]
+if (short > 0)
+  cat(sprintf("%d point(s) have a short but continuous window; EPIRICE will report NA for them.\n", short))
 
 pm <- model_cache[, { m <- model_pt(.SD); .(lon = lon[1], lat = lat[1],
               intensity = m$intensity, events = m$events) }, by = pid]

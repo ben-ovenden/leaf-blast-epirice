@@ -136,12 +136,23 @@ TARGET_CALLS_PER_RUN     <- DAILY_WEIGHTED_CAP
 # points per minute.
 GRID_TARGET_PER_MIN <- 80           # 4,800/hour, under the 5,000/hour cap
 
-# Refresh always requests a fixed tail rather than only the missing days. The API
-# charges a MINIMUM of 14 days, so a 1 day top up and a 14 day one cost exactly
-# the same. Taking the full 14 costs nothing, self heals gaps, and picks up the
-# ERA5T revisions applied to the most recent days. It also gives every refresh
-# point a single shared start date, so they all batch into one request shape.
-REFRESH_TAIL_DAYS <- 14L
+# Refresh requests a fixed tail rather than only the missing days, because the API
+# charges a MINIMUM of 14 days: a 1 day top up and a 14 day one cost the same.
+#
+# ** SIZE THIS SO tail + BLASTAM_LEADIN_DAYS COMES TO 14 DAYS, NOT MORE. **
+# The fetch actually issued is (REFRESH_TAIL_DAYS + BLASTAM_LEADIN_DAYS) days,
+# because BLASTAM needs lead-in for its preceding 5-day mean. At 14 + 6 = 20 days
+# the weight is 20/14 = 1.43 rather than 1.00, and that 43% surcharge on every
+# refresh is enough to stop the grid ever completing: with a 9,000 weighted cap
+# the growth equation has a fixed point at cap/cost_ref, which is 5,985 points
+# (0.34 deg) at 1.43 but 8,550 (past the 7,721 target) at 1.00. Measured on the
+# 2026-07-29 run, not theorised.
+#
+# 8 + 6 = 14 exactly. The tail then spans 8 days, which covers the 7 day gap of a
+# weekly schedule with one day spare. Points that fall further behind (a missed
+# run) are detected and refetched over the full window instead, so the short tail
+# cannot leave a hole.
+REFRESH_TAIL_DAYS <- 8L
 
 # Wall clock budgets (unit: MINUTES).
 GRID_MAX_MINUTES     <- 200L   # total fetch budget, measured from run start
