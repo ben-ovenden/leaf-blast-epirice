@@ -73,6 +73,11 @@ jobs:
           if (length(need)) install.packages(need)
         shell: Rscript {0}
 
+      # Offline regression tests: no network, no quota, a few seconds. Fails the
+      # run before three hours of fetching are spent on broken code.
+      - name: Offline tests
+        run: Rscript tests/test_offline.R
+
       - name: Continental heatmaps
         run: Rscript run_blast_grid.R
 
@@ -94,7 +99,7 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config --local user.email "github-actions@github.com"
           git config --local user.name "github-actions"
-          for f in weather_cache.csv.gz weather_cache.csv fetch_failures.csv; do
+          for f in weather_cache.csv.gz weather_cache.csv fetch_failures.csv cache_version.txt; do
             [ -f "blast_outputs/$f" ] && git add -f "blast_outputs/$f" || true
           done
           for f in town_trends.csv blastam_trends.csv map_stats.txt midweek_status.txt; do
