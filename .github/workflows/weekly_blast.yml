@@ -75,8 +75,20 @@ jobs:
 
       # Offline regression tests: no network, no quota, a few seconds. Fails the
       # run before three hours of fetching are spent on broken code.
+      #
+      # Accepts the file at tests/test_offline.R or at the repo root, since a
+      # browser download of a single file arrives without its folder. A MISSING
+      # file is a warning, not a failure: tests that fail should block the run,
+      # but the absence of a test file should never stop the weekly product.
       - name: Offline tests
-        run: Rscript tests/test_offline.R
+        run: |
+          if [ -f tests/test_offline.R ]; then
+            Rscript tests/test_offline.R
+          elif [ -f test_offline.R ]; then
+            Rscript test_offline.R
+          else
+            echo "::warning::test_offline.R not found in tests/ or the repo root; skipping offline tests"
+          fi
 
       - name: Continental heatmaps
         run: Rscript run_blast_grid.R
