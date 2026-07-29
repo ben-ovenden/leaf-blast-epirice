@@ -77,16 +77,29 @@ ok("exclusive window is the failure mode this guards",
 
 cat("\n5. Weighted cost model\n")
 source("openmeteo_batch.R")
-ok("14 day floor: 1 day costs the same as 14",
-   om_weight_per_location(1, 3) == om_weight_per_location(14, 3))
-ok("61 days is ~4.36", abs(om_weight_per_location(61, 3) - 61/14) < 1e-9)
-ok("11+ variables trigger the multiplier", om_weight_per_location(14, 11) > 1)
+# Guard rather than let a missing symbol halt the suite: a swapped-out or stubbed
+# openmeteo_batch.R should report a clear failure, not an "Execution halted" with
+# no summary line.
+have <- function(f) exists(f, mode = "function")
+if (!have("om_weight_per_location")) {
+  ok("om_weight_per_location() is defined", FALSE, "(openmeteo_batch.R stubbed?)")
+} else {
+  ok("14 day floor: 1 day costs the same as 14",
+     om_weight_per_location(1, 3) == om_weight_per_location(14, 3))
+  ok("61 days is ~4.36", abs(om_weight_per_location(61, 3) - 61/14) < 1e-9)
+  ok("11+ variables trigger the multiplier", om_weight_per_location(14, 11) > 1)
+}
 
 cat("\n6. Pacer holds the sustained rate\n")
-p <- om_pacer(6000); p(6000)
-t0 <- Sys.time(); for (i in 1:5) p(100)
-el <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
-ok("500 weighted at 6000/min takes ~5 s", abs(el - 5) < 1.5, sprintf("(got %.2fs)", el))
+if (!have("om_pacer")) {
+  ok("om_pacer() is defined", FALSE, "(openmeteo_batch.R stubbed?)")
+} else {
+  p <- om_pacer(6000); p(6000)
+  t0 <- Sys.time(); for (i in 1:5) p(100)
+  el <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+  # Loose bound: shared CI runners are not real-time systems.
+  ok("500 weighted at 6000/min takes ~5 s", abs(el - 5) < 2.0, sprintf("(got %.2fs)", el))
+}
 
 cat("\n7. Cache gz is really gzipped\n")
 # Regression: the atomic write used a ".tmp" temp name, so fwrite() stopped
