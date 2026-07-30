@@ -24,6 +24,15 @@
 #     & van den Bosch 2007). It is an internal helper and affects only the AUDPC
 #     output column, not the disease dynamics.
 #
+#     Temperature response evidence behind the default optimum:
+#       Kato, H. and Kozaka, T. (1974) Effect of temperature on lesion
+#         enlargement and sporulation of Pyricularia oryzae in rice leaves.
+#         Phytopathology 64: 828-830. doi:10.1094/Phyto-64-828.
+#       Hashioka, Y. (1965) Effects of environmental factors on development of
+#         causal fungus, infection, disease development, and epidemiology in
+#         rice blast disease. In: The Rice Blast Disease. J Hopkins Press,
+#         pp. 153-161.
+#
 #  2. The RcT infection-optimum temperature is SELECTABLE, via EPIRICE_RCT_PEAK
 #     in blast_config.R, and defaults to the published 25 C rather than epicrop's
 #     20 C. See section 4b of blast_config.R for the reasoning and for the

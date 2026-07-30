@@ -100,7 +100,11 @@
 #   Koshimizu, Y. (1988) Bull. Tohoku Natl. Agric. Exp. Stn. 78: 67-121 [Jpn]
 #   Hayashi, T. and Koshimizu, Y. (1988) ibid. 78: 123-138 [Jpn]
 #   Barksdale, T.H. and Jones, M.W. (1965) Phytopathology 55: 1037-1040.
-#   Kato, H. (1974) Rev. Plant Prot. Res. 7: 1-20.
+#   Kato, H. (1974) Epidemiology of rice blast disease. Rev. Plant Prot. Res.
+#     7: 1-20.
+#   Kato, H. and Kozaka, T. (1974) Effect of temperature on lesion enlargement
+#     and sporulation of Pyricularia oryzae in rice leaves. Phytopathology 64:
+#     828-830. doi:10.1094/Phyto-64-828.
 #   Maehara, H. and Yamada, M. (2025) Ann. Rep. Soc. Pl. Prot. North Japan 76: 41-46.
 ################################################################################
 

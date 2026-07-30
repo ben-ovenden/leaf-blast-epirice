@@ -245,8 +245,9 @@ BLASTAM_END_LAG_DAYS <- 0L
 #
 # Below about 22 C the 20 C curve gives the higher answer, so this is NOT a
 # uniform scaling and the two are not interchangeable. Note also that sporulation
-# peaks cooler than infection (Kato and Kozaka 1974: 399 spores per lesion per
-# day at 20 C, 271 at 25 C, 131 at 32 C) and EPIRICE uses one RcT for both, so
+# peaks cooler than infection (Kato and Kozaka 1974, Phytopathology 64: 828-830:
+# 399 spores per lesion per day at 20 C, 271 at 25 C, 131 at 32 C) and EPIRICE
+# uses one RcT for both, so
 # either choice is a compromise. 25 favours the infection step, which is the
 # mechanistic basis for the SEIR transition and the reason for the default.
 EPIRICE_RCT_PEAK <- 25L
@@ -480,6 +481,11 @@ CITATION <- paste(
   "  adapted from cropsim (Hijmans et al. 2009). Framework: Zadoks (1971).",
   sprintf("  RcT infection optimum set to %d C (see blast_config.R section 4b).",
           EPIRICE_RCT_PEAK),
+  "  Temperature response evidence: Kato, H. and Kozaka, T. (1974). Effect of",
+  "  temperature on lesion enlargement and sporulation of Pyricularia oryzae in",
+  "  rice leaves. Phytopathology 64: 828-830. doi:10.1094/Phyto-64-828.",
+  "  Kato, H. (1974). Epidemiology of rice blast disease. Review of Plant",
+  "  Protection Research 7: 1-20.",
   "BLASTAM (infection days): infection-warning model of Koshimizu, Y. (1988),",
   "  A forecasting method for occurrence of rice leaf blast with AMeDAS data,",
   "  Bull. Tohoku Natl. Agric. Exp. Stn. 78: 67-121; Hayashi & Koshimizu (1988)",

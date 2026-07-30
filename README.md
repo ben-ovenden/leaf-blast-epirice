@@ -5,7 +5,7 @@
 > is now cut at 10:00 local solar rather than local midnight, so every `TEMP`,
 > `RHUM` and `RAIN` value changes; the preceding 5 day mean is lagged so it
 > genuinely precedes, so `infect` and `semi` change; and night completeness now
-> requires a minimum number of observed hours. Expect about eight to eleven runs
+> requires a minimum number of observed hours. Expect about twelve runs
 > before the 0.3 degree grid is full again, so on the weekly schedule the map
 > will be coarse for a couple of months unless a midweek top up job is added.
 
@@ -72,7 +72,7 @@ requires in canopy loggers deployed alongside ERA5 driven model runs.
 | `run_blast.R` | Town table runner: fetch, model, write CSV, HTML and text summary |
 | `run_blast_grid.R` | Continental heatmap runner: fill the cache, model, render maps |
 | `send_email.py` | Python stdlib email sender |
-| `test_offline.R` | Offline regression tests: 52 tests, no network, runs in seconds, in CI |
+| `test_offline.R` | Offline regression tests: 54 tests, no network, runs in seconds, in CI |
 | `australia_land.geojson` | Land polygon for masking ocean and clipping the map |
 | `australia_rivers.geojson` | River overlay |
 | `australia_roads.geojson` | Road overlay |
@@ -122,7 +122,7 @@ Set `BLAST_RUN_DATE=YYYY-MM-DD` to pin the run date; otherwise today is used.
 Required packages: `data.table`, `jsonlite`, `curl`, `terra`. The workflow uses
 the `rocker/geospatial` container.
 
-All 52 offline tests must pass before a run is meaningful. Each test guards a bug
+All 54 offline tests must pass before a run is meaningful. Each test guards a bug
 that was actually shipped.
 
 ---
@@ -186,6 +186,15 @@ said so.
 The date in the filename is the run date; the title and footer carry the data
 date. The heatmap colours every land cell as if rice were grown there.
 
+### Internal state (committed, not emailed)
+
+`weather_cache.csv.gz` (the cache), `cache_version.txt` (its schema version),
+`fetch_failures.csv` (the failure ledger), `weighted_spend.csv` (the shared quota
+ledger), `map_stats.txt` (the grid summary the email reads back) and
+`run_date.txt` (the pinned run date). All are committed so the next run picks up
+where this one stopped. Dated copies of the town CSV and text summary are written
+alongside the `_latest` ones and are not committed.
+
 **Colour scale.** `HEAT_MAX` (2%) and `BLASTAM_HEAT_MAX` (21 days) are fixed
 ceilings so colours are comparable week to week. `HEAT_STRETCH` (0.4) and
 `BLASTAM_STRETCH` (0.6) expand the low end: the anchor is unchanged, the legend
@@ -193,9 +202,12 @@ is labelled with true values, only the spacing of the colours changes.
 
 These stretches are now applied. They were previously documented here as working
 controls while no script read them, which is why the delivered maps rendered as
-one flat pale blue: EPIRICE peaked near 0.03% against a 2% ceiling, using about
-1.5% of the ramp. The observed maximum is now printed in the map footer and in
-the email, so a genuinely flat map is distinguishable from a broken scale.
+one flat pale blue. The highest town value in the 2026-07-30 email was Lismore
+at 0.022% against a 2% ceiling, so roughly the first 1% of the ramp carried the
+whole signal. The map's own maximum was not reported anywhere at the time, which
+is exactly the gap the footer now fills: the observed maximum is printed on the
+map and in the email, so a genuinely flat map is distinguishable from a broken
+scale.
 
 **Coastal cells.** ERA5 cells on the coastal fringe are partly marine, so their
 humidity is not representative of any paddock, yet they carried most of the
@@ -264,7 +276,7 @@ fetches the latest days.
 
 ### Grid fill and resolution
 
-The 7,721 land cell target at 0.3 degrees takes about eleven runs from cold,
+The 7,721 land cell target at 0.3 degrees takes about twelve runs from cold,
 because each run must refresh everything already cached before it can add
 anything. Working the recursion through, adds per run are
 `(plan_cap − n_cached) / 4.86`:
@@ -275,9 +287,10 @@ anything. Working the recursion through, adds per run are
 | 2 | ~3,160 | 0.6 deg complete |
 | 4 | ~5,150 | 0.3 deg partial |
 | 8 | ~7,200 | |
-| 11 | 7,721 | 0.3 deg complete |
+| 11 | ~7,710 | |
+| 12 | 7,721 | 0.3 deg complete |
 
-On the weekly schedule that is about eleven weeks. Earlier versions of this table
+On the weekly schedule that is about three months. Earlier versions of this table
 claimed four to nine "daily runs", which was wrong twice over: the arithmetic was
 optimistic and the only scheduled workflow is weekly. `run_blast_grid.R` has a
 `BLAST_MIDWEEK` branch and `run_blast.R` reports on `midweek_status.txt`, but a
@@ -583,7 +596,7 @@ by default, so the delivered maps still include them.
 The Monday workflow runs:
 
 1. **Resolve run date**, pinned once and exported as `BLAST_RUN_DATE`.
-2. **Offline tests**, `Rscript test_offline.R`. 52 tests, no network. terra is
+2. **Offline tests**, `Rscript test_offline.R`. 54 tests, no network. terra is
    attached inside the suite on purpose, because `terra::shift` masks
    `data.table::shift` and that masking once turned every grid point into a
    silent "empty" and produced a blank map with no error in the log.
@@ -629,6 +642,11 @@ fungus, infection, disease development, and epidemiology in rice blast disease.
 In: *The Rice Blast Disease*. J Hopkins Press, pp. 153 to 161. [empirical basis
 for the 24 to 25 C infection rate optimum]
 
+Kato, H. and Kozaka, T. (1974). Effect of temperature on lesion enlargement and
+sporulation of *Pyricularia oryzae* in rice leaves. *Phytopathology* 64: 828 to
+830. doi:10.1094/Phyto-64-828 [source of the sporulation figures in the RcT
+discussion above]
+
 **BLASTAM:** Koshimizu, Y. (1988). *Bulletin of the Tohoku National Agricultural
 Experiment Station* 78: 67 to 121 [in Japanese]. Hayashi, T. and Koshimizu, Y.
 (1988). ibid. 78: 123 to 138 [in Japanese].
@@ -637,8 +655,8 @@ Barksdale, T.H. and Jones, M.W. (1965). Minimum conditions of temperature and de
 period for infection of rice by *Piricularia oryzae*. *Phytopathology* 55: 1037
 to 1040.
 
-Kato, H. (1974). Epidemiology of blast. *Review of Plant Protection Research* 7:
-1 to 20.
+Kato, H. (1974). Epidemiology of rice blast disease. *Review of Plant Protection
+Research* 7: 1 to 20.
 
 Maehara, H. and Yamada, M. (2025). Annual changes in the timing and frequency of
 favorable conditions for rice leaf blast infection estimated by BLASTAM in
