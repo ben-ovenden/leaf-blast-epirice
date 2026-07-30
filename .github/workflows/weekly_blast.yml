@@ -8,13 +8,16 @@ on:
     - cron: '30 20 * * 0'   # 06:30 Monday AEST (winter, UTC+10)
     - cron: '30 19 * * 0'   # 06:30 Monday AEDT (summer, UTC+11)
   workflow_dispatch:
+    inputs:
+      run_date:
+        description: 'Override the run date (YYYY-MM-DD). Leave blank for today in Sydney.'
+        required: false
+        default: ''
 
 permissions:
   contents: write
 
-# Two runs must never write the weather cache at once. Without this a manual
-# dispatch overlapping the cron gives two runs pushing the same file and one of
-# them loses its fetches.
+# Two runs must never write the weather cache at once.
 concurrency:
   group: blast-grid
   cancel-in-progress: false
@@ -33,8 +36,8 @@ jobs:
           fi
           # Match the schedule that fired against the current UTC offset rather
           # than against the local hour. GitHub cron routinely fires 5 to 30
-          # minutes late, and the old hour check ("is it 06?") silently skipped
-          # the entire week whenever a run started at 07:0x local.
+          # minutes late, and an hour check ("is it 06?") silently skipped the
+          # entire week whenever a run started at 07:0x local.
           OFF=$(TZ=Australia/Sydney date +%z)     # +1000 (AEST) or +1100 (AEDT)
           SCHED='${{ github.event.schedule }}'
           echo "Offset $OFF, schedule '$SCHED'"
@@ -52,42 +55,57 @@ jobs:
     runs-on: ubuntu-latest
     # Must exceed GRID_MAX_MINUTES (200) plus GRID_RESERVE_MINUTES (25), so the
     # script's own graceful stop fires first and the run still saves and commits.
-    # A hard job timeout here would lose the whole run.
     timeout-minutes: 240
     env:
       MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
-    # rocker/geospatial ships R with terra, sf and a matching GDAL already built,
-    # so nothing spatial has to compile on the runner.
+    # rocker/geospatial ships R with terra, sf and a matching GDAL already built.
     container:
       image: rocker/geospatial:latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ONE RUN DATE FOR THE WHOLE JOB.
+      #
+      # This is the fix for the 2026-07-30 email, which carried maps titled
+      # "weather to 2026-07-23" beside body text saying "weather to 24 Jul 2026".
+      # The grid script took its window from Sys.Date() before a two hour fetch
+      # and its run_tag from a second Sys.Date() after it, then the town script
+      # started on the far side of local midnight and took a third. Pinning the
+      # date here and exporting it makes all three impossible.
+      - name: Resolve run date
+        run: |
+          RD="${{ github.event.inputs.run_date }}"
+          [ -z "$RD" ] && RD=$(TZ=Australia/Sydney date +%F)
+          echo "BLAST_RUN_DATE=$RD" >> "$GITHUB_ENV"
+          echo "RUN_DATE=$RD" >> "$GITHUB_ENV"
+          echo "Run date pinned to $RD (Australia/Sydney)"
+
       - name: Install extra R packages
         run: |
-          # curl is now required: openmeteo_batch.R needs real HTTP status codes,
+          # curl is required: openmeteo_batch.R needs real HTTP status codes,
           # which jsonlite::fromJSON(url) cannot expose.
-          pkgs <- c("data.table", "jsonlite", "curl")
+          pkgs <- c("data.table", "jsonlite", "curl", "terra")
           need <- pkgs[!pkgs %in% rownames(installed.packages())]
           if (length(need)) install.packages(need)
         shell: Rscript {0}
 
       # Offline regression tests: no network, no quota, a few seconds. Fails the
-      # run before three hours of fetching are spent on broken code.
+      # run before three hours of fetching are spent on broken code. terra is
+      # attached inside the suite on purpose: terra::shift masks
+      # data.table::shift, and that masking once turned every grid point into a
+      # silent "empty" and produced a blank map with no error in the log.
       #
-      # Accepts the file at tests/test_offline.R or at the repo root, since a
-      # browser download of a single file arrives without its folder. A MISSING
-      # file is a warning, not a failure: tests that fail should block the run,
-      # but the absence of a test file should never stop the weekly product.
+      # A MISSING file is a warning, not a failure: tests that fail should block
+      # the run, but the absence of a test file should never stop the product.
       - name: Offline tests
         run: |
-          if [ -f tests/test_offline.R ]; then
-            Rscript tests/test_offline.R
-          elif [ -f test_offline.R ]; then
+          if [ -f test_offline.R ]; then
             Rscript test_offline.R
+          elif [ -f tests/test_offline.R ]; then
+            Rscript tests/test_offline.R
           else
-            echo "::warning::test_offline.R not found in tests/ or the repo root; skipping offline tests"
+            echo "::warning::test_offline.R not found; skipping offline tests"
           fi
 
       - name: Continental heatmaps
@@ -95,13 +113,6 @@ jobs:
 
       - name: Site table and summary
         run: Rscript run_blast.R
-
-      - name: Set run date
-        run: |
-          RD=$(cat blast_outputs/run_date.txt 2>/dev/null || true)
-          [ -z "$RD" ] && RD=$(TZ=Australia/Sydney date +%F)
-          echo "RUN_DATE=$RD" >> "$GITHUB_ENV"
-          echo "Using RUN_DATE=$RD"
 
       # Commit the cache FIRST, and never let a missing optional file abort the
       # step. `run:` uses bash -e, so a `git add` on a path that does not exist
@@ -111,24 +122,25 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config --local user.email "github-actions@github.com"
           git config --local user.name "github-actions"
-          for f in weather_cache.csv.gz weather_cache.csv fetch_failures.csv cache_version.txt; do
+          for f in weather_cache.csv.gz weather_cache.csv fetch_failures.csv \
+                   cache_version.txt weighted_spend.csv; do
             [ -f "blast_outputs/$f" ] && git add -f "blast_outputs/$f" || true
           done
-          for f in town_trends.csv blastam_trends.csv map_stats.txt midweek_status.txt; do
+          for f in town_trends.csv blastam_trends.csv run_log.csv map_stats.txt \
+                   midweek_status.txt run_date.txt; do
             [ -f "blast_outputs/$f" ] && git add -f "blast_outputs/$f" || true
           done
           git add -u blast_outputs/ 2>/dev/null || true
           if git diff --staged --quiet; then
             echo "Nothing to commit."
           else
-            git commit -m "Weekly run (cache + trends) $(date +%F)"
+            git commit -m "Weekly run (cache + trends) ${BLAST_RUN_DATE}"
             git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
             for i in 1 2 3; do git push && break || sleep $((i*10)); done
           fi
 
       # Email via a Python stdlib script rather than a JavaScript action: the
-      # send-mail action broke when GitHub forced actions onto Node 24. The
-      # script fails loudly if a secret or attachment is missing.
+      # send-mail action broke when GitHub forced actions onto Node 24.
       - name: Email summary and heatmaps
         if: env.MAIL_USERNAME != ''
         env:
@@ -139,8 +151,7 @@ jobs:
           command -v python3 >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq python3; }
           python3 send_email.py
 
-      # Fallback copy of everything kept for 90 days, in case an email fails to
-      # deliver. Runs even if an earlier step failed.
+      # Fallback copy of everything kept for 90 days, in case an email fails.
       - name: Upload artifact
         if: always()
         uses: actions/upload-artifact@v4
