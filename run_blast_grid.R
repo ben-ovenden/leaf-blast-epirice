@@ -9,33 +9,36 @@
 #
 # Both derive from ONE hourly Open-Meteo fetch per point: hourly data gives
 # BLASTAM its leaf wetness hours and is aggregated to daily values for EPIRICE.
-# The cache holds daily rows; each run refreshes existing points and adds new
-# ones, so the map sharpens over successive runs.
 #
-# CHANGES FROM THE CONCURRENT VERSION
-#   * Fetching is batched (openmeteo_batch.R): many locations per request, real
-#     HTTP status codes, token bucket pacing on weighted calls. The adaptive
-#     concurrency controller is gone; its pacer made throughput algebraically
-#     independent of concurrency, so it hill climbed on noise while the failure
-#     rate rose.
-#   * cost_new now uses the API's actual weight formula. The old
-#     (CROP_AGE_DAYS / 7) * 0.75 overestimated by about 47%, so runs stopped
-#     roughly 1.5x short of the budget they were allowed to spend.
-#   * Refreshes request a fixed REFRESH_TAIL_DAYS tail rather than only the
-#     missing days. Same weighted cost because of the API's 14 day floor, and it
-#     self heals gaps and absorbs ERA5T revisions.
-#   * The retry pass has its own reserved wall clock. Previously the add phase
-#     ran to the full deadline, so the retry was unreachable by construction.
-#   * Effective spacing is computed over LAND, not the bounding box, and the
-#     completed lattice level is reported alongside it.
-#   * The IDW search radius follows the achieved spacing instead of a fixed 6
-#     degrees (about 660 km), and uncovered cells are masked.
+# CHANGES IN THIS REVISION
+#   * ONE run date, from blast_run_date(). run_tag used to come from a second
+#     Sys.Date() called after the fetch, so a run that started before local
+#     midnight produced a map dated 30 July over weather to 23 July while the
+#     town table, started after midnight, said 24 July.
+#   * model_pt() derives emergence from model_end, not from the run's global
+#     emergence. Under GRID_WINDOW_MODE = "coverage" the two differ, SEIR's
+#     alignment check threw for every point, and the EPIRICE map came out empty
+#     while the BLASTAM map still rendered.
+#   * HEAT_STRETCH and BLASTAM_STRETCH are applied. They were documented as
+#     working controls but no script read them, so both delivered maps rendered
+#     as one flat pale blue against a fixed 2% and 21 day scale.
+#   * The observed maximum is printed in the footer and passed to the email.
+#   * The refresh phase is capped by the weighted budget, not only by the fetch
+#     count, and the retry reserve is enforced on the fetch rather than only in
+#     planning.
+#   * Overlay line parts are split at long jumps. australia_roads.geojson holds a
+#     feature with a 3.25 deg step from Victoria to Tasmania, which drew as a line
+#     across Bass Strait on every map.
+#   * Town labels are placed by a declutter pass and pushed inward near the east
+#     coast, so "Gympie" is no longer clipped to "Gym".
+#   * Optional COAST_MASK_KM blanks the partly marine coastal fringe, which was
+#     carrying most of the BLASTAM signal in country where rice is not grown.
+#   * The target lattice extent is rounded out to a whole number of cells, so the
+#     northernmost row is no longer dropped by seq(-44, -10, by = 0.3).
 #
-# The test hook changed: POINT_FETCH_FN(lat, lon, start, end) is replaced by
-# GRID_ON_POINT(pid, lon, lat, hourly_dt) -> cache rows.
+# The test hook is GRID_ON_POINT(pid, lon, lat, hourly_dt) -> cache rows.
 ################################################################################
 
-Sys.setenv(TZ = "Australia/Sydney")
 RUN_T0 <- Sys.time()
 
 SCRIPT_DIR <- tryCatch(
@@ -50,23 +53,37 @@ source(file.path(SCRIPT_DIR, "openmeteo_batch.R"))
 
 suppressPackageStartupMessages({library(data.table); library(terra)})
 
-ext <- GRID_EXTENT
+RUN_DATE <- blast_run_date()
+run_tag  <- format(RUN_DATE, "%Y-%m-%d")
+blastam_check_fetch_arithmetic()
+
 key_of <- function(lon, lat) paste0(sprintf("%.4f", lon), "_", sprintf("%.4f", lat))
 CACHE_COLS <- c("pid","lon","lat","date","TEMP","RHUM","RAIN","wet_hours","temp_wet","infect","semi")
 
+# Round the requested extent OUT to a whole number of cells, so the lattice
+# covers it. seq(-44, -10, by = 0.3) stops at -10.1, silently dropping the
+# northernmost row of cells; the extra cells added here are ocean and are masked.
+ext <- {
+  fin <- GRID_RES_FINEST
+  c(GRID_EXTENT[1],
+    GRID_EXTENT[1] + ceiling((GRID_EXTENT[2] - GRID_EXTENT[1]) / fin) * fin,
+    GRID_EXTENT[3],
+    GRID_EXTENT[3] + ceiling((GRID_EXTENT[4] - GRID_EXTENT[3]) / fin) * fin)
+}
+
 # Hourly JSON for one point -> the daily cache rows both models read.
 #
-# TWO THINGS MATTER HERE.
-#  * lon is passed so BLASTAM applies its 15:00-09:00 window in LOCAL SOLAR time.
-#    Without it the window lands on UTC, which over Australia is roughly 01:00 to
-#    19:00 local: it misses the evening dew onset entirely.
-#  * keep_from drops the lead-in days. The first four days of any fetch have no
-#    preceding 5-day mean, so their infect is NA; writing them would overwrite
-#    good cached values with NA on every short refresh.
-make_on_point <- function(keep_from) function(pid, lon, lat, hw) {
+#  * lon is passed so the model day is cut at BLASTAM_DAY_CUT_HOUR local solar
+#    and the BLASTAM night window sits inside it.
+#  * keep_from drops the lead-in days, whose infect is NA because the lagged
+#    preceding 5-day mean is not yet available. Writing them would overwrite good
+#    cached values with NA on every short refresh.
+#  * keep_to caps the rows at end_date. The fetch runs one day further, to
+#    data_end, purely so the final model day is complete at every longitude.
+make_on_point <- function(keep_from, keep_to) function(pid, lon, lat, hw) {
   w <- tryCatch(blastam_daily_from_hourly(hw, lon = lon), error = function(e) NULL)
   if (is.null(w) || nrow(w) == 0) return(NULL)
-  w <- w[date >= keep_from]
+  w <- w[date >= keep_from & date <= keep_to]
   if (nrow(w) == 0) return(NULL)
   data.table(pid = pid, lon = lon, lat = lat, date = as.Date(w$date),
              TEMP = w$TEMP, RHUM = w$RHUM, RAIN = w$RAIN,
@@ -109,17 +126,10 @@ build_targets <- function() {
   lv[is.na(lv)] <- length(GRID_RES_LEVELS) + 1L
   g[, lvl := lv]
 
-  # PROGRESSIVE WITHIN-LEVEL ORDERING.
-  # setorder(g, lvl, lat, lon) filled each level from the south, so a level that
-  # ran out of budget partway left a horizontal band unsampled. On the
-  # 2026-07-29 run that band was everything north of -17.6 deg: Cape York, the
-  # Top End and the Kimberley held only the 1.2 deg lattice while the south had
-  # 0.6, giving the tropics 14% coverage against 23% for the continent. That is
-  # the worst possible bias here, since the tropics are where blast risk is.
-  #
-  # Ordering by a bit-reversed Morton (Z-order) index instead makes ANY prefix a
-  # spatially uniform sample of the level: the map thins evenly and sharpens
-  # evenly rather than growing as a front moving north.
+  # PROGRESSIVE WITHIN-LEVEL ORDERING. A bit-reversed Morton (Z-order) index
+  # makes ANY prefix a spatially uniform sample of the level, so a level that
+  # runs out of budget partway thins the map evenly instead of leaving the
+  # tropics on the coarse lattice while the south is fine.
   g[, `:=`(ci = as.integer(round((lon - ext[1]) / fin)),
            ri = as.integer(round((lat - ext[3]) / fin)))]
   nbits <- max(1L, as.integer(ceiling(log2(max(g$ci, g$ri) + 1))))
@@ -148,11 +158,18 @@ targets <- build_targets()
 LEVEL_RES <- c(GRID_RES_LEVELS, GRID_RES_FINEST)[seq_len(max(targets$lvl))]
 
 # ---- Window ----------------------------------------------------------------
-end_date  <- Sys.Date() - ARCHIVE_LAG_DAYS
+# data_end is the last day FETCHED; end_date is the last day MODELLED. They
+# differ by DAY_CUT_LAG_DAYS because the model day is cut at
+# BLASTAM_DAY_CUT_HOUR local solar, so the final fetched day is only partly
+# covered and by an amount that depends on longitude. Dropping it makes the
+# window identical at every longitude by construction.
+data_end  <- RUN_DATE - ARCHIVE_LAG_DAYS
+end_date  <- data_end - DAY_CUT_LAG_DAYS
 emergence <- end_date - CROP_AGE_DAYS
 win_dates <- seq(emergence, end_date, by = "day")
-cat(sprintf("Window %s to %s (%d days); target %d land points at %.2f deg\n",
-            emergence, end_date, length(win_dates), nrow(targets), GRID_RES_FINEST))
+cat(sprintf("Run %s. Fetch to %s, model %s to %s (%d days); target %d land points at %.2f deg\n",
+            run_tag, data_end, emergence, end_date, length(win_dates),
+            nrow(targets), GRID_RES_FINEST))
 
 # ---- Load cache ------------------------------------------------------------
 OUT <- file.path(SCRIPT_DIR, OUTPUT_DIR)
@@ -161,8 +178,7 @@ gz_file  <- file.path(OUT, WEATHER_CACHE_GZ)
 csv_file <- file.path(OUT, WEATHER_CACHE_CSV)
 
 # fread() cannot read .gz unless R.utils is installed (it is not in the runner
-# container), so gz is decompressed with a base R gzfile connection first. That
-# keeps the cache dependency free.
+# container), so gz is decompressed with a base R gzfile connection first.
 read_gz_dt <- function(f) {
   tmp <- tempfile(fileext = ".csv")
   on.exit(unlink(tmp), add = TRUE)
@@ -182,8 +198,6 @@ read_cache <- function() {
     d <- tryCatch(if (is_gz) read_gz_dt(f) else fread(f, colClasses = list(character = "pid")),
                   error = function(e) {
                     cat(sprintf("Cache read FAILED (%s): %s\n", basename(f), conditionMessage(e))); NULL })
-    # A damaged file can read without error yet be empty or missing columns (a
-    # non-gzip file opened through gzfile reads as plain text, for instance).
     if (is.null(d) || nrow(d) == 0 || !all(CACHE_COLS %in% names(d))) {
       if (!is.null(d))
         cat(sprintf("Cache file %s is empty or malformed (%d rows); ignoring it.\n",
@@ -209,9 +223,6 @@ read_cache <- function() {
               nrow(pick), length(unique(pick$pid))))
   list(data = pick, fmt = if (grepl("\\.gz$", used)) "gz" else "csv")
 }
-# Schema version gate. A cache written under an older definition of the stored
-# values must be discarded, not refreshed: a 14 day refresh would leave the older
-# days holding the old definition and the map would silently mix the two.
 ver_file <- file.path(OUT, if (exists("CACHE_VERSION_FILE")) CACHE_VERSION_FILE else "cache_version.txt")
 want_ver <- if (exists("CACHE_SCHEMA_VERSION")) CACHE_SCHEMA_VERSION else 1L
 have_ver <- suppressWarnings(as.integer(tryCatch(readLines(ver_file, warn = FALSE)[1],
@@ -224,7 +235,9 @@ read_fmt <- if (is.na(cache_in$fmt)) "none" else cache_in$fmt
 if (!is.null(cache) && have_ver != want_ver) {
   cat(sprintf("Cache schema is version %d, this code writes version %d; discarding %d cached point(s) and rebuilding.\n",
               have_ver, want_ver, length(unique(cache$pid))))
-  cat("  (version 2 moved the BLASTAM night window from UTC to local solar time, so every stored infect value from version 1 is wrong.)\n")
+  cat("  (version 3 moved the model day cut to BLASTAM_DAY_CUT_HOUR, lagged the\n")
+  cat("   preceding 5-day mean and tightened night completeness, so every TEMP,\n")
+  cat("   RHUM, RAIN, infect and semi value from version 2 is superseded.)\n")
   cache <- NULL
   read_fmt <- "none"
 }
@@ -237,10 +250,7 @@ if (is.null(cache) || !all(c("infect","semi","wet_hours") %in% names(cache))) {
 }
 cache[, date := as.Date(date)]
 
-# Drop cached points that are not on the current target grid. After a change to
-# GRID_RES_FINEST the old points do not coincide with the new lattice, so they
-# would never be refreshed again yet would still be modelled, feeding
-# progressively staler weather into the map.
+# Drop cached points that are not on the current target grid.
 if (nrow(cache) > 0) {
   orphans <- setdiff(unique(cache$pid), targets$pid)
   if (length(orphans) > 0) {
@@ -251,8 +261,6 @@ if (nrow(cache) > 0) {
 }
 
 # ---- Failure ledger --------------------------------------------------------
-# Points whose fetch failed previously. Without this the planner re-selects the
-# same points in the same order every run and fails the same way.
 ledger_file <- file.path(OUT, if (exists("FAIL_LEDGER_FILE")) FAIL_LEDGER_FILE else "fetch_failures.csv")
 max_strikes <- if (exists("FAIL_LEDGER_MAX_STRIKES")) FAIL_LEDGER_MAX_STRIKES else 4L
 fails <- if (file.exists(ledger_file))
@@ -261,29 +269,31 @@ if (is.null(fails) || !all(c("pid","strikes","last_try","last_status") %in% name
   fails <- data.table(pid = character(), strikes = integer(),
                       last_try = as.Date(character()), last_status = character())
 fails[, last_try := as.Date(last_try)]
-# Exponential cooloff: a point with s strikes is skipped for 2^s days.
-benched <- fails[strikes >= max_strikes & last_try > (Sys.Date() - 2^pmin(strikes, 8L)), pid]
+benched <- fails[strikes >= max_strikes & last_try > (RUN_DATE - 2^pmin(strikes, 8L)), pid]
 if (length(benched) > 0)
   cat(sprintf("%d point(s) benched after repeated fetch failures; they will be retried later.\n",
               length(benched)))
 
 # ---- Decide what to fetch --------------------------------------------------
-# Weighted cost. The API charges max(1, nvars/10) * max(1, ndays/14) per
-# location, with a 14 day FLOOR. That floor is why a refresh costs 1 regardless
-# of how few days it needs, and why refreshes take a full 14 day tail below.
-# Every fetch carries BLASTAM_LEADIN_DAYS of extra history that is computed and
-# then discarded: one day for the local solar shift (the first local day is
-# partial) plus five for the preceding 5-day mean temperature.
+# The API charges max(1, nvars/10) * max(1, ndays/14) per location, with a 14 day
+# FLOOR. Every fetch carries BLASTAM_LEADIN_DAYS of extra history that is
+# computed and then discarded (1 day for the local solar shift, 5 for the lagged
+# preceding 5-day mean) plus DAY_CUT_LAG_DAYS at the leading edge.
 lead <- BLASTAM_LEADIN_DAYS
-add_keep_from   <- emergence
-add_fetch_from  <- emergence - lead
-n_days_add <- as.integer(end_date - add_fetch_from) + 1L
+# In coverage mode the modelled window can end up to GRID_WINDOW_MAX_LAG_DAYS
+# earlier than end_date, so it also STARTS that much earlier and the cache has to
+# hold the extra days.
+win_back <- if (identical(GRID_WINDOW_MODE, "coverage") &&
+                exists("GRID_WINDOW_MAX_LAG_DAYS")) as.integer(GRID_WINDOW_MAX_LAG_DAYS) else 0L
+add_keep_from   <- emergence - win_back
+add_fetch_from  <- add_keep_from - lead
+n_days_add <- as.integer(data_end - add_fetch_from) + 1L
 cost_new   <- om_weight_per_location(n_days_add, length(OM_HOURLY_VARS))
 
 tail_start      <- max(emergence, end_date - (REFRESH_TAIL_DAYS - 1L))
 ref_keep_from   <- tail_start
 ref_fetch_from  <- tail_start - lead
-cost_ref   <- om_weight_per_location(as.integer(end_date - ref_fetch_from) + 1L,
+cost_ref   <- om_weight_per_location(as.integer(data_end - ref_fetch_from) + 1L,
                                      length(OM_HOURLY_VARS))
 
 cached_pids <- unique(cache$pid)
@@ -294,21 +304,40 @@ max_fetch  <- GRID_MAX_FETCHES_PER_RUN
 wt_cap     <- DAILY_WEIGHTED_CAP
 stale_days <- REFRESH_MIN_STALE_DAYS
 
+# Respect anything already spent today by another script or an earlier run.
+spend_ledger <- file.path(OUT, SPEND_LEDGER_FILE)
+already <- om_spend_read(spend_ledger)
+wt_cap <- max(0, min(wt_cap, DAILY_WEIGHTED_HARD_CAP - already))
+if (already > 0)
+  cat(sprintf("Weighted ledger: %.0f already spent today, so this run is capped at %.0f.\n",
+              already, wt_cap))
+
 eligible <- last_by[last < end_date & last <= (end_date - stale_days)][order(last)]
 
 # Hold back a slice of the weighted budget so the retry pass has something to
-# spend. Planning adds up to the full cap leaves the retry with a budget of zero.
+# spend. plan_cap is used for planning AND is now handed to the fetch, so a
+# charged retry cannot silently eat the reserve: the 2026-07-30 run reported
+# 8,667 weighted spent against a planned 8,550 for exactly that reason.
 retry_wfrac <- if (exists("GRID_RETRY_WEIGHT_FRAC")) GRID_RETRY_WEIGHT_FRAC else 0.05
 plan_cap <- wt_cap * (1 - retry_wfrac)
 
-# A short tail can only close a gap it actually spans. A point whose last row
-# predates ref_keep_from - 1 would be left with a hole between that row and the
-# tail, so it is refetched over the FULL window instead of topped up. Without
-# this split the short tail silently produces discontinuous series.
+# A short tail can only close a gap it actually spans, so a point whose last row
+# predates ref_keep_from - 1 is refetched over the FULL window instead.
 tail_ok   <- eligible[last >= (ref_keep_from - 1L)]
 tail_late <- eligible[last <  (ref_keep_from - 1L)]
 
-n_refresh <- min(nrow(tail_ok), max_fetch)
+# THE REFRESH PHASE IS NOW BUDGETED. It used to be min(nrow(tail_ok), max_fetch)
+# with no weighted check, unlike the add and refetch phases. At cost_ref = 1.00
+# and max_fetch = 8500 that fitted inside plan_cap by 50 calls; raise the tail so
+# cost_ref becomes 1.07 and the planner would schedule a refresh it cannot pay
+# for, the fetch would stop on "budget" partway through, and nothing would be
+# added for the rest of the run.
+n_refresh <- max(0L, min(nrow(tail_ok), max_fetch, floor(plan_cap / cost_ref)))
+if (n_refresh < nrow(tail_ok))
+  cat(sprintf("Refresh limited to %d of %d eligible points by the %s.\n",
+              n_refresh, nrow(tail_ok),
+              if (max_fetch <= floor(plan_cap / cost_ref)) "fetch count cap"
+              else "weighted budget"))
 maintain  <- targets[pid %in% tail_ok$pid[seq_len(n_refresh)]]
 maintain_cost <- nrow(maintain) * cost_ref
 
@@ -335,13 +364,8 @@ if (nrow(tail_late) > nrow(restale))
               nrow(tail_late) - nrow(restale), REFRESH_TAIL_DAYS))
 
 # ---- Deadlines -------------------------------------------------------------
-# Measured from RUN_T0 so cache loading and grid building count against the
-# budget, not just fetching.
 reserve_min   <- GRID_RESERVE_MINUTES
 retry_reserve <- if (exists("GRID_RETRY_RESERVE_MINUTES")) GRID_RETRY_RESERVE_MINUTES else 20L
-# CLAMP. The retry slice is subtracted from the fetch budget, so if it is larger
-# than the budget the add deadline lands in the PAST and the run fetches nothing
-# while reporting "deadline". That is exactly what a short dry run would hit.
 if (!is.na(GRID_MAX_MINUTES) && GRID_MAX_MINUTES > 0)
   retry_reserve <- min(as.numeric(retry_reserve), as.numeric(GRID_MAX_MINUTES) * 0.25)
 
@@ -349,8 +373,6 @@ fetch_deadline <- if (!is.na(GRID_MAX_MINUTES) && GRID_MAX_MINUTES > 0)
   RUN_T0 + GRID_MAX_MINUTES * 60 else as.POSIXct(NA)
 add_deadline <- if (is.na(fetch_deadline)) fetch_deadline else fetch_deadline - retry_reserve * 60
 add_frac <- GRID_ADD_RESERVE_FRAC
-# Refresh gets a share of the ADD deadline, not of the whole budget, so the three
-# phases are always ordered refresh < add < retry whatever the budget is.
 refresh_deadline <- if (is.na(add_deadline)) add_deadline else {
   if (nrow(add) > 0 && add_frac > 0)
     RUN_T0 + as.numeric(difftime(add_deadline, RUN_T0, units = "secs")) * (1 - add_frac)
@@ -370,12 +392,12 @@ all_ledger <- list()
 spent <- 0
 quota_hit <- FALSE
 
-run_phase <- function(tab, fetch_from, keep_from, deadline, label) {
+run_phase <- function(tab, fetch_from, keep_from, deadline, label, cap) {
   if (nrow(tab) == 0L || isTRUE(quota_hit)) return(invisible())
-  r <- fetch_points_batched(tab[, .(pid, lon, lat)], fetch_from, end_date,
-                            on_point = make_on_point(keep_from),
+  r <- fetch_points_batched(tab[, .(pid, lon, lat)], fetch_from, data_end,
+                            on_point = make_on_point(keep_from, end_date),
                             deadline = deadline,
-                            budget = max(0, wt_cap - spent),
+                            budget = max(0, cap - spent),
                             label = label)
   if (length(r$rows) > 0) new_rows <<- c(new_rows, r$rows)
   if (nrow(r$ledger) > 0) all_ledger[[length(all_ledger) + 1L]] <<- r$ledger
@@ -384,24 +406,18 @@ run_phase <- function(tab, fetch_from, keep_from, deadline, label) {
   invisible()
 }
 
-# Refresh first: keeping existing cells current matters more than growing, since
-# under "latest" window mode a stale cell drops off the map entirely.
-run_phase(maintain, ref_fetch_from, ref_keep_from, refresh_deadline, "refresh")
-run_phase(restale,  add_fetch_from, add_keep_from, refresh_deadline, "refetch")
-run_phase(add,      add_fetch_from, add_keep_from, add_deadline,     "add")
+# Refresh first: under "latest" window mode a stale cell drops off the map.
+run_phase(maintain, ref_fetch_from, ref_keep_from, refresh_deadline, "refresh", plan_cap)
+run_phase(restale,  add_fetch_from, add_keep_from, refresh_deadline, "refetch", plan_cap)
+run_phase(add,      add_fetch_from, add_keep_from, add_deadline,     "add",     plan_cap)
 
 # ---- Retry -----------------------------------------------------------------
 # Only points that were ATTEMPTED and failed with a transport or HTTP error.
-# "empty" means the API answered and had nothing, so retrying is pointless, and
-# points the budget never reached are left for next run. This pass now has its
-# own reserved wall clock; previously the add phase consumed the whole budget so
-# the retry was skipped every time.
+# "empty" means the API answered and had nothing. The retry alone may draw on the
+# reserved slice, which is why its cap is wt_cap rather than plan_cap.
 led <- if (length(all_ledger)) rbindlist(all_ledger) else
   data.table(pid = character(), status = character(), code = integer())
 retryable <- led[status %in% c("http", "transport"), unique(pid)]
-# If most of the run failed, the archive is having a bad day and retrying
-# everything simply doubles the wasted quota and wall clock. Retry only when the
-# failures look transient.
 attempted <- nrow(led)
 ok_frac <- if (attempted > 0) nrow(led[status == "ok"]) / attempted else 1
 retry_min_ok <- if (exists("GRID_RETRY_MIN_OK_FRAC")) GRID_RETRY_MIN_OK_FRAC else 0.25
@@ -413,9 +429,11 @@ if (length(retryable) > 0 && !quota_hit && ok_frac < retry_min_ok) {
   rt_add <- rbind(restale[pid %in% retryable], add[pid %in% retryable])
   cat(sprintf("Retrying %d refresh and %d add/refetch point(s) that failed with a transport or HTTP error.\n",
               nrow(rt_ref), nrow(rt_add)))
-  run_phase(rt_ref, ref_fetch_from, ref_keep_from, fetch_deadline, "refresh-retry")
-  run_phase(rt_add, add_fetch_from, add_keep_from, fetch_deadline, "add-retry")
+  run_phase(rt_ref, ref_fetch_from, ref_keep_from, fetch_deadline, "refresh-retry", wt_cap)
+  run_phase(rt_add, add_fetch_from, add_keep_from, fetch_deadline, "add-retry", wt_cap)
 }
+
+om_spend_add(spend_ledger, spent, "grid")
 
 # ---- Update the failure ledger ---------------------------------------------
 led <- if (length(all_ledger)) rbindlist(all_ledger) else led
@@ -427,7 +445,7 @@ if (nrow(led) > 0) {
   if (nrow(bad_now) > 0) {
     upd <- merge(bad_now, fails[, .(pid, strikes)], by = "pid", all.x = TRUE)
     upd[is.na(strikes), strikes := 0L]
-    upd[, `:=`(strikes = strikes + 1L, last_try = Sys.Date(), last_status = status)]
+    upd[, `:=`(strikes = strikes + 1L, last_try = RUN_DATE, last_status = status)]
     fails <- rbind(fails[!pid %in% upd$pid],
                    upd[, .(pid, strikes, last_try, last_status)], fill = TRUE)
   }
@@ -439,8 +457,7 @@ if (length(new_rows) > 0)
   cache <- rbindlist(list(cache, rbindlist(new_rows)), use.names = TRUE)
 
 # Retain history rather than pruning to the modelling window. Weather already
-# fetched costs nothing to keep, and discarding it means no past map can be
-# reproduced and any retrospective analysis needs the whole grid fetched again.
+# fetched costs nothing to keep.
 keep_hist <- if (exists("CACHE_KEEP_HISTORY")) isTRUE(CACHE_KEEP_HISTORY) else FALSE
 hist_days <- if (exists("CACHE_HISTORY_DAYS")) CACHE_HISTORY_DAYS else 400L
 cache <- if (keep_hist) {
@@ -452,32 +469,11 @@ setorder(cache, pid, date)
 cache <- unique(cache, by = c("pid", "date"), fromLast = TRUE)
 
 # ---- Model both per point --------------------------------------------------
-run_tag <- format(Sys.Date(), "%Y-%m-%d")
 writeLines(run_tag, file.path(OUT, "run_date.txt"))
-
-model_pt <- function(dt) {
-  epi <- NA_real_
-  if (nrow(dt) >= 20) {
-    w <- data.table(YYYYMMDD = dt$date, DOY = as.integer(format(dt$date, "%j")),
-                    TEMP = dt$TEMP, RHUM = dt$RHUM, RAIN = dt$RAIN,
-                    LAT = dt$lat[1], LON = dt$lon[1])
-    setorder(w, YYYYMMDD)
-    lb <- tryCatch(predict_leaf_blast(w, emergence = emergence,
-                                      duration = as.integer(min(120L, nrow(w)))),
-                   error = function(e) NULL)
-    if (!is.null(lb) && nrow(lb) > 0) epi <- lb$intensity[nrow(lb)]
-  }
-  win <- BLASTAM_WINDOW_DAYS
-  lagd <- if (exists("BLASTAM_END_LAG_DAYS")) BLASTAM_END_LAG_DAYS else 0L
-  bend <- model_end - lagd
-  list(intensity = epi,
-       events = sum(dt$infect[dt$date > (bend - win) & dt$date <= bend], na.rm = TRUE))
-}
 
 # COMMON WINDOW, REAL WEATHER ONLY. Cells differ in how current they are, so the
 # map's window ends at a date essentially every cell has reached, and each cell's
-# series is TRUNCATED to it. One shared calendar window, nothing padded or
-# extrapolated.
+# series is TRUNCATED to it.
 pt_end <- if (nrow(cache) > 0) cache[, .(mx = max(date)), by = pid] else
   data.table(pid = character(), mx = as.Date(character()))
 n_cache_pts <- nrow(pt_end)
@@ -490,20 +486,40 @@ if (identical(wmode, "latest")) {
   idx <- max(1L, ceiling((1 - cover) * length(mx_sorted)))
   model_end <- min(mx_sorted[idx], end_date)
 }
+# EVERY MAPPED CELL SHARES THIS EMERGENCE DATE. It used to be the run's global
+# `emergence`, which equals model_end - CROP_AGE_DAYS only under "latest". Under
+# "coverage" the weather was truncated to an earlier model_end while SEIR was
+# still handed the later emergence, so its alignment check threw for every point
+# and the EPIRICE map rendered empty while BLASTAM rendered normally.
+model_start <- model_end - CROP_AGE_DAYS
+
 current_pids <- pt_end[mx >= model_end, pid]
 held_out <- n_cache_pts - length(current_pids)
 # NOTE the >= . With `>` this yields CROP_AGE_DAYS rows starting one day after
-# emergence, and SEIR's "dates do not align" check then throws for every point,
-# silently emptying the EPIRICE map via model_pt()'s tryCatch.
-model_cache <- cache[pid %in% current_pids &
-                     date >= (model_end - CROP_AGE_DAYS) & date <= model_end]
+# model_start, and SEIR's alignment check then throws for every point.
+model_cache <- cache[pid %in% current_pids & date >= model_start & date <= model_end]
 cat(sprintf("Window [%s] ends %s: %d of %d cells reach it, %d absent (%d days behind the archive edge).\n",
             wmode, format(model_end), length(current_pids), n_cache_pts, held_out,
             as.integer(end_date - model_end)))
 
+# Distinguish "no EPIRICE because the alignment is wrong" from "no EPIRICE because
+# the cache does not reach back to model_start yet". The second is expected on the
+# first few coverage-mode runs and resolves itself as CACHE_HISTORY_DAYS fills.
+if (nrow(model_cache) > 0) {
+  reach <- model_cache[, .(first = min(date)), by = pid]
+  n_reach <- sum(reach$first <= model_start)
+  if (n_reach == 0L)
+    cat(sprintf(paste0("No cell holds weather back to %s, so EPIRICE will be NA everywhere. ",
+                       "The earliest cached day is %s. In coverage mode this is expected until ",
+                       "the cache has accumulated GRID_WINDOW_MAX_LAG_DAYS (%s) of extra ",
+                       "history; it is not the SEIR alignment fault.\n"),
+                format(model_start), format(min(reach$first)),
+                if (exists("GRID_WINDOW_MAX_LAG_DAYS")) GRID_WINDOW_MAX_LAG_DAYS else 0L))
+}
+
 # SEIR indexes the weather vector by POSITION, so a missing day would shift every
 # later day by one and be modelled silently. Drop any point whose window is not a
-# continuous run of dates.
+# continuous run of dates. (SEIR now also refuses a gappy series itself.)
 shape <- model_cache[, .(n = .N, span = as.integer(max(date) - min(date)) + 1L), by = pid]
 gappy <- shape[n != span, pid]
 if (length(gappy) > 0) {
@@ -515,20 +531,36 @@ short <- shape[n == span & n < (CROP_AGE_DAYS + 1L), .N]
 if (short > 0)
   cat(sprintf("%d point(s) have a short but continuous window; EPIRICE will report NA for them.\n", short))
 
+# EPIRICE is reported only for a cell holding the FULL common window, so every
+# coloured cell on the map carries the same crop age and the same number of days.
+model_pt <- function(dt) {
+  epi <- NA_real_
+  if (nrow(dt) >= (CROP_AGE_DAYS + 1L) && min(dt$date) <= model_start) {
+    w <- data.table(YYYYMMDD = dt$date, DOY = as.integer(format(dt$date, "%j")),
+                    TEMP = dt$TEMP, RHUM = dt$RHUM, RAIN = dt$RAIN,
+                    LAT = dt$lat[1], LON = dt$lon[1])
+    setorder(w, YYYYMMDD)
+    lb <- tryCatch(predict_leaf_blast(w, emergence = model_start,
+                                      duration = as.integer(min(120L, nrow(w)))),
+                   error = function(e) NULL)
+    if (!is.null(lb) && nrow(lb) > 0) epi <- lb$intensity[nrow(lb)]
+  }
+  win  <- BLASTAM_WINDOW_DAYS
+  lagd <- if (exists("BLASTAM_END_LAG_DAYS")) BLASTAM_END_LAG_DAYS else 0L
+  bend <- model_end - lagd
+  bs <- blastam_score(dt$infect, dt$semi, dt$date, bend,
+                      window = win, recent = BLASTAM_RECENT_DAYS)
+  list(intensity = epi, events = bs$events, unjudged = bs$unjudged)
+}
+
 pm <- model_cache[, { m <- model_pt(.SD); .(lon = lon[1], lat = lat[1],
-              intensity = m$intensity, events = m$events) }, by = pid]
+              intensity = m$intensity, events = m$events, unjudged = m$unjudged) }, by = pid]
 pm_epi <- pm[!is.na(intensity)]
 
 # ---- Coverage reporting ----------------------------------------------------
-# Mean spacing over LAND, from the target lattice. The old statistic divided the
-# BOUNDING BOX (42 x 34 = 1428 sq deg) by the point count, counting the Southern
-# Ocean as unsampled land, which understated the achieved resolution by about 40%.
 land_area_deg2 <- nrow(targets) * GRID_RES_FINEST^2
 map_spacing <- if (nrow(pm) > 0) sqrt(land_area_deg2 / nrow(pm)) else NA_real_
 
-# Mean spacing is misleading while the lattice fills coarse to fine, because
-# coverage is a complete coarse level plus a partial finer one. The completed
-# level is the defensible claim.
 lvl_target <- targets[, .(N_target = .N), by = lvl]
 lvl_done   <- targets[pid %in% pm$pid, .(N_done = .N), by = lvl]
 lvl_tab <- merge(lvl_target, lvl_done, by = "lvl", all.x = TRUE)[order(lvl)]
@@ -536,6 +568,8 @@ lvl_tab[is.na(N_done), N_done := 0L]
 lvl_tab[, frac := N_done / N_target]
 complete_lvl <- suppressWarnings(max(lvl_tab[frac >= 0.995, lvl]))
 res_complete <- if (is.finite(complete_lvl)) LEVEL_RES[complete_lvl] else NA_real_
+obs_max_epi <- if (nrow(pm_epi) > 0) max(pm_epi$intensity, na.rm = TRUE) * 100 else NA_real_
+obs_max_bl  <- if (nrow(pm) > 0) max(pm$events, na.rm = TRUE) else NA_real_
 cat(sprintf("Level coverage: %s\n",
             paste(sprintf("L%d(%.2f deg) %d/%d", lvl_tab$lvl, LEVEL_RES[lvl_tab$lvl],
                           lvl_tab$N_done, lvl_tab$N_target), collapse = "; ")))
@@ -544,28 +578,90 @@ cat(sprintf("Modelled %d points to %s; %s; mean land spacing ~%s deg\n",
             if (is.na(res_complete)) "no lattice level complete yet"
             else sprintf("complete to %.2f deg", res_complete),
             if (is.na(map_spacing)) "NA" else sprintf("%.2f", map_spacing)))
+cat(sprintf("Observed maxima: EPIRICE %s, BLASTAM %s. Colour ceilings: %.2f%% and %d days.\n",
+            if (is.na(obs_max_epi)) "NA" else sprintf("%.4f%%", obs_max_epi),
+            if (is.na(obs_max_bl)) "NA" else sprintf("%.0f days", obs_max_bl),
+            HEAT_MAX, as.integer(BLASTAM_HEAT_MAX)))
 
 # ---- Render ----------------------------------------------------------------
+# Overlay loader. australia_roads.geojson contains a feature whose last vertex
+# jumps 3.25 deg from Victoria (144.67, -38.38) straight to Tasmania
+# (146.33, -41.17), which drew as a line across Bass Strait on every map. Rather
+# than editing the bundled data, any line part is split at a jump longer than
+# OVERLAY_MAX_SEGMENT_DEG, which also catches two smaller artefacts.
+split_long_segments <- function(v, maxd) {
+  g <- tryCatch(as.data.frame(terra::geom(v)), error = function(e) NULL)
+  if (is.null(g) || !nrow(g)) return(v)
+  g$grp <- paste(g$geom, g$part, sep = "_")
+  parts <- lapply(split(g, g$grp), function(sub) {
+    if (nrow(sub) < 2L) return(NULL)
+    step <- c(0, sqrt(diff(sub$x)^2 + diff(sub$y)^2))
+    sub$seg <- cumsum(step > maxd)
+    sub
+  })
+  g2 <- do.call(rbind, parts[!vapply(parts, is.null, logical(1))])
+  if (is.null(g2) || !nrow(g2)) return(v)
+  g2$obj <- as.integer(factor(paste(g2$grp, g2$seg)))
+  keep <- g2$obj %in% as.integer(names(which(table(g2$obj) >= 2L)))
+  g2 <- g2[keep, , drop = FALSE]
+  if (!nrow(g2)) return(v)
+  m <- cbind(object = as.integer(factor(g2$obj)), part = 1L, x = g2$x, y = g2$y, hole = 0L)
+  out <- tryCatch(terra::vect(m, type = "lines", crs = terra::crs(v)),
+                  error = function(e) NULL)
+  if (is.null(out)) v else out
+}
+
 load_bundled <- function(fname) {
   f <- file.path(SCRIPT_DIR, fname)
   v <- tryCatch(if (file.exists(f)) terra::vect(f) else NULL, error = function(e) NULL)
   if (is.null(v) || nrow(v) == 0) return(NULL)
-  tryCatch(terra::crop(v, terra::ext(ext)), error = function(e) v)
+  v <- tryCatch(terra::crop(v, terra::ext(ext)), error = function(e) v)
+  if (is.null(v) || nrow(v) == 0) return(NULL)
+  maxd <- if (exists("OVERLAY_MAX_SEGMENT_DEG")) OVERLAY_MAX_SEGMENT_DEG else Inf
+  if (is.finite(maxd)) v <- split_long_segments(v, maxd)
+  v
 }
 rivers <- if (isTRUE(SHOW_RIVERS)) load_bundled("australia_rivers.geojson") else NULL
 roads  <- if (isTRUE(SHOW_ROADS))  load_bundled("australia_roads.geojson") else NULL
 
-render_map <- function(pts, valcol, title, colours, hmax, legend, base) {
+# Greedy label declutter, south to north so the order is deterministic. Labels
+# that would sit within LABEL_MIN_SEP_DEG of one already placed are dropped, and
+# labels near the eastern edge are placed to the left so they are not clipped.
+declutter_labels <- function(lon, lat, minsep) {
+  keep <- logical(length(lon))
+  px <- numeric(0); py <- numeric(0)
+  for (i in order(lat)) {
+    if (length(px) == 0L ||
+        all(sqrt((lon[i] - px)^2 + (lat[i] - py)^2) >= minsep)) {
+      keep[i] <- TRUE; px <- c(px, lon[i]); py <- c(py, lat[i])
+    }
+  }
+  keep
+}
+
+# Apply the colour stretch. The ANCHOR IS UNCHANGED: hmax is still the deepest
+# colour every week. Only the spacing changes, and the legend is labelled with
+# true values, so nothing is misrepresented.
+stretch_raster <- function(r, hmax, s) {
+  if (!is.finite(s) || abs(s - 1) < 1e-9) return(r)
+  z <- terra::clamp(r, 0, hmax, values = TRUE) / hmax
+  z^s * hmax
+}
+legend_ticks <- function(hmax, s, n = 5L) {
+  true_at <- pretty(c(0, hmax), n = n)
+  true_at <- true_at[true_at >= 0 & true_at <= hmax]
+  disp_at <- hmax * (true_at / hmax)^s
+  list(at = disp_at, labels = format(true_at, trim = TRUE))
+}
+
+render_map <- function(pts, valcol, title, colours, hmax, stretch, legend, base,
+                       obs_max = NA_real_, obs_fmt = "%.3f") {
   if (nrow(pts) < 3) { cat("Too few points to render", base, "\n"); return(invisible()) }
   r0 <- terra::rast(xmin = ext[1], xmax = ext[2], ymin = ext[3], ymax = ext[4],
                     resolution = GRID_RES_FINEST / 2, crs = "EPSG:4326")
   v <- terra::vect(as.matrix(pts[, .(lon, lat)]), type = "points", crs = "EPSG:4326")
   v$val <- pts[[valcol]]
 
-  # Search radius tied to the achieved spacing. The old fixed radius of 6 was six
-  # DEGREES, roughly 660 km and about fifteen times the point spacing, so it
-  # interpolated smoothly straight across unsampled regions and a gap in the
-  # lattice was indistinguishable from data.
   idw_rad <- min(if (exists("IDW_RADIUS_MAX")) IDW_RADIUS_MAX else 1.0,
                  max(GRID_RES_FINEST, IDW_RADIUS_MULT * map_spacing))
   r <- tryCatch(terra::interpIDW(r0, v, field = "val", radius = idw_rad,
@@ -574,41 +670,77 @@ render_map <- function(pts, valcol, title, colours, hmax, legend, base) {
   names(r) <- valcol
   if (!is.null(land_poly)) r <- terra::mask(r, land_poly)
   if (isTRUE(MASK_UNCOVERED)) {
-    # Blank anywhere with no modelled point within the search radius, so gaps
-    # read as gaps. distance() on a lonlat grid returns metres.
     dmask <- tryCatch(terra::distance(r0, v), error = function(e) NULL)
     if (!is.null(dmask)) r[dmask > idw_rad * 111320] <- NA
   }
+  # Optional coastal fringe mask. ERA5 cells on the coast are partly marine, so
+  # their humidity is not representative of any paddock, yet they carried most of
+  # the BLASTAM signal on the delivered maps. Off by default.
+  cmk <- if (exists("COAST_MASK_KM")) COAST_MASK_KM else 0
+  if (is.finite(cmk) && cmk > 0 && !is.null(land_poly)) {
+    cl <- tryCatch(terra::as.lines(land_poly), error = function(e) NULL)
+    dcoast <- if (is.null(cl)) NULL else
+      tryCatch(terra::distance(r0, cl), error = function(e) NULL)
+    if (!is.null(dcoast)) r[dcoast < cmk * 1000] <- NA
+  }
 
+  # The GeoTIFF carries TRUE values; only the PNG is stretched.
   if (isTRUE(WRITE_GEOTIFF))
     terra::writeRaster(r, file.path(OUT, sprintf("%s_%s.tif", base, run_tag)),
                        overwrite = TRUE)
+
   rmax <- if (!is.null(hmax)) hmax else {
     m <- terra::global(r, "max", na.rm = TRUE)[1,1]; if (!is.finite(m) || m <= 0) 1 else m }
+  rs <- stretch_raster(r, rmax, stretch)
+  tk <- legend_ticks(rmax, stretch)
 
-  # Filenames stay on the RUN date so send_email.py keeps finding them, but the
-  # title and footer carry the DATA date. The two differ by ARCHIVE_LAG_DAYS plus
-  # any refresh lag, and a run-dated title implied a currency the map lacks.
-  # To move the filename onto the data date, swap run_tag for format(model_end)
-  # here and in the .tif above, and update send_email.py to match.
+  # Filenames stay on the RUN date so send_email.py keeps finding them; the title
+  # and footer carry the DATA date.
   png_file <- file.path(OUT, sprintf("%s_%s.png", base, run_tag))
   png(png_file, width = 1000, height = 900, res = 120)
-  op <- par(mar = c(4, 4, 3, 5))
-  ramp <- grDevices::colorRampPalette(colours)(100)
-  terra::plot(r, col = ramp, range = c(0, rmax), xlab = "Longitude", ylab = "Latitude",
-              main = sprintf("%s  weather to %s", title, format(model_end)),
-              plg = list(title = legend))
-  mtext(sprintf("run %s | %d cells | complete to %s deg | driver %s",
-                run_tag, nrow(pts),
-                if (is.na(res_complete)) "no level" else sprintf("%.2f", res_complete),
-                OPENMETEO_MODEL),
-        side = 1, line = 2.6, cex = 0.55, col = "#6b7378")
+  op <- par(mar = c(4.4, 4, 3, 5))
+  ramp <- grDevices::colorRampPalette(colours)(200)
+  plotted <- tryCatch({
+    terra::plot(rs, col = ramp, range = c(0, rmax), xlab = "Longitude", ylab = "Latitude",
+                main = sprintf("%s  weather to %s", title, format(model_end)),
+                plg = list(title = legend, at = tk$at, labels = tk$labels))
+    TRUE
+  }, error = function(e) FALSE)
+  if (!plotted)
+    terra::plot(rs, col = ramp, range = c(0, rmax), xlab = "Longitude", ylab = "Latitude",
+                main = sprintf("%s  weather to %s", title, format(model_end)),
+                plg = list(title = legend))
+
+  foot <- sprintf("run %s | %d cells | complete to %s deg | driver %s | colour scale 0 to %s%s",
+                  run_tag, nrow(pts),
+                  if (is.na(res_complete)) "no level" else sprintf("%.2f", res_complete),
+                  OPENMETEO_MODEL, format(rmax, trim = TRUE),
+                  if (abs(stretch - 1) > 1e-9) sprintf(", stretch %.2f", stretch) else "")
+  if (isTRUE(SHOW_OBSERVED_MAX) && is.finite(obs_max))
+    foot <- paste0(foot, " | observed max ", sprintf(obs_fmt, obs_max))
+  mtext(foot, side = 1, line = 3.2, cex = 0.62, col = NSW_GREY_04)
+
   if (isTRUE(SHOW_RIVERS) && !is.null(rivers)) try(terra::lines(rivers, col = COL_RIVER, lwd = 0.6), silent = TRUE)
   if (isTRUE(SHOW_ROADS)  && !is.null(roads))  try(terra::lines(roads,  col = COL_ROAD,  lwd = 0.5), silent = TRUE)
-  if (isTRUE(SHOW_COAST)  && !is.null(land_poly)) try(terra::lines(land_poly, col = COL_COAST, lwd = 1), silent = TRUE)
+  # Draw the coastline as polygon borders rather than terra::lines(), which is
+  # more tolerant of multipart geometry.
+  if (isTRUE(SHOW_COAST) && !is.null(land_poly))
+    try(terra::plot(land_poly, add = TRUE, col = NA, border = COL_COAST, lwd = 1), silent = TRUE)
+
   if (isTRUE(SHOW_TOWNS) && exists("MONITOR_TOWNS") && nrow(MONITOR_TOWNS) > 0) {
-    points(MONITOR_TOWNS$lon, MONITOR_TOWNS$lat, pch = 21, bg = "white", col = COL_TOWN, cex = 1.1, lwd = 1.4)
-    text(MONITOR_TOWNS$lon, MONITOR_TOWNS$lat, MONITOR_TOWNS$name, pos = 4, offset = 0.3, cex = 0.5, col = COL_TOWN)
+    tw <- as.data.frame(MONITOR_TOWNS)
+    points(tw$lon, tw$lat, pch = 21, bg = "white", col = COL_TOWN, cex = 1.0, lwd = 1.3)
+    minsep <- if (exists("LABEL_MIN_SEP_DEG")) LABEL_MIN_SEP_DEG else 0.9
+    keep <- declutter_labels(tw$lon, tw$lat, minsep)
+    lab <- tw[keep, , drop = FALSE]
+    # Push labels left near the eastern edge so they are not clipped.
+    pos <- ifelse(lab$lon > (ext[2] - 6), 2, 4)
+    text(lab$lon, lab$lat, lab$name, pos = pos, offset = 0.35,
+         cex = if (exists("LABEL_CEX")) LABEL_CEX else 0.5, col = COL_TOWN)
+    if (sum(!keep) > 0)
+      mtext(sprintf("%d town label(s) suppressed to avoid overprinting; all %d towns are plotted.",
+                    sum(!keep), nrow(tw)),
+            side = 1, line = 3.9, cex = 0.55, col = NSW_GREY_04)
   }
   par(op); dev.off()
   file.copy(png_file, file.path(OUT, sprintf("%s_latest.png", base)), overwrite = TRUE)
@@ -616,10 +748,12 @@ render_map <- function(pts, valcol, title, colours, hmax, legend, base) {
 }
 
 pm_epi[, intensity_pct := intensity * 100]
-render_map(pm_epi, "intensity_pct", "EPIRICE potential risk (%)", HEAT_COLOURS, HEAT_MAX,
-           "intensity %", "epirice_heatmap")
+render_map(pm_epi, "intensity_pct", "EPIRICE potential risk (%)", HEAT_COLOURS,
+           HEAT_MAX, HEAT_STRETCH, "intensity %", "epirice_heatmap",
+           obs_max = obs_max_epi, obs_fmt = "%.4f%%")
 render_map(pm, "events", sprintf("BLASTAM infection days (last %d)", BLASTAM_WINDOW_DAYS),
-           BLASTAM_HEAT_COLOURS, BLASTAM_HEAT_MAX, "days", "blastam_heatmap")
+           BLASTAM_HEAT_COLOURS, BLASTAM_HEAT_MAX, BLASTAM_STRETCH, "days",
+           "blastam_heatmap", obs_max = obs_max_bl, obs_fmt = "%.0f days")
 
 # ---- Save cache ------------------------------------------------------------
 csvdt <- copy(cache)
@@ -627,23 +761,19 @@ csvdt[, `:=`(TEMP = round(TEMP, 1), RHUM = round(RHUM, 0), RAIN = round(RAIN, 1)
              temp_wet = round(temp_wet, 1), wet_hours = round(wet_hours, 0),
              lon = round(lon, 4), lat = round(lat, 4))]
 
-# True if the file starts with the gzip magic bytes. fwrite() decides whether to
-# compress from the FILE EXTENSION, so a temp file named ".tmp" is written as
-# plain text and then renamed to ".gz". read_gz_dt() reads it back happily,
-# because gzfile() transparently handles uncompressed input, so the verify passes
-# and an 8x larger file is committed under a .gz name. Hence both the ".tmp.gz"
-# naming below and this explicit check.
+# fwrite() decides whether to compress from the FILE EXTENSION, so a temp file
+# named ".tmp" is written as plain text and then renamed to ".gz". gzfile()
+# reads it back happily, so the verify passes and an 8x larger file is committed
+# under a .gz name. Hence both the ".tmp.gz" naming and this explicit check.
 is_gzip <- function(f) {
   con <- file(f, "rb"); on.exit(close(con), add = TRUE)
   identical(as.integer(readBin(con, "raw", 2L)), c(31L, 139L))
 }
 
-# Write to a temp path, verify, then rename. A job cancelled mid write used to
-# leave a truncated cache that the next run had to detect and discard.
 write_cache <- function(dt) {
   tmp_gz <- paste0(gz_file, ".tmp.gz")     # extension must survive, see is_gzip()
   ok_gz <- tryCatch({
-    fwrite(dt, tmp_gz)
+    fwrite(dt, tmp_gz, na = "NA")
     if (!is_gzip(tmp_gz)) {
       cat("gz cache was NOT compressed (data.table built without zlib?); using plain CSV.\n")
       FALSE
@@ -652,7 +782,7 @@ write_cache <- function(dt) {
   if (ok_gz) {
     file.rename(tmp_gz, gz_file)
     if (WEATHER_CACHE_KEEP_CSV) {
-      tmp_csv <- paste0(csv_file, ".tmp.csv"); fwrite(dt, tmp_csv)
+      tmp_csv <- paste0(csv_file, ".tmp.csv"); fwrite(dt, tmp_csv, na = "NA")
       file.rename(tmp_csv, csv_file); fmt <- "gz+csv"
     } else {
       if (file.exists(csv_file)) file.remove(csv_file); fmt <- "gz"
@@ -661,7 +791,8 @@ write_cache <- function(dt) {
   }
   unlink(tmp_gz)
   cat("gz cache write/verify failed; falling back to plain CSV.\n")
-  tmp_csv <- paste0(csv_file, ".tmp.csv"); fwrite(dt, tmp_csv); file.rename(tmp_csv, csv_file)
+  tmp_csv <- paste0(csv_file, ".tmp.csv"); fwrite(dt, tmp_csv, na = "NA")
+  file.rename(tmp_csv, csv_file)
   if (file.exists(gz_file)) file.remove(gz_file)
   list(fmt = "csv", kb = file.info(csv_file)$size / 1024)
 }
@@ -671,28 +802,30 @@ cat(sprintf("Cache saved: %d points, %d rows as %s (%.0f KB)\n",
             length(unique(cache$pid)), nrow(cache), wc$fmt, wc$kb))
 
 # ---- Stats line for the email ----------------------------------------------
-# Field 3 is now the number MAPPED on the previous run, read back before this
-# run overwrites the file. It used to be the cache size at the start of this run,
-# which is a different quantity, so "up from N" compared unlike things.
+# Field 3 is the number MAPPED on the previous run, read back before this run
+# overwrites the file. Fields 11 and 12 are the observed maxima, so the email can
+# say whether a flat map is flat weather or a broken scale.
 stats_file <- file.path(OUT, "map_stats.txt")
 prev_mapped <- if (!file.exists(stats_file)) NA_integer_ else tryCatch({
   s <- strsplit(readLines(stats_file, warn = FALSE)[1], "\\|")[[1]]
   as.integer(s[1])
 }, error = function(e) NA_integer_, warning = function(w) NA_integer_)
 
-writeLines(sprintf("%d|%.2f|%d|%.2f|%s|%.0f|%s|%s|%s|%.0f",
+writeLines(sprintf("%d|%.2f|%d|%.2f|%s|%.0f|%s|%s|%s|%.0f|%s|%s",
                    nrow(pm), map_spacing,
                    if (is.na(prev_mapped)) 0L else prev_mapped,
                    GRID_RES_FINEST, wc$fmt, wc$kb, read_fmt,
                    format(model_end),
                    if (is.na(res_complete)) "" else sprintf("%.2f", res_complete),
-                   spent),
+                   spent,
+                   if (is.na(obs_max_epi)) "" else sprintf("%.4f", obs_max_epi),
+                   if (is.na(obs_max_bl))  "" else sprintf("%.0f", obs_max_bl)),
            stats_file)
 
 if (Sys.getenv("BLAST_MIDWEEK") == "1") {
   added <- length(unique(cache$pid)) - length(cached_pids)
   writeLines(sprintf("%s|%d|%d|%d|%s|%.0f",
-                     format(Sys.Date()), length(unique(cache$pid)),
+                     format(RUN_DATE), length(unique(cache$pid)),
                      length(cached_pids), added, wc$fmt, wc$kb),
              file.path(OUT, "midweek_status.txt"))
   cat(sprintf("Midweek fetch-only run: +%d points, cache now %d.\n",

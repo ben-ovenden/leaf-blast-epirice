@@ -38,6 +38,14 @@ suppressPackageStartupMessages({
 
 OPENMETEO_ARCHIVE_URL <- "https://archive-api.open-meteo.com/v1/archive"
 
+# Defined here rather than after om_request(), which uses it. R resolves the
+# symbol at call time so the old order worked, but only if the whole file was
+# sourced before the first call.
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# Defined here rather than after om_request(), which used it. R resolves the
+# symbol at call time so it worked, but only if the whole file was sourced.
+
 .cfg <- function(nm, default) if (exists(nm, inherits = TRUE)) get(nm, inherits = TRUE) else default
 
 # ---- weighted cost ---------------------------------------------------------
@@ -122,7 +130,6 @@ om_request <- function(lats, lons, start_date, end_date, timeout_s = 60) {
        body = parsed, msg = "")
 }
 
-`%||%` <- function(a, b) if (is.null(a)) b else a
 
 # ---- hourly JSON for one location -> hourly data.table ---------------------
 # Indexed BY POSITION, never by the returned latitude and longitude: Open-Meteo
@@ -150,7 +157,13 @@ om_request <- function(lats, lons, start_date, end_date, timeout_s = 60) {
   if (nrow(out) == 0L) return(NULL)
   # A location can be structurally valid but entirely empty. Treat that as no
   # data rather than a fetch failure, so it is not retried forever.
-  if (all(is.na(out$temp))) return(NULL)
+  #
+  # HUMIDITY IS CHECKED TOO. Only temperature used to be checked, so a response
+  # with temperature but a null relative_humidity_2m column passed through and
+  # BLASTAM scored every night as not favourable. On the map that is
+  # indistinguishable from genuinely dry weather. Rain may legitimately be all
+  # zero, so it is not tested for presence.
+  if (all(is.na(out$temp)) || all(is.na(out$rh))) return(NULL)
   out
 }
 
@@ -189,7 +202,7 @@ fetch_points_batched <- function(pts, start_date, end_date, on_point,
   w_loc  <- om_weight_per_location(n_days)
   pace   <- om_pacer(rate)
 
-  rows <- vector("list", ceiling(n / 1L))
+  rows <- vector("list", n)
   n_rows <- 0L
   spent <- 0; stopped <- ""
   ledger <- data.table(pid = pts$pid, status = NA_character_, code = NA_integer_)
@@ -222,7 +235,7 @@ fetch_points_batched <- function(pts, start_date, end_date, on_point,
       if (res$status == "ok") break
       if (res$status == "quota") break              # never retry into a spent quota
       if (attempt >= max_att) break
-      if (spent >= budget) break                    # retries must not overrun it
+      if (spent + w_batch > budget) break           # retries must not overrun it
       # Jittered exponential backoff, transport errors and 5xx only.
       Sys.sleep(min(30, 2^attempt) * runif(1, 0.5, 1.5))
       attempt <- attempt + 1L
@@ -287,4 +300,39 @@ fetch_points_batched <- function(pts, start_date, end_date, on_point,
               paste(sprintf("%s=%d", names(tally), tally), collapse = " ")))
   list(rows = rows, ledger = ledger[!is.na(status)], spent = spent,
        stopped = stopped, n_ok = n_ok)
+}
+
+################################################################################
+# Shared weighted-spend ledger
+#
+# DAILY_WEIGHTED_CAP was applied per RUN, not per day, and run_blast.R fetched
+# its 31 towns with budget = Inf on top of whatever the grid run had already
+# spent. The 2026-07-30 grid run reported 8,667 weighted calls against a 9,000
+# cap, and the town run then added roughly 150 more, unbudgeted.
+#
+# Both scripts now append their spend here, keyed on the UTC day the quota resets
+# on, and read it back before deciding their own budget.
+################################################################################
+om_spend_utc_day <- function() as.Date(format(Sys.time(), "%Y-%m-%d", tz = "UTC"))
+
+om_spend_read <- function(file, day = om_spend_utc_day()) {
+  if (!file.exists(file)) return(0)
+  d <- tryCatch(fread(file), error = function(e) NULL)
+  if (is.null(d) || !all(c("utc_day", "spent") %in% names(d))) return(0)
+  s <- suppressWarnings(sum(d[as.Date(utc_day) == as.Date(day), spent], na.rm = TRUE))
+  if (!is.finite(s)) 0 else s
+}
+
+om_spend_add <- function(file, spent, label, day = om_spend_utc_day()) {
+  row <- data.table(utc_day = format(as.Date(day)), stamp = format(Sys.time(), tz = "UTC"),
+                    label = label, spent = round(as.numeric(spent), 1))
+  old <- if (file.exists(file))
+    tryCatch(fread(file, colClasses = list(character = c("utc_day", "stamp", "label"))),
+             error = function(e) NULL) else NULL
+  d <- if (is.null(old) || !all(c("utc_day", "spent") %in% names(old))) row else
+    rbind(old, row, fill = TRUE)
+  # Keep a fortnight; the ledger only has to survive one quota window.
+  d <- d[as.Date(utc_day) >= (as.Date(day) - 14L)]
+  fwrite(d, file)
+  invisible(d)
 }

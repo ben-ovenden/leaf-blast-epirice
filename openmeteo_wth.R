@@ -12,14 +12,17 @@
 # The archive lags real time by roughly 5 days, which is why ARCHIVE_LAG_DAYS
 # exists. Docs: https://open-meteo.com/en/docs/historical-weather-api
 #
-# TIMEZONE. Everything here is UTC, deliberately and consistently. The previous
-# code used timezone=auto for daily aggregates and timezone=UTC for hourly, so
-# the two models were aggregated over different 24 hour windows. timezone=auto
-# is also wrong for a continental lattice: it returns different zones for
-# adjacent cells near state borders, making the daily aggregation window
-# discontinuous across the map. UTC has the incidental benefit that in eastern
-# Australia the "day" runs 10:00 to 10:00 local, keeping each night's dew period
-# inside a single day rather than splitting it at local midnight.
+# TIMEZONE. Requests are made in UTC, deliberately and consistently: timezone=auto
+# returns different zones for adjacent cells near state borders, which would make
+# the aggregation window discontinuous across the continental map.
+#
+# The UTC timestamps are then converted to LOCAL SOLAR time inside
+# blastam_daily_from_hourly(), which cuts the 24 hour model day at
+# BLASTAM_DAY_CUT_HOUR (10:00 local solar) so the nocturnal wet and rain period
+# stays inside one day. An earlier version of this note claimed the UTC day was
+# itself the mechanism keeping the dew period intact, which was true only for
+# eastern longitudes and stopped being true when schema 2 moved the aggregates
+# onto local midnight days. Do not read the raw UTC day as the model day.
 ################################################################################
 
 suppressPackageStartupMessages({
@@ -187,11 +190,19 @@ get_openmeteo_hourly <- function(lat, lon, start_date, end_date,
     error = function(e) NULL)
   if (is.null(resp) || is.null(resp$hourly) || is.null(resp$hourly$time)) return(NULL)
   h <- resp$hourly
-  gv <- function(x) if (is.null(x)) NA_real_ else suppressWarnings(as.numeric(x))
+  nh <- length(h$time)
+  # Length-safe. jsonlite may return a short vector if the response is ragged,
+  # and recycling a short column against the time axis mis-aligns every later
+  # value, which is corruption rather than a visible failure.
+  gv <- function(x) {
+    if (is.null(x)) return(rep(NA_real_, nh))
+    v <- suppressWarnings(as.numeric(x))
+    if (length(v) != nh) rep(NA_real_, nh) else v
+  }
   dt <- as.POSIXct(h$time, format = "%Y-%m-%dT%H:%M", tz = "UTC")
   out <- data.table(dt = dt, temp = gv(h$temperature_2m),
                     rh = gv(h$relative_humidity_2m), rain = gv(h$precipitation))
   out <- out[!is.na(dt)]
-  if (nrow(out) == 0L || all(is.na(out$temp))) return(NULL)
+  if (nrow(out) == 0L || all(is.na(out$temp)) || all(is.na(out$rh))) return(NULL)
   out
 }

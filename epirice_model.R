@@ -13,16 +13,33 @@
 #   epicrop package + leaf blast parameters: Adam H. Sparks (DPIRD, WA)
 #   SEIR framework: Zadoks (1971), doi:10.1094/Phyto-61-600
 #
-# The SEIR() and .fn_Rc() functions below are reproduced from the epicrop
-# source so the model runs without installing the package. predict_leaf_blast()
-# carries the exact leaf blast parameters. Please retain this attribution and
-# cite Savary et al. (2012) if you publish or distribute results. Check the
-# epicrop licence before redistributing the code itself.
+# The SEIR() and .fn_Rc() functions below are reproduced from the epicrop source
+# so the model runs without installing the package. Please retain this
+# attribution and cite Savary et al. (2012) if you publish or distribute
+# results. Check the epicrop licence before redistributing the code itself.
 #
-# Only change from the package: .calculate_audpc() is implemented here with the
-# standard trapezoidal definition (Madden, Hughes & van den Bosch 2007), since
-# it is an internal helper. It affects only the AUDPC output column, not the
-# disease dynamics.
+# TWO DELIBERATE DEPARTURES FROM THE PACKAGE
+#
+#  1. .calculate_audpc() uses the standard trapezoidal definition (Madden, Hughes
+#     & van den Bosch 2007). It is an internal helper and affects only the AUDPC
+#     output column, not the disease dynamics.
+#
+#  2. The RcT infection-optimum temperature is SELECTABLE, via EPIRICE_RCT_PEAK
+#     in blast_config.R, and defaults to the published 25 C rather than epicrop's
+#     20 C. See section 4b of blast_config.R for the reasoning and for the
+#     magnitude of the difference. Previously the README argued at length for the
+#     25 C peak while this file shipped the 20 C curve and carried a comment
+#     asserting 20 C, so the documented model and the running model disagreed by
+#     roughly a factor of two at northern Australian temperatures.
+#
+# NOTE ON THE SEIR BODY. It is reproduced from upstream, including three
+# constructs that look wrong but are load-bearing and match the package:
+#   * removed[d] is read on the line above the one that assigns it, so it reads
+#     the pre-allocated zero;
+#   * sum(infectious) sums the whole pre-allocated vector, giving the cumulative
+#     total of infectious increments;
+#   * removed_today reads `infday` carried over from the previous iteration.
+# Diff against epicrop before changing any of them.
 ################################################################################
 
 suppressPackageStartupMessages(library(data.table))
@@ -44,6 +61,26 @@ suppressPackageStartupMessages(library(data.table))
     yleft = 0,
     yright = 0
   )$y
+}
+
+# ---- Temperature response curves -------------------------------------------
+# Relative infection rate against daily mean air temperature.
+#
+#  peak 25: as published, Table 2 of Savary et al. 2012.
+#  peak 20: as implemented in epicrop, whose source asserts the table has a typo.
+EPIRICE_RCT_CURVES <- list(
+  `25` = cbind(c(10L, 15L, 20L, 25L, 30L, 35L, 40L, 45L),
+               c(0,   0.5, 0.6, 1.0, 0.6, 0.2, 0.05, 0)),
+  `20` = cbind(c(10L, 15L, 20L, 25L, 30L, 35L, 40L, 45L),
+               c(0,   0.5, 1.0, 0.6, 0.2, 0.05, 0.01, 0))
+)
+
+epirice_rct <- function(peak = if (exists("EPIRICE_RCT_PEAK", inherits = TRUE))
+                                EPIRICE_RCT_PEAK else 25L) {
+  key <- as.character(as.integer(peak))
+  if (!key %in% names(EPIRICE_RCT_CURVES))
+    stop("EPIRICE_RCT_PEAK must be 25 or 20, not ", peak, call. = FALSE)
+  EPIRICE_RCT_CURVES[[key]]
 }
 
 # ---- SEIR engine (reproduced from epicrop::SEIR) --------------------------
@@ -95,6 +132,15 @@ SEIR <-
     if (nrow(wth) > duration) {
       wth <-
         wth[YYYYMMDD %between% c(emergence, emergence + sum(duration, -1))]
+    }
+
+    # The daily loop indexes the weather BY POSITION, so a missing calendar day
+    # would shift every later day against crop age and be modelled silently.
+    # Both callers screen for this, but a direct caller may not.
+    if (nrow(wth) > 1L &&
+        any(as.integer(diff(sort(wth$YYYYMMDD))) != 1L)) {
+      stop(call. = FALSE,
+           "Weather series has gaps; SEIR indexes by position and cannot be trusted")
     }
 
     # Reference vectors
@@ -177,7 +223,7 @@ SEIR <-
       setDT(
         list(
           "simday" = simday,
-          "dates" = dates[1:d],
+          "dates" = dates[seq_len(duration)],
           "sites" = sites,
           "latent" = now_latent,
           "infectious" = now_infectious,
@@ -201,13 +247,22 @@ SEIR <-
     return(out[])
   }
 
-# ---- Leaf blast parameterisation (exact, from epicrop::predict_leaf_blast) --
-# Note: the optimum temperature is 20 C. Table 2 of Savary et al. 2012 shows a
-# typo of 25 C; the epicrop implementation uses the corrected 20 C, as below in
-# the RcT curve peak.
-# duration defaults to the published season length of 120 days. It is exposed
-# so an in-season weekly run can simulate only as far as today's weather.
-predict_leaf_blast <- function(wth, emergence, duration = 120L) {
+# ---- Leaf blast parameterisation (from epicrop::predict_leaf_blast) ---------
+# Published parameters, Savary et al. (2012) Table 2:
+#   onset 15 d, duration 120 d, rhlim 90%, rainlim 5 mm, H0 600, I0 1,
+#   RcOpt 1.14, p 5 d, i 20 d, a 1, Sx 30000, RRS 0.01, RRG 0.1.
+#
+# `duration` is exposed so an in-season weekly run can simulate only as far as
+# today's weather. The runners pass CROP_AGE_DAYS + 1 rows, which gives a final
+# crop age of CROP_AGE_DAYS.
+#
+# NOTE ON THE WETNESS GATE. RcW is switched on by a daily MEAN RH of 90% or a
+# daily rain SUM of 5 mm. A 24 hour mean of 90% needs an all-day saturated air
+# mass: a series with 95% nights and 58% afternoons averages about 75% and never
+# opens the RH branch. In practice this configuration is driven almost entirely
+# by the 5 mm rain branch, which is why BLASTAM_DAY_CUT_HOUR matters so much.
+predict_leaf_blast <- function(wth, emergence, duration = 120L,
+                               rct = epirice_rct()) {
   SEIR(
     wth = wth,
     emergence = emergence,
@@ -223,10 +278,7 @@ predict_leaf_blast <- function(wth, emergence, duration = 120L) {
       c(1, 1, 1, 0.9, 0.8, 0.7, 0.64, 0.59, 0.53, 0.43, 0.32, 0.22, 0.16,
         0.09, 0.03, 0.02, 0.02, 0.02, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01)
     ),
-    RcT = cbind(
-      c(10L, 15L, 20L, 25L, 30L, 35L, 40L, 45L),
-      c(0, 0.5, 1, 0.6, 0.2, 0.05, 0.01, 0)
-    ),
+    RcT = rct,
     RcOpt = 1.14,
     p = 5L,
     i = 20L,
