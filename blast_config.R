@@ -322,6 +322,24 @@ GRID_ADD_RESERVE_FRAC <- 0.2
 # GRID_WINDOW_COVERAGE of cells are included, at the cost of a staler window.
 GRID_WINDOW_MODE     <- "latest"
 GRID_WINDOW_COVERAGE <- 0.98
+
+# GRACEFUL DEGRADATION FOR "latest".
+#
+# "latest" pins the window to end_date and drops any cell that has not reached
+# it. That is right when the run refreshed normally, and catastrophic when it
+# could not: if nothing was refreshed, NO cell reaches end_date, nothing is
+# modelled, no map renders and the email step fails on a missing attachment. The
+# 2026-07-31 run hit exactly this after the weighted ledger correctly capped it
+# at 4 calls following an earlier run the same UTC day. The cache held 1,874
+# perfectly good points and the run produced nothing from them.
+#
+# So: use end_date only if at least this fraction of cached cells reach it.
+# Otherwise step back to the newest date that this fraction DO reach. The
+# same-date guarantee is preserved either way; only the date moves.
+GRID_WINDOW_MIN_COVERAGE <- 0.90
+# Warn loudly (do not cap) if the fallback lands more than this far back. A very
+# stale map that says so is more useful than no map, but it should be obvious.
+GRID_WINDOW_WARN_FALLBACK_DAYS <- 10L
 # Under "coverage" the common window ends earlier than end_date, so the EPIRICE
 # window STARTS earlier too, and the cache must already hold weather before the
 # current run's emergence date. New points are therefore fetched with this many

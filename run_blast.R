@@ -245,6 +245,8 @@ map_growth_line <- function() {
   fmt    <- fld(5); kb <- fld(6, as.numeric); rd <- fld(7); wend <- fld(8)
   cres   <- fld(9, as.numeric); spent <- fld(10, as.numeric)
   mx_epi <- fld(11, as.numeric); mx_bl <- fld(12, as.numeric)
+  wnote  <- if (length(s) >= 13 && nzchar(trimws(s[13]))) trimws(s[13]) else NA_character_
+  rendered <- if (length(s) >= 14) trimws(s[14]) else NA_character_
 
   chg <- if (is.na(prev) || prev <= 0) ""
          else if (now > prev) sprintf(" (up from %d mapped last run)", prev)
@@ -272,6 +274,28 @@ map_growth_line <- function() {
           now, finest, chg, cbit, wtxt, mbit, cache_bit, qbit)
 }
 mg <- map_growth_line()
+
+# Degraded-run banner. A run that could not refresh still models from cache and
+# still emails, but it must say so rather than quietly arriving with an older
+# window or without a map.
+map_warning <- function() {
+  f <- file.path(OUT, "map_stats.txt")
+  if (!file.exists(f)) return(NULL)
+  s <- tryCatch(strsplit(readLines(f, warn = FALSE)[1], "\\|")[[1]],
+                error = function(e) NULL)
+  if (length(s) < 13) return(NULL)
+  wnote <- if (nzchar(trimws(s[13]))) trimws(s[13]) else ""
+  rend  <- if (length(s) >= 14) trimws(s[14]) else ""
+  miss <- setdiff(c("epirice", "blastam"), strsplit(rend, "\\+")[[1]])
+  parts <- c(
+    if (nzchar(wnote)) paste0("The map ", wnote,
+      ". This happens when a run cannot refresh the grid, usually because the daily weather-API quota was already spent. The cells are real cached weather, all on one window, just an older one.") else NULL,
+    if (nzchar(rend) && length(miss) > 0) sprintf(
+      "The %s heatmap could not be rendered this run and is not attached.",
+      paste(miss, collapse = " and ")) else NULL)
+  if (length(parts) == 0) NULL else paste(parts, collapse = " ")
+}
+mwarn <- map_warning()
 
 midweek_line <- function() {
   f <- file.path(OUT, "midweek_status.txt")
@@ -372,6 +396,7 @@ summary_lines <- c(summary_lines, "",
   "",
   if (exists("CITATION")) CITATION else NULL,
   if (!is.null(mg) || !is.null(mw)) "" else NULL,
+  if (!is.null(mwarn)) paste0("NOTE:    ", mwarn) else NULL,
   if (!is.null(mg)) paste0("Map:     ", mg) else NULL,
   if (!is.null(mw)) paste0("Top-up:  ", mw) else NULL,
   "",
@@ -464,6 +489,10 @@ sprintf(paste0("<p style='margin:0 0 12px;'>Two models for %d monitoring towns, 
         "Both are weather-driven potentials, not field measurements.</p>"),
         nrow(results), format(data_end, "%d %b %Y"), format(end_date, "%d %b %Y"),
         CROP_AGE_DAYS, BLASTAM_WINDOW_DAYS),
+if (!is.null(mwarn)) sprintf(
+  paste0("<p style='margin:0 0 12px;padding:10px 12px;background:#FDEBD9;",
+         "border-left:4px solid %s;border-radius:3px;font-size:13px;'>",
+         "<b>Degraded run.</b> %s</p>"), COL_MODERATE, mwarn) else "",
 "<p style='margin:0 0 8px;'>",
 "<span style='font-size:12px;color:#6b7378;margin-right:8px;'>EPIRICE bands:</span>",
 pill("high", getn("high")), pill("moderate", getn("moderate")), pill("low", getn("low")),

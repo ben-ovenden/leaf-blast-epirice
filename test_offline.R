@@ -279,7 +279,51 @@ ok("both runners take the run date from blast_run_date()",
 ok("neither runner calls Sys.Date() directly",
    !grepl("Sys.Date()", gsrc, fixed = TRUE) && !grepl("Sys.Date()", tsrc, fixed = TRUE))
 
-cat("\n13. Grid lattice covers the requested extent\n")
+cat("\n13. A starved run still models from cache\n")
+# Regression: under GRID_WINDOW_MODE = "latest", model_end was pinned to
+# end_date unconditionally. The 2026-07-31 run was correctly capped at 4 weighted
+# calls by the shared ledger after an earlier run the same UTC day, so no cell
+# reached end_date, nothing was modelled, no map rendered and the email step
+# failed on a missing attachment, with 1,874 usable cached points in the repo.
+pick_window_end <- function(pt_end, cap_date, cover) {
+  if (nrow(pt_end) == 0L) return(cap_date)
+  mx <- sort(pt_end$mx, decreasing = TRUE)
+  need <- max(1L, ceiling(cover * length(mx)))
+  min(mx[need], cap_date)
+}
+{
+  ed <- as.Date("2026-07-24")
+  # every cached cell is one day behind, exactly the failing case
+  stale <- data.table(pid = sprintf("p%03d", 1:200), mx = ed - 1L)
+  reach <- sum(stale$mx >= ed) / nrow(stale)
+  ok("the failing case is detected", reach < GRID_WINDOW_MIN_COVERAGE,
+     sprintf("(%.0f%% reach end_date)", 100 * reach))
+  fb <- pick_window_end(stale, ed, GRID_WINDOW_MIN_COVERAGE)
+  ok("the window falls back one day", fb == ed - 1L, sprintf("(got %s)", format(fb)))
+  ok("and every cached cell then reaches it", sum(stale$mx >= fb) == nrow(stale))
+  # a healthy run must NOT fall back
+  fresh <- data.table(pid = sprintf("p%03d", 1:200), mx = ed)
+  ok("a healthy run keeps end_date",
+     sum(fresh$mx >= ed) / nrow(fresh) >= GRID_WINDOW_MIN_COVERAGE)
+  # a mixed cache: 95% current, 5% stale. Should keep end_date, not fall back.
+  mixed <- data.table(pid = sprintf("p%03d", 1:200),
+                      mx = c(rep(ed, 190), rep(ed - 3L, 10)))
+  ok("a mostly current cache keeps end_date",
+     sum(mixed$mx >= ed) / nrow(mixed) >= GRID_WINDOW_MIN_COVERAGE)
+  # empty cache must not error
+  ok("an empty cache does not error",
+     pick_window_end(data.table(pid=character(), mx=as.Date(character())), ed, 0.9) == ed)
+}
+# The heatmaps must be OPTIONAL attachments, so a degraded run still emails.
+esrc <- paste(readLines("send_email.py", warn = FALSE), collapse = "\n")
+opt_block <- sub(".*optional = \\[", "", esrc)
+opt_block <- sub("\\].*", "", opt_block)
+ok("heatmaps are optional attachments, not required",
+   grepl("heatmap", opt_block, fixed = TRUE))
+ok("trends CSVs are still required",
+   grepl("town_trends.csv", sub("\\].*", "", sub(".*required = \\[", "", esrc)), fixed = TRUE))
+
+cat("\n14. Grid lattice covers the requested extent\n")
 fin <- GRID_RES_FINEST
 lat_top <- GRID_EXTENT[3] + ceiling((GRID_EXTENT[4] - GRID_EXTENT[3]) / fin) * fin
 ok("the northernmost row is inside the lattice", lat_top >= GRID_EXTENT[4],
@@ -288,7 +332,7 @@ ok("the old seq() would have dropped it",
    max(seq(GRID_EXTENT[3], GRID_EXTENT[4], by = fin)) < GRID_EXTENT[4] ||
    isTRUE(all.equal((GRID_EXTENT[4] - GRID_EXTENT[3]) %% fin, 0)))
 
-cat("\n14. Overlay artefacts and label declutter (terra)\n")
+cat("\n15. Overlay artefacts and label declutter (terra)\n")
 if (!requireNamespace("terra", quietly = TRUE)) {
   cat("  SKIP  terra not installed\n")
 } else {

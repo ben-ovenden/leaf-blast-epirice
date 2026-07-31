@@ -478,13 +478,42 @@ pt_end <- if (nrow(cache) > 0) cache[, .(mx = max(date)), by = pid] else
   data.table(pid = character(), mx = as.Date(character()))
 n_cache_pts <- nrow(pt_end)
 wmode <- GRID_WINDOW_MODE
-if (identical(wmode, "latest")) {
+
+# The newest date that at least `cover` of the cached cells have reached, never
+# later than cap_date.
+pick_window_end <- function(pt_end, cap_date, cover) {
+  if (nrow(pt_end) == 0L) return(cap_date)
+  mx <- sort(pt_end$mx, decreasing = TRUE)
+  need <- max(1L, ceiling(cover * length(mx)))
+  min(mx[need], cap_date)
+}
+
+min_cov  <- if (exists("GRID_WINDOW_MIN_COVERAGE")) GRID_WINDOW_MIN_COVERAGE else 0.90
+reach_now <- if (n_cache_pts > 0L) sum(pt_end$mx >= end_date) / n_cache_pts else 1
+window_note <- ""
+
+if (identical(wmode, "latest") && reach_now >= min_cov) {
   model_end <- end_date
 } else {
-  cover <- GRID_WINDOW_COVERAGE
-  mx_sorted <- sort(pt_end$mx)
-  idx <- max(1L, ceiling((1 - cover) * length(mx_sorted)))
-  model_end <- min(mx_sorted[idx], end_date)
+  # FALLBACK. Under "latest" this fires only when the run could not refresh
+  # enough of the grid, which in practice means the weighted quota was already
+  # spent. The map is still ONE window across every cell, just an older one.
+  cover <- if (identical(wmode, "latest")) min_cov else GRID_WINDOW_COVERAGE
+  model_end <- pick_window_end(pt_end, end_date, cover)
+  if (identical(wmode, "latest") && model_end < end_date) {
+    behind <- as.integer(end_date - model_end)
+    window_note <- sprintf("window fell back %d %s to %s (only %.0f%% of cached cells reached %s)",
+                           behind, if (behind == 1L) "day" else "days",
+                           format(model_end), 100 * reach_now, format(end_date))
+    cat(sprintf("WINDOW FALLBACK: %s.\n", window_note))
+    cat("  This is the degraded-but-useful path: the run could not refresh the grid,\n")
+    cat("  usually because the daily weighted quota was already spent, so the map is\n")
+    cat("  built from cache at the newest date the cells actually share.\n")
+    warn_days <- if (exists("GRID_WINDOW_WARN_FALLBACK_DAYS")) GRID_WINDOW_WARN_FALLBACK_DAYS else 10L
+    if (behind > warn_days)
+      cat(sprintf("  WARNING: that is more than %d days behind the archive edge. Check the quota ledger and the failure ledger.\n",
+                  warn_days))
+  }
 }
 # EVERY MAPPED CELL SHARES THIS EMERGENCE DATE. It used to be the run's global
 # `emergence`, which equals model_end - CROP_AGE_DAYS only under "latest". Under
@@ -520,14 +549,16 @@ if (nrow(model_cache) > 0) {
 # SEIR indexes the weather vector by POSITION, so a missing day would shift every
 # later day by one and be modelled silently. Drop any point whose window is not a
 # continuous run of dates. (SEIR now also refuses a gappy series itself.)
-shape <- model_cache[, .(n = .N, span = as.integer(max(date) - min(date)) + 1L), by = pid]
+shape <- if (nrow(model_cache) > 0L)
+  model_cache[, .(n = .N, span = as.integer(max(date) - min(date)) + 1L), by = pid] else
+  data.table(pid = character(), n = integer(), span = integer())
 gappy <- shape[n != span, pid]
 if (length(gappy) > 0) {
   cat(sprintf("Dropping %d point(s) with gaps in the modelling window; they will be refetched.\n",
               length(gappy)))
   model_cache <- model_cache[!pid %in% gappy]
 }
-short <- shape[n == span & n < (CROP_AGE_DAYS + 1L), .N]
+short <- if (nrow(shape) > 0L) shape[n == span & n < (CROP_AGE_DAYS + 1L), .N] else 0L
 if (short > 0)
   cat(sprintf("%d point(s) have a short but continuous window; EPIRICE will report NA for them.\n", short))
 
@@ -656,7 +687,11 @@ legend_ticks <- function(hmax, s, n = 5L) {
 
 render_map <- function(pts, valcol, title, colours, hmax, stretch, legend, base,
                        obs_max = NA_real_, obs_fmt = "%.3f") {
-  if (nrow(pts) < 3) { cat("Too few points to render", base, "\n"); return(invisible()) }
+  if (nrow(pts) < 3) {
+    cat(sprintf("Too few points to render %s (%d with a value). No PNG this run.\n",
+                base, nrow(pts)))
+    return(FALSE)
+  }
   r0 <- terra::rast(xmin = ext[1], xmax = ext[2], ymin = ext[3], ymax = ext[4],
                     resolution = GRID_RES_FINEST / 2, crs = "EPSG:4326")
   v <- terra::vect(as.matrix(pts[, .(lon, lat)]), type = "points", crs = "EPSG:4326")
@@ -745,13 +780,14 @@ render_map <- function(pts, valcol, title, colours, hmax, stretch, legend, base,
   par(op); dev.off()
   file.copy(png_file, file.path(OUT, sprintf("%s_latest.png", base)), overwrite = TRUE)
   cat("Heatmap:", png_file, "\n")
+  TRUE
 }
 
 pm_epi[, intensity_pct := intensity * 100]
-render_map(pm_epi, "intensity_pct", "EPIRICE potential risk (%)", HEAT_COLOURS,
+rendered_epi <- render_map(pm_epi, "intensity_pct", "EPIRICE potential risk (%)", HEAT_COLOURS,
            HEAT_MAX, HEAT_STRETCH, "intensity %", "epirice_heatmap",
            obs_max = obs_max_epi, obs_fmt = "%.4f%%")
-render_map(pm, "events", sprintf("BLASTAM infection days (last %d)", BLASTAM_WINDOW_DAYS),
+rendered_bl <- render_map(pm, "events", sprintf("BLASTAM infection days (last %d)", BLASTAM_WINDOW_DAYS),
            BLASTAM_HEAT_COLOURS, BLASTAM_HEAT_MAX, BLASTAM_STRETCH, "days",
            "blastam_heatmap", obs_max = obs_max_bl, obs_fmt = "%.0f days")
 
@@ -811,7 +847,12 @@ prev_mapped <- if (!file.exists(stats_file)) NA_integer_ else tryCatch({
   as.integer(s[1])
 }, error = function(e) NA_integer_, warning = function(w) NA_integer_)
 
-writeLines(sprintf("%d|%.2f|%d|%.2f|%s|%.0f|%s|%s|%s|%.0f|%s|%s",
+# Fields 13 and 14 tell run_blast.R whether the window fell back and which maps
+# actually rendered, so a degraded run explains itself in the email instead of
+# silently arriving without attachments.
+rendered <- paste(c(if (isTRUE(rendered_epi)) "epirice", if (isTRUE(rendered_bl)) "blastam"),
+                  collapse = "+")
+writeLines(sprintf("%d|%.2f|%d|%.2f|%s|%.0f|%s|%s|%s|%.0f|%s|%s|%s|%s",
                    nrow(pm), map_spacing,
                    if (is.na(prev_mapped)) 0L else prev_mapped,
                    GRID_RES_FINEST, wc$fmt, wc$kb, read_fmt,
@@ -819,7 +860,9 @@ writeLines(sprintf("%d|%.2f|%d|%.2f|%s|%.0f|%s|%s|%s|%.0f|%s|%s",
                    if (is.na(res_complete)) "" else sprintf("%.2f", res_complete),
                    spent,
                    if (is.na(obs_max_epi)) "" else sprintf("%.4f", obs_max_epi),
-                   if (is.na(obs_max_bl))  "" else sprintf("%.0f", obs_max_bl)),
+                   if (is.na(obs_max_bl))  "" else sprintf("%.0f", obs_max_bl),
+                   gsub("[|\n]", " ", window_note),
+                   rendered),
            stats_file)
 
 if (Sys.getenv("BLAST_MIDWEEK") == "1") {

@@ -72,7 +72,7 @@ requires in canopy loggers deployed alongside ERA5 driven model runs.
 | `run_blast.R` | Town table runner: fetch, model, write CSV, HTML and text summary |
 | `run_blast_grid.R` | Continental heatmap runner: fill the cache, model, render maps |
 | `send_email.py` | Python stdlib email sender |
-| `test_offline.R` | Offline regression tests: 54 tests, no network, runs in seconds, in CI |
+| `test_offline.R` | Offline regression tests: 62 tests, no network, runs in seconds, in CI |
 | `australia_land.geojson` | Land polygon for masking ocean and clipping the map |
 | `australia_rivers.geojson` | River overlay |
 | `australia_roads.geojson` | Road overlay |
@@ -122,7 +122,7 @@ Set `BLAST_RUN_DATE=YYYY-MM-DD` to pin the run date; otherwise today is used.
 Required packages: `data.table`, `jsonlite`, `curl`, `terra`. The workflow uses
 the `rocker/geospatial` container.
 
-All 54 offline tests must pass before a run is meaningful. Each test guards a bug
+All 62 offline tests must pass before a run is meaningful. Each test guards a bug
 that was actually shipped.
 
 ---
@@ -302,8 +302,22 @@ resolution level, so any partial run is a spatially uniform sample of the
 continent rather than a south to north front.
 
 `GRID_WINDOW_MODE = "latest"` (default) ends every cell at the archive edge on
-the same date. `"coverage"` pulls the window back so nearly all cells are
-included; it now works, and new points are fetched with
+the same date, **provided at least `GRID_WINDOW_MIN_COVERAGE` (90%) of cached
+cells have reached it**. If they have not, the window steps back to the newest
+date that 90% do reach, and the email carries a "Degraded run" banner saying by
+how much and why. The same-date guarantee is preserved either way; only the date
+moves.
+
+That fallback exists because the strict form fails badly. A run that cannot
+refresh the grid, typically because the shared weighted ledger has correctly
+capped it after an earlier run the same UTC day, leaves no cell at `end_date`.
+Before the fallback, that meant nothing modelled, no map rendered and the email
+step failing on a missing attachment, with a cache full of perfectly good points
+sitting in the repository. The heatmaps are now **optional** email attachments
+for the same reason: the run that most needs explaining should not be the one
+that goes unreported.
+
+`"coverage"` pulls the window back so nearly all cells are included; it now works, and new points are fetched with
 `GRID_WINDOW_MAX_LAG_DAYS` of extra lookback so the earlier window start is
 actually in the cache. Previously that mode handed SEIR the run's global
 emergence date while truncating the weather to an earlier `model_end`, so the
@@ -596,7 +610,7 @@ by default, so the delivered maps still include them.
 The Monday workflow runs:
 
 1. **Resolve run date**, pinned once and exported as `BLAST_RUN_DATE`.
-2. **Offline tests**, `Rscript test_offline.R`. 54 tests, no network. terra is
+2. **Offline tests**, `Rscript test_offline.R`. 62 tests, no network. terra is
    attached inside the suite on purpose, because `terra::shift` masks
    `data.table::shift` and that masking once turned every grid point into a
    silent "empty" and produced a blank map with no error in the log.

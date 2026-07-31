@@ -95,16 +95,26 @@ def main():
     with open(html_path, encoding="utf-8") as f:
         msg.add_alternative(f.read(), subtype="html")
 
+    # The town table and the trends are the core product and must be present.
     required = [
-        os.path.join(OUT, f"epirice_heatmap_{run_date}.png"),
-        os.path.join(OUT, f"blastam_heatmap_{run_date}.png"),
         os.path.join(OUT, "town_trends.csv"),
         os.path.join(OUT, "blastam_trends.csv"),
     ]
+    # The heatmaps are OPTIONAL, deliberately. A run that could not refresh the
+    # grid, typically because the daily weather-API quota was already spent, may
+    # legitimately have too few current cells to render. Failing the whole email
+    # on a missing PNG means the one run that most needs explaining is the one
+    # nobody hears about: the 2026-07-31 run died here with 1,874 usable cached
+    # points sitting in the repository. The R side writes a "Degraded run"
+    # banner into the body naming exactly what is missing and why.
+    #
     # run_log.csv records the schema version and model parameters behind each
-    # trends column, so a change of method is not read as a change in the
-    # weather. Optional: an older cache will not have one yet.
-    optional = [os.path.join(OUT, "run_log.csv")]
+    # trends column. Optional: an older cache will not have one yet.
+    optional = [
+        os.path.join(OUT, f"epirice_heatmap_{run_date}.png"),
+        os.path.join(OUT, f"blastam_heatmap_{run_date}.png"),
+        os.path.join(OUT, "run_log.csv"),
+    ]
 
     n = 0
     for p in required:
@@ -112,10 +122,16 @@ def main():
             sys.exit(f"::error::attachment missing or empty: {p} (run date {run_date})")
         attach(msg, p)
         n += 1
+    skipped = []
     for p in optional:
         if os.path.exists(p) and os.path.getsize(p) > 0:
             attach(msg, p)
             n += 1
+        else:
+            skipped.append(os.path.basename(p))
+    if skipped:
+        # A warning, not an error: the email still goes out and explains itself.
+        print(f"::warning::not attached (absent or empty): {', '.join(skipped)}")
 
     context = ssl.create_default_context()
     with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=60) as server:
@@ -123,7 +139,8 @@ def main():
         server.send_message(msg)
 
     print(f"Email sent to {', '.join(recipients)} with {n} attachments "
-          f"(run date {run_date}, weather to {window_end or 'unknown'}).")
+          f"(run date {run_date}, weather to {window_end or 'unknown'})."
+          + (f" Skipped: {', '.join(skipped)}." if skipped else ""))
 
 
 if __name__ == "__main__":
