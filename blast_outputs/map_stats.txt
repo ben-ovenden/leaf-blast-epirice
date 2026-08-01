@@ -1,1 +1,1 @@
-3381|0.45|3381|0.30|gz|1586|gz|2026-07-24|0.60|32|0.1261|7|window fell back 1 day to 2026-07-24 (only 0% of cached cells reached 2026-07-25)|epirice+blastam
+4445|0.40|3381|0.30|gz|2106|gz|2026-07-25|0.60|8549|0.1107|7||epirice+blastam
