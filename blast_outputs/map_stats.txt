@@ -1,1 +1,1 @@
-7721|0.30|7616|0.30|gz|5104|gz|2026-08-23|0.30|8126|0.0411|12|window fell back 1 day to 2026-08-23 (only 89% of cached cells reached 2026-08-24)|epirice+blastam
+7721|0.30|7721|0.30|gz|5383|gz|2026-08-28|0.30|7721|0.0547|11|window fell back 1 day to 2026-08-28 (only 89% of cached cells reached 2026-08-29)|epirice+blastam
