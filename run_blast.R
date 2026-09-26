@@ -28,6 +28,14 @@
 #     column shows a dash rather than "+0.00" for no change; unjudged nights are
 #     surfaced; bands use the NSW Government palette; trends columns are keyed on
 #     the DATA end date and blanks are written as NA.
+#
+# CHANGES AFTER THE SEPTEMBER 2026 OUTAGE
+#   * data_end comes from blast_data_end(), so the town table and the maps agree
+#     on a window the archive actually holds (see blast_config.R section 2).
+#   * An hourly HTTP 429 is waited out, for at most TOWN_QUOTA_WAIT_MAX_MIN, rather
+#     than producing 31 towns of "no data" as on 2026-09-07. After a 429 that
+#     could not be waited out, the serial fallback is skipped: it is unpaced and
+#     unbudgeted, and it would only be refused too.
 ################################################################################
 
 SCRIPT_DIR <- tryCatch(
@@ -45,7 +53,8 @@ suppressPackageStartupMessages({library(data.table); library(methods)})
 
 # ---- One run date, one window ----------------------------------------------
 RUN_DATE  <- blast_run_date()
-data_end  <- RUN_DATE - ARCHIVE_LAG_DAYS      # last day FETCHED
+data_end  <- blast_data_end(RUN_DATE)         # last day FETCHED; lag counted from
+                                              # the UTC date when that is earlier
 end_date  <- data_end - DAY_CUT_LAG_DAYS      # last day MODELLED
 emergence <- end_date - CROP_AGE_DAYS
 run_tag   <- format(RUN_DATE, "%Y-%m-%d")
@@ -146,9 +155,9 @@ blastam_check_fetch_arithmetic()
 sites <- as.data.table(MONITOR_TOWNS)
 sites[, pid := sprintf("%s", name)]
 
-cat("Run date:   ", format(RUN_DATE, "%A %d %B %Y"), "\n")
+cat("Run date:   ", format(RUN_DATE, "%A %d %B %Y"), " (UTC date ", format(blast_utc_date()), ")\n", sep = "")
 cat("Fetched to: ", format(data_end, "%Y-%m-%d"), " (archive lag ", ARCHIVE_LAG_DAYS,
-    " days)\n", sep = "")
+    " days from the earlier of the two dates)\n", sep = "")
 cat("Modelled to:", format(end_date, "%Y-%m-%d"), " (model day cut at ",
     BLASTAM_DAY_CUT_HOUR, ":00 local solar, so the last fetched day is partial)\n", sep = "")
 cat("Crop age:   ", CROP_AGE_DAYS, " days (rolling emergence ",
@@ -175,13 +184,22 @@ on_town <- function(pid, lon, lat, hw) {
   assign(pid, as.data.table(w), envir = town_daily)
   data.table(pid = pid)          # non-empty return marks the point as ok
 }
+# The town run has no fetch deadline of its own, so its 429 waiting is bounded by
+# TOWN_QUOTA_WAIT_MAX_MIN; the workflow's timeout-minutes allows for it.
 fr <- fetch_points_batched(sites[, .(pid, lon, lat)], fetch_from, data_end,
-                           on_point = on_town, budget = town_budget, label = "towns")
+                           on_point = on_town, budget = town_budget, label = "towns",
+                           quota_wait_max_s = TOWN_QUOTA_WAIT_MAX_MIN * 60)
 om_spend_add(ledger_path, fr$spent, "towns")
 
 # Serial fallback for towns the batch did not deliver, on a clean connection.
+# Not after a 429 that could not be waited out: the serial path is unpaced and
+# unbudgeted, so it would hammer a ceiling the batch fetch has just hit and its
+# spend would not reach the ledger.
 missing <- setdiff(sites$pid, ls(town_daily))
-if (length(missing) > 0 && fr$spent < town_budget) {
+if (length(missing) > 0 && identical(fr$stopped, "quota"))
+  cat(sprintf("Serial fallback skipped for %d town(s): the API quota ceiling was hit and could not be waited out.\n",
+              length(missing)))
+if (length(missing) > 0 && fr$spent < town_budget && !identical(fr$stopped, "quota")) {
   cat(sprintf("Serial fallback for %d town(s): %s\n",
               length(missing), paste(missing, collapse = ", ")))
   for (nm in missing) {

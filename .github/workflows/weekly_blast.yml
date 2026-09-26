@@ -53,9 +53,10 @@ jobs:
     needs: gate
     if: needs.gate.outputs.run == 'yes'
     runs-on: ubuntu-latest
-    # Must exceed GRID_MAX_MINUTES (200) plus GRID_RESERVE_MINUTES (25), so the
-    # script's own graceful stop fires first and the run still saves and commits.
-    timeout-minutes: 240
+    # Must exceed GRID_MAX_MINUTES (200) plus GRID_RESERVE_MINUTES (25) plus the
+    # town run's TOWN_QUOTA_WAIT_MAX_MIN (10) with room to commit and email, so
+    # the scripts' own graceful stops fire first and the run still saves.
+    timeout-minutes: 255
     env:
       MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
     # rocker/geospatial ships R with terra, sf and a matching GDAL already built.
@@ -73,13 +74,23 @@ jobs:
       # and its run_tag from a second Sys.Date() after it, then the town script
       # started on the far side of local midnight and took a third. Pinning the
       # date here and exporting it makes all three impossible.
+      #
+      # The UTC date is pinned alongside it. The archive's availability follows
+      # the UTC clock, and this job fires at ~22:30 UTC on SUNDAY: "Sydney Monday
+      # minus 6" was only five days behind the archive and that day was not there
+      # yet, so every cell west of 120 E landed a day short on every scheduled
+      # run. blast_data_end() counts the lag from the earlier of the two dates.
+      # Pinned here for the same reason as the run date: the grid run crosses
+      # 00:00 UTC and the town script must see the same date the grid script did.
       - name: Resolve run date
         run: |
           RD="${{ github.event.inputs.run_date }}"
           [ -z "$RD" ] && RD=$(TZ=Australia/Sydney date +%F)
+          UD=$(date -u +%F)
           echo "BLAST_RUN_DATE=$RD" >> "$GITHUB_ENV"
           echo "RUN_DATE=$RD" >> "$GITHUB_ENV"
-          echo "Run date pinned to $RD (Australia/Sydney)"
+          echo "BLAST_UTC_DATE=$UD" >> "$GITHUB_ENV"
+          echo "Run date pinned to $RD (Australia/Sydney); UTC date $UD"
 
       - name: Install extra R packages
         run: |
