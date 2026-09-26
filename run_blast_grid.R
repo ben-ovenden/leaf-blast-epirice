@@ -36,6 +36,19 @@
 #   * The target lattice extent is rounded out to a whole number of cells, so the
 #     northernmost row is no longer dropped by seq(-44, -10, by = 0.3).
 #
+# CHANGES AFTER THE SEPTEMBER 2026 OUTAGE (three weeks of the same 29 Aug map)
+#   * data_end comes from blast_data_end(), which counts the archive lag from
+#     the UTC date when that is earlier than the Sydney run date. The Monday job
+#     fires on Sunday UTC, so the old "run date minus 6" asked for a day the
+#     archive did not have yet, and every cell west of 120 E landed a day short.
+#   * Cohort refresh (om_plan_refresh): each cached cell is fetched from the day
+#     after its newest row, so a cell 16 days behind costs 1.64 weighted rather
+#     than a 4.86 full-window refetch. One interrupted run no longer takes three
+#     weeks to recover from.
+#   * One token bucket for the whole run, shared across every cohort call.
+#   * An hourly 429 is waited out inside fetch_points_batched() rather than
+#     ending the run; see openmeteo_batch.R.
+#
 # The test hook is GRID_ON_POINT(pid, lon, lat, hourly_dt) -> cache rows.
 ################################################################################
 
@@ -163,12 +176,16 @@ LEVEL_RES <- c(GRID_RES_LEVELS, GRID_RES_FINEST)[seq_len(max(targets$lvl))]
 # BLASTAM_DAY_CUT_HOUR local solar, so the final fetched day is only partly
 # covered and by an amount that depends on longitude. Dropping it makes the
 # window identical at every longitude by construction.
-data_end  <- RUN_DATE - ARCHIVE_LAG_DAYS
+#
+# data_end counts ARCHIVE_LAG_DAYS from the UTC date when that is earlier than
+# the run date (blast_data_end); see blast_config.R section 2 for the 120 E
+# failure this prevents.
+data_end  <- blast_data_end(RUN_DATE)
 end_date  <- data_end - DAY_CUT_LAG_DAYS
 emergence <- end_date - CROP_AGE_DAYS
 win_dates <- seq(emergence, end_date, by = "day")
-cat(sprintf("Run %s. Fetch to %s, model %s to %s (%d days); target %d land points at %.2f deg\n",
-            run_tag, data_end, emergence, end_date, length(win_dates),
+cat(sprintf("Run %s (UTC date %s). Fetch to %s, model %s to %s (%d days); target %d land points at %.2f deg\n",
+            run_tag, format(blast_utc_date()), data_end, emergence, end_date, length(win_dates),
             nrow(targets), GRID_RES_FINEST))
 
 # ---- Load cache ------------------------------------------------------------
@@ -290,12 +307,6 @@ add_fetch_from  <- add_keep_from - lead
 n_days_add <- as.integer(data_end - add_fetch_from) + 1L
 cost_new   <- om_weight_per_location(n_days_add, length(OM_HOURLY_VARS))
 
-tail_start      <- max(emergence, end_date - (REFRESH_TAIL_DAYS - 1L))
-ref_keep_from   <- tail_start
-ref_fetch_from  <- tail_start - lead
-cost_ref   <- om_weight_per_location(as.integer(data_end - ref_fetch_from) + 1L,
-                                     length(OM_HOURLY_VARS))
-
 cached_pids <- unique(cache$pid)
 last_by <- if (nrow(cache) > 0) cache[, .(last = max(date)), by = pid] else
   data.table(pid = character(), last = as.Date(character()))
@@ -312,56 +323,63 @@ if (already > 0)
   cat(sprintf("Weighted ledger: %.0f already spent today, so this run is capped at %.0f.\n",
               already, wt_cap))
 
-eligible <- last_by[last < end_date & last <= (end_date - stale_days)][order(last)]
-
 # Hold back a slice of the weighted budget so the retry pass has something to
-# spend. plan_cap is used for planning AND is now handed to the fetch, so a
-# charged retry cannot silently eat the reserve: the 2026-07-30 run reported
-# 8,667 weighted spent against a planned 8,550 for exactly that reason.
+# spend. plan_cap is used for planning AND is handed to the fetch, so a charged
+# retry cannot silently eat the reserve: the 2026-07-30 run reported 8,667
+# weighted spent against a planned 8,550 for exactly that reason.
 retry_wfrac <- if (exists("GRID_RETRY_WEIGHT_FRAC")) GRID_RETRY_WEIGHT_FRAC else 0.05
 plan_cap <- wt_cap * (1 - retry_wfrac)
 
-# A short tail can only close a gap it actually spans, so a point whose last row
-# predates ref_keep_from - 1 is refetched over the FULL window instead.
-tail_ok   <- eligible[last >= (ref_keep_from - 1L)]
-tail_late <- eligible[last <  (ref_keep_from - 1L)]
-
-# THE REFRESH PHASE IS NOW BUDGETED. It used to be min(nrow(tail_ok), max_fetch)
-# with no weighted check, unlike the add and refetch phases. At cost_ref = 1.00
-# and max_fetch = 8500 that fitted inside plan_cap by 50 calls; raise the tail so
-# cost_ref becomes 1.07 and the planner would schedule a refresh it cannot pay
-# for, the fetch would stop on "budget" partway through, and nothing would be
-# added for the rest of the run.
-n_refresh <- max(0L, min(nrow(tail_ok), max_fetch, floor(plan_cap / cost_ref)))
-if (n_refresh < nrow(tail_ok))
-  cat(sprintf("Refresh limited to %d of %d eligible points by the %s.\n",
-              n_refresh, nrow(tail_ok),
-              if (max_fetch <= floor(plan_cap / cost_ref)) "fetch count cap"
-              else "weighted budget"))
-maintain  <- targets[pid %in% tail_ok$pid[seq_len(n_refresh)]]
-maintain_cost <- nrow(maintain) * cost_ref
-
-n_restale <- max(0L, min(nrow(tail_late),
-                         max_fetch - nrow(maintain),
-                         floor(max(0, plan_cap - maintain_cost) / cost_new)))
-restale <- if (n_restale > 0) targets[pid %in% tail_late$pid[seq_len(n_restale)]] else targets[0]
-restale_cost <- nrow(restale) * cost_new
+# COHORT REFRESH. Every cached cell that has not reached end_date is fetched from
+# the day after its newest cached row, so it pays for the days it is missing and
+# no more: 7 days is the 14 day floor (1.00), 8 days 1.07, 22 days 2.07, and a
+# cell so far behind that its window starts at add_keep_from costs the same as a
+# new one. Cheapest first, because the coverage rule counts cells.
+#
+# It used to be a FIXED 7 day tail for cells within a week of end_date and a
+# full crop-window refetch at ~4.86 for anything older. One interrupted run left
+# 42% of the grid older than a week, and at 4.86 each the weekly budget recovered
+# about 800 of them per run: three weeks on the same 29 August map.
+plan <- om_plan_refresh(last_by, end_date, data_end, add_keep_from,
+                        lead = lead, n_vars = length(OM_HOURLY_VARS),
+                        stale_days = stale_days, budget = plan_cap, max_n = max_fetch)
+taken <- plan[take == TRUE]
+left  <- plan[take == FALSE]
+refresh_cost <- sum(taken$cost)
+# One fetch call per distinct window. keep_from fixes fetch_from, n_days and the
+# cost, so grouping on it also merges cells whose windows happen to coincide.
+cohorts <- if (nrow(taken) > 0L) {
+  taken[, .(n = .N, fetch_from = fetch_from[1], n_days = n_days[1], cost = cost[1],
+            behind = if (min(missing) == max(missing)) sprintf("%d", min(missing))
+                     else sprintf("%d-%d", min(missing), max(missing)),
+            total = sum(cost)),
+        by = keep_from][order(cost, -keep_from)]
+} else {
+  data.table(keep_from = as.Date(character()), n = integer(),
+             fetch_from = as.Date(character()), n_days = integer(), cost = numeric(),
+             behind = character(), total = numeric())
+}
 
 to_add <- targets[!pid %in% cached_pids & !pid %in% benched]
 n_add <- max(0L, min(nrow(to_add),
-                     max_fetch - nrow(maintain) - nrow(restale),
-                     floor(max(0, plan_cap - maintain_cost - restale_cost) / cost_new)))
+                     max_fetch - nrow(taken),
+                     floor(max(0, plan_cap - refresh_cost) / cost_new)))
 add <- if (n_add > 0) to_add[seq_len(n_add)] else to_add[0]
 
-skipped_fresh <- length(cached_pids) - nrow(eligible)
-cat(sprintf("Cache: %d points (%d fresh, skipped). Refresh %d @ %.2f, refetch %d stale @ %.2f, add %d new @ %.2f (%d/%d fetches, ~%.0f of %.0f weighted)\n",
-            length(cached_pids), skipped_fresh, nrow(maintain), cost_ref,
-            nrow(restale), cost_new, nrow(add), cost_new,
-            nrow(maintain) + nrow(restale) + nrow(add), max_fetch,
-            maintain_cost + restale_cost + nrow(add) * cost_new, wt_cap))
-if (nrow(tail_late) > nrow(restale))
-  cat(sprintf("  %d point(s) fell behind the %d day tail and are queued for a full refetch on a later run.\n",
-              nrow(tail_late) - nrow(restale), REFRESH_TAIL_DAYS))
+skipped_fresh <- length(cached_pids) - nrow(plan)
+cat(sprintf("Cache: %d points (%d already at %s). Refresh %d in %d cohort(s) (~%.0f weighted), add %d new @ %.2f (~%.0f); %d/%d fetches, ~%.0f of %.0f weighted planned.\n",
+            length(cached_pids), skipped_fresh, format(end_date),
+            nrow(taken), nrow(cohorts), refresh_cost,
+            nrow(add), cost_new, nrow(add) * cost_new,
+            nrow(taken) + nrow(add), max_fetch,
+            refresh_cost + nrow(add) * cost_new, wt_cap))
+for (k in seq_len(nrow(cohorts)))
+  cat(sprintf("  cohort %d: %5d cell(s) %s day(s) behind; fetch %s to %s (%d days) @ %.2f = %.0f weighted\n",
+              k, cohorts$n[k], cohorts$behind[k], format(cohorts$fetch_from[k]),
+              format(data_end), cohorts$n_days[k], cohorts$cost[k], cohorts$total[k]))
+if (nrow(left) > 0L)
+  cat(sprintf("  %d cached cell(s) (%d to %d days behind, ~%.0f weighted at today's prices) do not fit this run's budget and wait for the next one; each costs %.2f more per week it waits.\n",
+              nrow(left), min(left$missing), max(left$missing), sum(left$cost), 7 / 14))
 
 # ---- Deadlines -------------------------------------------------------------
 reserve_min   <- GRID_RESERVE_MINUTES
@@ -391,6 +409,9 @@ new_rows <- list()
 all_ledger <- list()
 spent <- 0
 quota_hit <- FALSE
+# ONE token bucket for the whole run. Each cohort is a separate call, and a
+# private pacer per call would open each one with a full bucket's burst.
+PACER <- om_pacer(GRID_TARGET_PER_MIN)
 
 run_phase <- function(tab, fetch_from, keep_from, deadline, label, cap) {
   if (nrow(tab) == 0L || isTRUE(quota_hit)) return(invisible())
@@ -398,7 +419,7 @@ run_phase <- function(tab, fetch_from, keep_from, deadline, label, cap) {
                             on_point = make_on_point(keep_from, end_date),
                             deadline = deadline,
                             budget = max(0, cap - spent),
-                            label = label)
+                            label = label, pacer = PACER)
   if (length(r$rows) > 0) new_rows <<- c(new_rows, r$rows)
   if (nrow(r$ledger) > 0) all_ledger[[length(all_ledger) + 1L]] <<- r$ledger
   spent <<- spent + r$spent
@@ -406,10 +427,16 @@ run_phase <- function(tab, fetch_from, keep_from, deadline, label, cap) {
   invisible()
 }
 
-# Refresh first: under "latest" window mode a stale cell drops off the map.
-run_phase(maintain, ref_fetch_from, ref_keep_from, refresh_deadline, "refresh", plan_cap)
-run_phase(restale,  add_fetch_from, add_keep_from, refresh_deadline, "refetch", plan_cap)
-run_phase(add,      add_fetch_from, add_keep_from, add_deadline,     "add",     plan_cap)
+# Refresh first, cheapest cohort first: under "latest" window mode a stale cell
+# drops off the map, and the cheapest cohorts buy the most coverage.
+cohort_pids  <- function(k, pool) pool[keep_from == cohorts$keep_from[k], pid]
+cohort_label <- function(k, suffix = "")
+  sprintf("refresh[%s d behind @%.2f]%s", cohorts$behind[k], cohorts$cost[k], suffix)
+for (k in seq_len(nrow(cohorts)))
+  run_phase(targets[pid %in% cohort_pids(k, taken)],
+            cohorts$fetch_from[k], cohorts$keep_from[k], refresh_deadline,
+            cohort_label(k), plan_cap)
+run_phase(add, add_fetch_from, add_keep_from, add_deadline, "add", plan_cap)
 
 # ---- Retry -----------------------------------------------------------------
 # Only points that were ATTEMPTED and failed with a transport or HTTP error.
@@ -425,11 +452,15 @@ if (length(retryable) > 0 && !quota_hit && ok_frac < retry_min_ok) {
   cat(sprintf("Skipping the retry pass: only %.0f%% of %d attempted points succeeded, which looks like a systemic failure rather than transient flakiness.\n",
               100 * ok_frac, attempted))
 } else if (length(retryable) > 0 && !quota_hit) {
-  rt_ref <- maintain[pid %in% retryable]
-  rt_add <- rbind(restale[pid %in% retryable], add[pid %in% retryable])
-  cat(sprintf("Retrying %d refresh and %d add/refetch point(s) that failed with a transport or HTTP error.\n",
+  rt_ref <- taken[pid %in% retryable]
+  rt_add <- add[pid %in% retryable]
+  cat(sprintf("Retrying %d refresh and %d add point(s) that failed with a transport or HTTP error.\n",
               nrow(rt_ref), nrow(rt_add)))
-  run_phase(rt_ref, ref_fetch_from, ref_keep_from, fetch_deadline, "refresh-retry", wt_cap)
+  # Each cohort keeps its own window on retry.
+  for (k in seq_len(nrow(cohorts)))
+    run_phase(targets[pid %in% cohort_pids(k, rt_ref)],
+              cohorts$fetch_from[k], cohorts$keep_from[k], fetch_deadline,
+              cohort_label(k, "-retry"), wt_cap)
   run_phase(rt_add, add_fetch_from, add_keep_from, fetch_deadline, "add-retry", wt_cap)
 }
 

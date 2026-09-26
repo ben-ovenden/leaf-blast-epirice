@@ -32,6 +32,24 @@ blast_run_date <- function() {
   if (is.na(d)) Sys.Date() else d
 }
 
+# The UTC calendar date the job started on, pinned once by the workflow as
+# BLAST_UTC_DATE for the same reason as the run date: a grid run lasts long
+# enough to cross 00:00 UTC, and the town script must not see a later date than
+# the grid script did.
+blast_utc_date <- function() {
+  v <- Sys.getenv("BLAST_UTC_DATE", "")
+  d <- if (nzchar(v)) suppressWarnings(as.Date(v)) else as.Date(NA)
+  if (is.na(d)) as.Date(format(Sys.time(), "%Y-%m-%d", tz = "UTC")) else d
+}
+
+# The last day FETCHED. The archive's availability is a function of the UTC
+# clock, not of the Sydney calendar, so the lag is counted from whichever of the
+# two dates is EARLIER. See ARCHIVE_LAG_DAYS in section 2 for what went wrong
+# when it was counted from the Sydney date alone.
+blast_data_end <- function(run_date = blast_run_date()) {
+  min(as.Date(run_date), blast_utc_date()) - ARCHIVE_LAG_DAYS
+}
+
 ################################################################################
 # 1. Season and risk bands
 ################################################################################
@@ -65,8 +83,21 @@ MIN_DAYS <- 16
 ################################################################################
 # The Open-Meteo archive (ERA5) lags real time by about 5 days. End the fetch a
 # few days back so the most recent days are actually populated.
-#   data_end  = run date - ARCHIVE_LAG_DAYS      the last day FETCHED
-#   end_date  = data_end - DAY_CUT_LAG_DAYS      the last day MODELLED
+#   data_end  = min(run date, UTC date) - ARCHIVE_LAG_DAYS   the last day FETCHED
+#   end_date  = data_end - DAY_CUT_LAG_DAYS                  the last day MODELLED
+#
+# WHY THE UTC DATE IS IN THERE. The Monday job fires at about 22:30 UTC on
+# SUNDAY, so the Sydney run date is a day ahead of the UTC date and "run date
+# minus 6" is only five days behind the archive's clock. That day was not in the
+# archive yet on any 22:30 UTC run through August and September 2026. With the
+# model day cut at 10:00 local solar, a cell at longitude L needs (10 - L/15)
+# hours of that missing day to complete end_date; the completeness rule allows
+# two, so every cell west of 120 E landed one day short: 841 cells, 10.9% of the
+# grid, hence "only 89% of cached cells reached end_date" on every scheduled run
+# and a "Degraded run" banner on every Monday email. A week later those cells
+# were more than a tail behind and cost a full refetch each. Counting the lag
+# from the UTC date costs one day of freshness on the Monday email and removes
+# the whole chain. Manual runs after 10:00 Sydney are unaffected.
 ARCHIVE_LAG_DAYS <- 6L
 
 # Why the extra day. The model day now runs from BLASTAM_DAY_CUT_HOUR local solar
@@ -137,6 +168,20 @@ OM_BATCH_SIZE <- 25L
 # Per REQUEST timeout, not per point.
 OM_TIMEOUT_S <- 60L
 OM_MAX_ATTEMPTS <- 3L
+
+# HTTP 429 handling. Open-Meteo enforces three ceilings (per minute, per hour,
+# per day) and says which one in the response body. Only the DAILY one means the
+# run is over. The 2026-09-07 grid run hit the HOURLY ceiling at exactly 5,000
+# weighted calls, about 60 minutes in, and the code then treated every 429 as
+# "quota spent": it abandoned the remaining 42% of the grid with 140 minutes of
+# wall clock still in hand, and the town fetch that followed in the same hour was
+# refused too, so that email carried 31 towns of "no data". A minutely or hourly
+# 429 is now waited out and the fetch resumes; the wait is bounded by the total
+# below and by the run's own deadline, and a 429 is never charged.
+OM_QUOTA_WAIT_S        <- 300   # seconds between probes after an hourly 429
+OM_QUOTA_WAIT_MAX_MIN  <- 60    # total 429 waiting a GRID run will tolerate
+TOWN_QUOTA_WAIT_MAX_MIN <- 10   # and a TOWN run, which has no fetch deadline of
+                                # its own and must leave time to commit and email
 
 # Free tier ceilings, all in WEIGHTED CALLS. Reference values, used by the shared
 # spend ledger below to keep the grid run and the town run inside one day's quota.
@@ -288,24 +333,37 @@ DAILY_WEIGHTED_CAP       <- 9000
 # Sustained request pacing (unit: WEIGHTED CALLS PER MINUTE).
 # The hourly ceiling (5,000/h = 83/min) binds long before the per minute one
 # (600/min). Do NOT read this as fetches per minute: at ~4.86 weighted per new
-# point, 80 weighted/min is about 16 points per minute.
-GRID_TARGET_PER_MIN <- 80           # 4,800/hour, under the 5,000/hour cap
+# point, 70 weighted/min is about 14 points per minute.
+#
+# This was 80, which is 96% of the hourly ceiling with nothing in hand for the
+# pacer's opening burst, for retried requests (which were not paced at all) or
+# for the ~150 weighted the town run spends in the grid run's final hour. The
+# 2026-09-07 run crossed the line at exactly 5,000. At 70 an hour of grid
+# fetching plus the town run comes to about 4,400.
+GRID_TARGET_PER_MIN <- 70           # 4,200/hour, under the 5,000/hour cap
 
-# Refresh requests a fixed tail rather than only the missing days, because the API
-# charges a MINIMUM of 14 days: a 1 day top up and a 14 day one cost the same.
+# Every cached cell is refreshed from the day after its newest cached row, plus
+# BLASTAM_LEADIN_DAYS of lead-in and the day cut lag, so it pays for exactly the
+# days it is missing. The API charges a MINIMUM of 14 days, so a cell refreshed on
+# the weekly cadence (7 days missing) costs exactly 1.00 weighted:
 #
 # ** REFRESH_TAIL_DAYS + BLASTAM_LEADIN_DAYS + DAY_CUT_LAG_DAYS MUST COME TO 14. **
-# 7 + 6 + 1 = 14 exactly, so a refresh costs exactly 1.00 weighted calls. At 15
-# days the weight is 15/14 = 1.07, and a 7% surcharge on every refresh costs
-# about 540 weighted calls once the grid is full, which is most of the headroom
-# for adding new cells. The runner now checks this sum and warns.
+# 7 + 6 + 1 = 14. At 15 days the weight is 15/14 = 1.07, and a 7% surcharge on
+# every weekly refresh costs about 540 weighted calls once the grid is full. The
+# runner checks this sum and warns. REFRESH_TAIL_DAYS is the weekly cadence that
+# the check describes; the planner itself no longer uses a fixed tail.
 #
-# The tail spans 7 days, exactly the weekly gap. A point that falls further
-# behind is detected and refetched over the full window instead, so a missed run
-# cannot leave a hole.
+# Cells further behind are grouped into cohorts by how far behind they are and
+# each cohort is fetched over its own window: 8 days missing costs 1.07, 15 days
+# 1.57, 22 days 2.07, and never more than a brand new cell (4.86). Previously any
+# cell more than 7 days behind was refetched over the FULL crop window at 4.86,
+# which is why one interrupted run in September 2026 took the grid three weeks
+# to recover from instead of one.
 REFRESH_TAIL_DAYS <- 7L
 
-# Wall clock budgets (unit: MINUTES).
+# Wall clock budgets (unit: MINUTES). The workflow's timeout-minutes must exceed
+# GRID_MAX_MINUTES + GRID_RESERVE_MINUTES + TOWN_QUOTA_WAIT_MAX_MIN plus a margin
+# for the town fetch, commit and email.
 GRID_MAX_MINUTES     <- 200L   # total fetch budget, measured from run start
 GRID_RESERVE_MINUTES <- 25L    # modelling, rendering, saving and committing
 GRID_RETRY_RESERVE_MINUTES <- 20L

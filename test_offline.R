@@ -375,5 +375,165 @@ if (!requireNamespace("terra", quietly = TRUE)) {
      identical(kp, declutter_labels(tw$lon, tw$lat, LABEL_MIN_SEP_DEG)))
 }
 
+cat("\n16. The data window follows the UTC date, not only the Sydney date\n")
+# Regression: the Monday job fires at ~22:30 UTC on Sunday, so "Sydney run date
+# minus 6" was only five days behind the archive's clock, and that day was not in
+# the archive yet. With the model day cut at 10:00 local solar, every cell west
+# of 120 E needed more than the two permitted hours from the missing day to
+# complete end_date and landed one day short: 841 cells, "only 89% of cached
+# cells reached end_date" on every scheduled run, a Degraded run banner on every
+# Monday email, and a week later a full-price refetch for each of them.
+{
+  old <- Sys.getenv(c("BLAST_RUN_DATE", "BLAST_UTC_DATE"), unset = NA)
+  Sys.setenv(BLAST_RUN_DATE = "2026-09-21", BLAST_UTC_DATE = "2026-09-20")
+  ok("Monday 06:30 Sydney (still Sunday UTC) counts the lag from the UTC date",
+     blast_data_end(blast_run_date()) == as.Date("2026-09-20") - ARCHIVE_LAG_DAYS,
+     sprintf("(got %s)", format(blast_data_end(blast_run_date()))))
+  Sys.setenv(BLAST_UTC_DATE = "2026-09-21")
+  ok("a run after 10:00 Sydney (same UTC date) is unchanged",
+     blast_data_end(blast_run_date()) == as.Date("2026-09-21") - ARCHIVE_LAG_DAYS)
+  Sys.setenv(BLAST_UTC_DATE = "2026-09-25")
+  ok("a manual re-run of an earlier run date keeps that date's window",
+     blast_data_end(blast_run_date()) == as.Date("2026-09-21") - ARCHIVE_LAG_DAYS)
+  for (v in names(old))
+    if (is.na(old[[v]])) Sys.unsetenv(v) else do.call(Sys.setenv, as.list(setNames(old[[v]], v)))
+  ok("both runners take the window from blast_data_end()",
+     grepl("blast_data_end(", gsrc, fixed = TRUE) && grepl("blast_data_end(", tsrc, fixed = TRUE))
+  ok("neither runner subtracts ARCHIVE_LAG_DAYS from the run date itself",
+     !grepl("RUN_DATE\\s*-\\s*ARCHIVE_LAG_DAYS", gsrc) &&
+     !grepl("RUN_DATE\\s*-\\s*ARCHIVE_LAG_DAYS", tsrc))
+  # The geometry behind it. With the final UTC day absent, a cell at 150 E still
+  # completes its last model day (that day ends at 23:59 UTC), while a cell at
+  # 115 E needs three hours of the missing day and may lose only two.
+  h <- mkseries(115, days = 20)
+  h[dt >= as.POSIXct("2026-06-20 00:00", tz = "UTC"),
+    `:=`(temp = NA_real_, rh = NA_real_, rain = NA_real_)]
+  d150 <- blastam_daily_from_hourly(copy(h), lon = 150)
+  d115 <- blastam_daily_from_hourly(copy(h), lon = 115)
+  ok("150 E completes model day 19 June without the 20th",
+     max(d150$date) == as.Date("2026-06-19"), sprintf("(got %s)", format(max(d150$date))))
+  ok("115 E does not: it needs 3 hours of the missing day and may lose only 2",
+     max(d115$date) == as.Date("2026-06-18"), sprintf("(got %s)", format(max(d115$date))))
+}
+
+cat("\n17. Stale cells are refetched over the days they miss, not the whole crop window\n")
+# Regression: any cell more than REFRESH_TAIL_DAYS behind was refetched over the
+# full window at ~4.86 weighted. After the 2026-09-07 run was cut short at 5,000
+# weighted, 3,243 cells were in that class; the weekly budget recovered ~800 of
+# them per run and the map sat on 29 August for three weeks (65%, 74%, 76%).
+source("openmeteo_batch.R")
+{
+  ed <- as.Date("2026-09-14"); de <- ed + DAY_CUT_LAG_DAYS
+  akf <- ed - CROP_AGE_DAYS
+  lb <- data.table(pid = sprintf("p%04d", 1:1000),
+                   last = c(rep(ed, 50),          # already current
+                            rep(ed - 7L, 800),    # the weekly cadence
+                            rep(ed - 8L, 100),    # one day short (the western cells)
+                            rep(ed - 22L, 40),    # cut off on 09-07
+                            rep(ed - 90L, 10)))   # older than the crop window
+  pl <- om_plan_refresh(lb, ed, de, akf, lead = BLASTAM_LEADIN_DAYS, n_vars = 3)
+  ok("cells already at end_date are not eligible", nrow(pl) == 950L, sprintf("(got %d)", nrow(pl)))
+  cost_of <- function(m) pl[missing == m, unique(cost)]
+  ok("7 days behind costs exactly 1.00 (the 14 day floor)", abs(cost_of(7) - 1) < 1e-12)
+  ok("8 days behind costs 15/14, not 4.86", abs(cost_of(8) - 15 / 14) < 1e-9,
+     sprintf("(got %.3f)", cost_of(8)))
+  ok("22 days behind costs 29/14", abs(cost_of(22) - 29 / 14) < 1e-9,
+     sprintf("(got %.3f)", cost_of(22)))
+  add_cost <- om_weight_per_location(CROP_AGE_DAYS + 1L + BLASTAM_LEADIN_DAYS + DAY_CUT_LAG_DAYS, 3)
+  ok("older than the crop window costs the same as a new cell, never more",
+     abs(cost_of(90) - add_cost) < 1e-9 && all(pl$cost <= add_cost + 1e-9))
+  ok("each cohort starts the day after its newest row (no gap, no overlap)",
+     pl[missing < 90, all(keep_from == last + 1L)])
+  ok("and fetches BLASTAM_LEADIN_DAYS of lead-in before that",
+     all(pl$fetch_from == pl$keep_from - BLASTAM_LEADIN_DAYS))
+  ok("cheapest cohort first", !is.unsorted(pl$cost))
+  # Budget for the 800 weekly cells, the 100 one-day-short cells and half of the
+  # 22-day cohort: the prefix must stop mid-cohort, not skip a cohort.
+  bud <- 800 + 100 * 15 / 14 + 20 * 29 / 14 + 0.01
+  pb <- om_plan_refresh(lb, ed, de, akf, lead = BLASTAM_LEADIN_DAYS, n_vars = 3, budget = bud)
+  ok("the budget buys an affordable prefix", pb[take == TRUE, .N] == 920L,
+     sprintf("(took %d)", pb[take == TRUE, .N]))
+  ok("spending stays within it", pb[take == TRUE, sum(cost)] <= bud)
+  ok("what is left is the dearest cohort", pb[take == FALSE, all(missing >= 22L)])
+  pc <- om_plan_refresh(lb, ed, de, akf, lead = BLASTAM_LEADIN_DAYS, n_vars = 3, max_n = 100)
+  ok("the fetch-count cap is honoured too", pc[take == TRUE, .N] == 100L)
+  # Under the old planner every one of the 150 cells past the tail cost 4.86.
+  old_cost <- 150 * add_cost; new_cost <- pl[missing > 7, sum(cost)]
+  ok("a September-type backlog costs a fraction of what it did", new_cost < old_cost / 2,
+     sprintf("(%.0f vs %.0f weighted)", new_cost, old_cost))
+  ok("an empty cache plans nothing, without error",
+     nrow(om_plan_refresh(data.table(pid = character(), last = as.Date(character())),
+                          ed, de, akf)) == 0L)
+}
+
+cat("\n18. An hourly HTTP 429 is waited out; a daily one stops the run\n")
+# Regression: every 429 was "quota spent, stop". The 2026-09-07 grid run hit the
+# HOURLY ceiling at exactly 5,000 weighted about an hour in, abandoned the rest
+# of the grid with 140 minutes of deadline left, and the town fetch in the same
+# hour was refused too: 31 towns of "no data" in that email.
+{
+  ok("the ceiling is read from the body",
+     om_quota_kind("Hourly API request limit exceeded. Please try again in the next hour.") == "hour" &&
+     om_quota_kind("Minutely API request limit exceeded. Please try again in one minute.") == "minute" &&
+     om_quota_kind("Daily API request limit exceeded. Please try again tomorrow.") == "day" &&
+     om_quota_kind("") == "unknown")
+  # Stub the HTTP layer: fetch_points_batched() resolves om_request at call time.
+  real_om_request <- om_request
+  old_wait <- OM_QUOTA_WAIT_S
+  hourly <- list(status = "quota", code = 429L, retry_after = NA_real_, body = NULL,
+                 msg = "Hourly API request limit exceeded. Please try again in the next hour.")
+  daily  <- modifyList(hourly, list(msg = "Daily API request limit exceeded. Please try again tomorrow."))
+  http   <- list(status = "http", code = 503L, retry_after = NA_real_, body = NULL, msg = "boom")
+  okbody <- function(lats) list(status = "ok", code = 200L, retry_after = NA_real_, msg = "",
+    body = lapply(seq_along(lats), function(i) list(hourly = list(
+      time = as.list(format(as.POSIXct("2026-06-01 00:00", tz = "UTC") + (0:23) * 3600,
+                            "%Y-%m-%dT%H:%M")),
+      temperature_2m = as.list(rep(25, 24)), relative_humidity_2m = as.list(rep(80, 24)),
+      precipitation = as.list(rep(0, 24))))))
+  pts <- data.table(pid = sprintf("t%02d", 1:30), lon = 145 + (1:30) / 10, lat = -25)
+  on_pt <- function(pid, lon, lat, hw) data.table(pid = pid)
+  script <- NULL; calls <- 0L
+  om_request <- function(lats, lons, start_date, end_date, timeout_s = 60) {
+    calls <<- calls + 1L
+    r <- script[[min(calls, length(script))]]
+    if (identical(r, "ok")) okbody(lats) else r
+  }
+  OM_QUOTA_WAIT_S <- 0.05          # read through .cfg() at call time
+  paced <- 0L; count_pacer <- function(weight) { paced <<- paced + 1L; invisible(NULL) }
+  d0 <- as.Date("2026-06-01"); d1 <- as.Date("2026-06-14")   # 14 days: 1.00 each
+
+  script <- list(hourly, hourly, "ok")   # first batch refused twice, then served
+  r <- fetch_points_batched(pts, d0, d1, on_pt, budget = Inf, label = "test-hourly",
+                            pacer = count_pacer, quota_wait_max_s = 10)
+  ok("an hourly 429 is waited out and the same batch is sent again",
+     r$n_ok == 30L && r$stopped == "",
+     sprintf("(ok %d, stopped '%s', %d requests)", r$n_ok, r$stopped, calls))
+  ok("the wait is recorded", r$waited_s > 0)
+  ok("refused requests are never charged", abs(r$spent - 30) < 1e-9, sprintf("(spent %.2f)", r$spent))
+
+  calls <- 0L; script <- list(daily)
+  r <- fetch_points_batched(pts, d0, d1, on_pt, budget = Inf, label = "test-daily",
+                            pacer = count_pacer, quota_wait_max_s = 10)
+  ok("a daily 429 stops the call at once", r$stopped == "quota" && r$n_ok == 0L && calls == 1L,
+     sprintf("(stopped '%s', %d requests)", r$stopped, calls))
+  ok("and the refused points are on the ledger as quota",
+     nrow(r$ledger) == 25L && r$ledger[, all(status == "quota")])
+
+  calls <- 0L; script <- list(hourly)    # refused every time
+  r <- fetch_points_batched(pts, d0, d1, on_pt, budget = Inf, label = "test-cap",
+                            pacer = count_pacer, quota_wait_max_s = 0.12)
+  ok("the wait allowance bounds it", r$stopped == "quota" && r$waited_s <= 0.12 + 1e-9 && calls <= 4L,
+     sprintf("(waited %.2f s over %d requests)", r$waited_s, calls))
+
+  calls <- 0L; paced <- 0L; script <- list(http, "ok", "ok")
+  r <- fetch_points_batched(pts, d0, d1, on_pt, budget = Inf, label = "test-retry",
+                            pacer = count_pacer, quota_wait_max_s = 10)
+  ok("every retry goes through the pacer", paced == calls && calls == 3L,
+     sprintf("(%d requests, %d paced)", calls, paced))
+  ok("and every non-429 attempt is charged", abs(r$spent - 55) < 1e-9, sprintf("(spent %.2f)", r$spent))
+
+  om_request <- real_om_request; OM_QUOTA_WAIT_S <- old_wait
+}
+
 cat(sprintf("\n%d tests, %d failures\n", n, fails))
 quit(status = if (fails > 0L) 1L else 0L)

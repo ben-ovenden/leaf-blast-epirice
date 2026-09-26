@@ -72,11 +72,11 @@ requires in canopy loggers deployed alongside ERA5 driven model runs.
 | `run_blast.R` | Town table runner: fetch, model, write CSV, HTML and text summary |
 | `run_blast_grid.R` | Continental heatmap runner: fill the cache, model, render maps |
 | `send_email.py` | Python stdlib email sender |
-| `test_offline.R` | Offline regression tests: 62 tests, no network, runs in seconds, in CI |
+| `test_offline.R` | Offline regression tests: 92 tests, no network, runs in seconds, in CI |
 | `australia_land.geojson` | Land polygon for masking ocean and clipping the map |
 | `australia_rivers.geojson` | River overlay |
 | `australia_roads.geojson` | Road overlay |
-| `.github/workflows/weekly_blast.yml` | Monday workflow: pin the run date, test, fetch, model, commit, email |
+| `.github/workflows/weekly_blast.yml` | Monday workflow: pin the run and UTC dates, test, fetch, model, commit, email |
 
 ---
 
@@ -119,10 +119,11 @@ Rscript run_blast.R          # town table
 ```
 
 Set `BLAST_RUN_DATE=YYYY-MM-DD` to pin the run date; otherwise today is used.
-Required packages: `data.table`, `jsonlite`, `curl`, `terra`. The workflow uses
-the `rocker/geospatial` container.
+`BLAST_UTC_DATE` pins the UTC date the same way (the workflow sets both); left
+unset, the current UTC date is used. Required packages: `data.table`, `jsonlite`,
+`curl`, `terra`. The workflow uses the `rocker/geospatial` container.
 
-All 62 offline tests must pass before a run is meaningful. Each test guards a bug
+All 92 offline tests must pass before a run is meaningful. Each test guards a bug
 that was actually shipped.
 
 ---
@@ -132,7 +133,7 @@ that was actually shipped.
 | Name | Definition | Meaning |
 | --- | --- | --- |
 | run date | `blast_run_date()`, pinned by the workflow | names the output files |
-| `data_end` | run date minus `ARCHIVE_LAG_DAYS` (6) | the last day **fetched** |
+| `data_end` | `blast_data_end()`: the **earlier** of the run date and the UTC date, minus `ARCHIVE_LAG_DAYS` (6) | the last day **fetched** |
 | `end_date` | `data_end` minus `DAY_CUT_LAG_DAYS` (1) | the last day **modelled** |
 
 `end_date` sits a day behind `data_end` because the model day is cut at 10:00
@@ -140,12 +141,23 @@ local solar, so the final fetched day is only partly covered, and by an amount
 that depends on longitude. Dropping it makes the modelled window identical at
 every longitude by construction rather than correcting for it afterwards.
 
-**All three come from one pinned date.** The workflow resolves it once and
-exports `BLAST_RUN_DATE`; both R scripts and `send_email.py` read it. Previously
-each script called `Sys.Date()` separately, and the grid script called it twice,
-once before a two hour fetch and once after, so a run straddling local midnight
-produced maps titled "weather to 2026-07-23" beside body text saying "weather to
-24 Jul 2026".
+**All three come from pinned dates.** The workflow resolves the run date and the
+UTC date once and exports `BLAST_RUN_DATE` and `BLAST_UTC_DATE`; both R scripts
+and `send_email.py` read them. Previously each script called `Sys.Date()`
+separately, and the grid script called it twice, once before a two hour fetch and
+once after, so a run straddling local midnight produced maps titled "weather to
+2026-07-23" beside body text saying "weather to 24 Jul 2026".
+
+**Why the UTC date is in the definition.** The archive's availability follows the
+UTC clock, and the Monday job fires at about 22:30 UTC on *Sunday*, so "Sydney
+Monday minus 6" was only five days behind the archive and that day was not there
+yet. A cell at longitude L needs `10 − L/15` hours of the missing day to complete
+`end_date`; the completeness rule allows two, so every cell west of 120 E (841 of
+7,721) landed one day short on every scheduled run through August and September
+2026. That is the "only 89% of cached cells reached end_date" in every Monday
+email, and the reason those cells cost a full-price refetch a week later. Counting
+the lag from the earlier date costs the Monday email one day of freshness; runs
+dispatched after 10:00 Sydney are unaffected.
 
 ---
 
@@ -236,19 +248,39 @@ The 14 day floor means a 1 day top up and a 14 day fetch cost identically.
 
 | Fetch | Days | Weighted |
 | --- | --- | --- |
-| refresh an existing point | `REFRESH_TAIL_DAYS` 7 + lead-in 6 + day cut lag 1 = 14 | 1.00 |
-| add a new point | crop window 61 + lead-in 6 + day cut lag 1 = 68 | 4.86 |
+| refresh a point 7 days behind (the weekly cadence) | 7 missing + lead-in 6 + day cut lag 1 = 14 | 1.00 |
+| refresh a point 8 days behind | 15 | 1.07 |
+| refresh a point 22 days behind | 29 | 2.07 |
+| add a new point, or refresh one older than the crop window | crop window 61 + lead-in 6 + day cut lag 1 = 68 | 4.86 |
 
+Every cached cell is fetched from the day after its newest cached row, so it pays
+for exactly the days it is missing (see "Recovery after an interrupted run"
+below). On the weekly cadence that is the 14 day floor:
 **`REFRESH_TAIL_DAYS + BLASTAM_LEADIN_DAYS + DAY_CUT_LAG_DAYS` must come to 14.**
-At 15 the weight is 1.07, and a 7% surcharge on every refresh costs about 540
-weighted calls once the grid is full, which is most of the headroom for adding
+At 15 the weight is 1.07, and a 7% surcharge on every weekly refresh costs about
+540 weighted calls once the grid is full, which is most of the headroom for adding
 new cells. `blastam_check_fetch_arithmetic()` warns if the sum drifts and a test
 asserts it.
 
 Free tier limits are 10,000 weighted calls per day, 5,000 per hour and 600 per
 minute. The grid run plans to `DAILY_WEIGHTED_CAP` (9,000) and paces at
-`GRID_TARGET_PER_MIN` (80 weighted per minute, so 4,800 per hour). At about 4.86
-weighted per new point, 80 per minute is roughly 16 points per minute.
+`GRID_TARGET_PER_MIN` (70 weighted per minute, so 4,200 per hour). At about 4.86
+weighted per new point, 70 per minute is roughly 14 points per minute. One token
+bucket is shared by every fetch call in a run, and retried requests go through it
+too. The rate was 80, which is 96% of the hourly ceiling with nothing in hand for
+the bucket's opening burst, for retries (which were not paced) or for the ~150
+weighted the town run spends in the grid run's final hour; the 2026-09-07 run
+crossed the line at exactly 5,000.
+
+**HTTP 429 is not one thing.** Open-Meteo names the ceiling in the body, and only
+the daily one means the run is over. A minutely or hourly rejection is waited out
+(`OM_QUOTA_WAIT_S`, 5 minutes between probes) and the same batch is sent again,
+within `OM_QUOTA_WAIT_MAX_MIN` (60) for the grid, `TOWN_QUOTA_WAIT_MAX_MIN` (10)
+for the towns, and never past the grid's own fetch deadline. A 429 is never
+charged. Before this, every 429 read as "quota spent, stop": the 2026-09-07 grid
+run hit the hourly ceiling about an hour in, abandoned the remaining 42% of the
+grid with 140 minutes of deadline unused, and the town fetch in the same hour was
+refused as well, so that email carried 31 towns of "no data".
 
 **Shared spend ledger.** `DAILY_WEIGHTED_CAP` is per run. `run_blast.R` used to
 fetch its towns with an unlimited budget on top of whatever the grid run had
@@ -264,7 +296,8 @@ of `DAILY_WEIGHTED_HARD_CAP` (9,500).
 night judgements for every cached grid point, and is committed so each run only
 fetches the latest days.
 
-- Cached points need only the `REFRESH_TAIL_DAYS` tail, costing exactly 1.00.
+- A cached point is fetched from the day after its newest cached row: exactly
+  1.00 on the weekly cadence, more only for the days it is actually missing.
 - New points need the full window, costing about 4.86.
 - The spare budget after refreshing is spent adding new points.
 - The cache is written to a `.tmp.gz` temp path, read back to verify the row count
@@ -273,6 +306,36 @@ fetches the latest days.
   window. Do not raise this much while the cache is committed to git.
 - `CACHE_SCHEMA_VERSION` (3): bump whenever a change alters the **values** stored,
   not just the columns. On a mismatch the cache is discarded entirely.
+
+### Recovery after an interrupted run
+
+`om_plan_refresh()` groups every cached cell that has not reached `end_date` into
+**cohorts by how far behind it is**, and makes one fetch call per cohort, each
+starting the day after that cohort's newest row (plus the lead-in). Cohorts are
+fetched cheapest first, because the coverage rule counts cells: a weighted call
+buys the most coverage when spent on the cells missing the fewest days. Whatever
+does not fit the budget is the oldest cohort, and it costs 0.5 more per week it
+waits, so a chronic shortfall wants a midweek top up run rather than a different
+order. A cell is never charged more than a new one. The run log prints the plan:
+
+```
+Cache: 7721 points (0 already at 2026-09-20). Refresh 7721 in 4 cohort(s) (~9478 weighted) ...
+  cohort 1:  5890 cell(s) 6 day(s) behind;  fetch 2026-09-09 to 2026-09-21 (13 days) @ 1.00 = 5890 weighted
+  cohort 2:   286 cell(s) 14 day(s) behind; fetch 2026-09-01 to 2026-09-21 (21 days) @ 1.50 = 429 weighted
+  ...
+```
+
+This replaces a fixed 7 day tail for cells within a week of `end_date` and a
+**full crop-window refetch at 4.86** for anything older. That design could not
+recover from a single interrupted run. On 2026-09-07 the grid fetch stopped at
+5,000 weighted (the hourly ceiling, above) with 42% of cells unrefreshed. A week
+later those 3,243 cells were more than a tail behind, so the planner priced each
+at 4.86; after refreshing the current cells at 1.00 the budget bought only about
+800 of them per run, and the 90% coverage rule then dragged the whole map back to
+the stale cohort's date. Three consecutive emails carried the same map, "weather
+to 2026-08-29", at 65%, 74% and 76% coverage, while the town table in the same
+email was current. Priced by the days actually missing, the same backlog cost
+about 8,200 weighted and fitted inside one run.
 
 ### Grid fill and resolution
 
@@ -311,6 +374,10 @@ moves.
 That fallback exists because the strict form fails badly. A run that cannot
 refresh the grid, typically because the shared weighted ledger has correctly
 capped it after an earlier run the same UTC day, leaves no cell at `end_date`.
+(It also fires when a large minority of cells is stale, as in September 2026,
+when 76% of the grid was current and the map was still drawn 16 days back. The
+percentile rule discards fresh cells in that case; drawing the current cells and
+greying the stale ones would be the better behaviour, and is not yet done.)
 Before the fallback, that meant nothing modelled, no map rendered and the email
 step failing on a missing attachment, with a cache full of perfectly good points
 sitting in the repository. The heatmaps are now **optional** email attachments
@@ -609,8 +676,9 @@ by default, so the delivered maps still include them.
 
 The Monday workflow runs:
 
-1. **Resolve run date**, pinned once and exported as `BLAST_RUN_DATE`.
-2. **Offline tests**, `Rscript test_offline.R`. 62 tests, no network. terra is
+1. **Resolve run date and UTC date**, pinned once and exported as
+   `BLAST_RUN_DATE` and `BLAST_UTC_DATE`.
+2. **Offline tests**, `Rscript test_offline.R`. 92 tests, no network. terra is
    attached inside the suite on purpose, because `terra::shift` masks
    `data.table::shift` and that masking once turned every grid point into a
    silent "empty" and produced a blank map with no error in the log.

@@ -1,5 +1,38 @@
 # Changes
 
+## September 2026: three weeks of the same map
+
+The 2026-09-07, 09-14 and 09-21 emails all carried the map "weather to
+2026-08-29" (identical maxima, 0.058% and 10 days) beside a town table that was
+current; the 09-07 email had 31 towns of "no data". Diagnosed from
+`map_stats.txt`, `weighted_spend.csv`, `run_log.csv` and the committed cache. The
+offline suite went from 62 tests to 92; all pass.
+
+| # | Item | Fix | Guarded by |
+| --- | --- | --- | --- |
+| A | The Monday job fires at ~22:30 UTC on Sunday, so `run date − 6` was only five days behind the archive's clock and that day was not there yet. A cell at longitude L needs `10 − L/15` hours of it to complete `end_date`; two may be missing, so **every cell west of 120 E (841) landed one day short on every scheduled run**: "89% reached end_date" and a Degraded run banner every Monday, and a full-price refetch for each of them a week later. | `blast_data_end()` counts `ARCHIVE_LAG_DAYS` from the **earlier** of the run date and the UTC date. The workflow pins `BLAST_UTC_DATE` beside `BLAST_RUN_DATE` for the same reason the run date is pinned (the grid run crosses 00:00 UTC). Costs the Monday email one day of freshness. | test 16, including the 115 E versus 150 E geometry |
+| B | Any cell more than `REFRESH_TAIL_DAYS` behind was refetched over the **full crop window at 4.86**. After 09-07 left 3,243 cells in that class, the weekly budget recovered ~800 per run and the 90% coverage rule pinned the map to the stale cohort's date: 65%, 74%, 76%. | `om_plan_refresh()`: cohorts by days behind, each fetched from the day after its newest row (8 days 1.07, 15 days 1.57, 22 days 2.07, never more than a new cell), cheapest first, one token bucket shared across the calls. The same backlog would have cost ~8,200 and fitted in one run. | test 17 |
+| C | The 09-07 grid fetch hit the **hourly** 5,000 ceiling at exactly 5,000.0 weighted about an hour in; every 429 was treated as "quota spent, stop", so 42% of the grid was abandoned with 140 minutes of deadline unused, and the town fetch in the same hour was refused too. The 80/min pacer was 96% of the ceiling, retries were not paced, and the town run always lands in the grid's final hour. | Minutely and hourly 429s are waited out (`OM_QUOTA_WAIT_S`, bounded by `OM_QUOTA_WAIT_MAX_MIN` / `TOWN_QUOTA_WAIT_MAX_MIN` and the fetch deadline) and the same batch is resent; only a daily 429 stops a run. `GRID_TARGET_PER_MIN` 80 to 70. Retries go through the pacer. The town run's serial fallback, which is unpaced and unbudgeted, is skipped after a 429 that could not be waited out. Workflow timeout 240 to 255. | test 18 |
+
+Verified end to end against a stubbed Open-Meteo in a scratch copy: a seeded
+cache in the four cohorts of the live one (6, 14, 21 and 22 days behind) was
+brought to `end_date` in a single run at exactly the planned 1.00 / 1.50 / 2.00 /
+2.07 per cell with no calendar gaps, the leftover budget added new cells, an
+injected hourly 429 was waited out and the run continued, and the town table
+landed on the same window.
+
+**Not done, deliberately** (each is a separate change): the coverage fallback
+still draws the whole map at the 90th-percentile date rather than drawing the
+current cells and greying the stale ones; the serial town fallback still bypasses
+the ledger when it does run; a same-day re-run still overwrites the earlier run's
+trends column and run log row; the subject line still takes the map window while
+the body takes the town window; a run that delivers 31 towns of "no data" still
+exits 0; and there is still no midweek top up workflow.
+
+---
+
+## Earlier: the code review and the email review
+
 Every item from the code review and the email review, with where it was fixed and
 how it is now guarded. The offline suite went from 20 tests to 54; all pass.
 
