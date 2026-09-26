@@ -48,6 +48,14 @@
 #   * One token bucket for the whole run, shared across every cohort call.
 #   * An hourly 429 is waited out inside fetch_points_batched() rather than
 #     ending the run; see openmeteo_batch.R.
+#   * Stale cells are DRAWN GREY, not dropped (grid_window.R). The 90th
+#     percentile fallback used to fire whenever more than 10% of cells were
+#     behind, and drew every cell at a 16 day old window while 76% were current.
+#     It now steps back at most GRID_WINDOW_MAX_FALLBACK_DAYS; beyond that the
+#     current cells are drawn at end_date and the rest are grey, with their
+#     count and age in the footer. map_stats.txt carries the count, the cohort
+#     summary and the fetch's own reason, so the email banner states what
+#     actually happened rather than a fixed sentence about the quota.
 #
 # The test hook is GRID_ON_POINT(pid, lon, lat, hourly_dt) -> cache rows.
 ################################################################################
@@ -63,6 +71,7 @@ source(file.path(SCRIPT_DIR, "epirice_model.R"))
 source(file.path(SCRIPT_DIR, "blastam_model.R"))
 source(file.path(SCRIPT_DIR, "openmeteo_wth.R"))
 source(file.path(SCRIPT_DIR, "openmeteo_batch.R"))
+source(file.path(SCRIPT_DIR, "grid_window.R"))
 
 suppressPackageStartupMessages({library(data.table); library(terra)})
 
@@ -409,6 +418,10 @@ new_rows <- list()
 all_ledger <- list()
 spent <- 0
 quota_hit <- FALSE
+# What stopped each phase, and how long was spent waiting out 429s: the email's
+# "why" is built from these rather than from a fixed sentence.
+phase_stops <- character(0)
+waited_total <- 0
 # ONE token bucket for the whole run. Each cohort is a separate call, and a
 # private pacer per call would open each one with a full bucket's burst.
 PACER <- om_pacer(GRID_TARGET_PER_MIN)
@@ -423,6 +436,8 @@ run_phase <- function(tab, fetch_from, keep_from, deadline, label, cap) {
   if (length(r$rows) > 0) new_rows <<- c(new_rows, r$rows)
   if (nrow(r$ledger) > 0) all_ledger[[length(all_ledger) + 1L]] <<- r$ledger
   spent <<- spent + r$spent
+  if (nzchar(r$stopped)) phase_stops <<- c(phase_stops, r$stopped)
+  waited_total <<- waited_total + r$waited_s
   if (identical(r$stopped, "quota")) quota_hit <<- TRUE
   invisible()
 }
@@ -510,41 +525,22 @@ pt_end <- if (nrow(cache) > 0) cache[, .(mx = max(date)), by = pid] else
 n_cache_pts <- nrow(pt_end)
 wmode <- GRID_WINDOW_MODE
 
-# The newest date that at least `cover` of the cached cells have reached, never
-# later than cap_date.
-pick_window_end <- function(pt_end, cap_date, cover) {
-  if (nrow(pt_end) == 0L) return(cap_date)
-  mx <- sort(pt_end$mx, decreasing = TRUE)
-  need <- max(1L, ceiling(cover * length(mx)))
-  min(mx[need], cap_date)
-}
-
-min_cov  <- if (exists("GRID_WINDOW_MIN_COVERAGE")) GRID_WINDOW_MIN_COVERAGE else 0.90
-reach_now <- if (n_cache_pts > 0L) sum(pt_end$mx >= end_date) / n_cache_pts else 1
-window_note <- ""
-
-if (identical(wmode, "latest") && reach_now >= min_cov) {
-  model_end <- end_date
-} else {
-  # FALLBACK. Under "latest" this fires only when the run could not refresh
-  # enough of the grid, which in practice means the weighted quota was already
-  # spent. The map is still ONE window across every cell, just an older one.
-  cover <- if (identical(wmode, "latest")) min_cov else GRID_WINDOW_COVERAGE
-  model_end <- pick_window_end(pt_end, end_date, cover)
-  if (identical(wmode, "latest") && model_end < end_date) {
-    behind <- as.integer(end_date - model_end)
-    window_note <- sprintf("window fell back %d %s to %s (only %.0f%% of cached cells reached %s)",
-                           behind, if (behind == 1L) "day" else "days",
-                           format(model_end), 100 * reach_now, format(end_date))
-    cat(sprintf("WINDOW FALLBACK: %s.\n", window_note))
-    cat("  This is the degraded-but-useful path: the run could not refresh the grid,\n")
-    cat("  usually because the daily weighted quota was already spent, so the map is\n")
-    cat("  built from cache at the newest date the cells actually share.\n")
-    warn_days <- if (exists("GRID_WINDOW_WARN_FALLBACK_DAYS")) GRID_WINDOW_WARN_FALLBACK_DAYS else 10L
-    if (behind > warn_days)
-      cat(sprintf("  WARNING: that is more than %d days behind the archive edge. Check the quota ledger and the failure ledger.\n",
-                  warn_days))
-  }
+# WHICH DATE, AND WHAT TO DO WITH THE CELLS THAT HAVE NOT REACHED IT. Four
+# rules, in grid_window.R: draw at end_date and GREY the stale cells, unless a
+# step back of at most GRID_WINDOW_MAX_FALLBACK_DAYS brings every cell in, or so
+# few cells are current (below GRID_WINDOW_MIN_DRAW_COVERAGE) that an old
+# complete map is the more useful thing. The map is still ONE window across
+# every coloured cell; grey means "no value at this window", never an older one.
+win <- grid_choose_window(pt_end, end_date, mode = wmode)
+model_end   <- win$model_end
+reach_now   <- win$reach_now
+window_note <- win$fallback_note
+if (nzchar(window_note)) {
+  cat(sprintf("WINDOW FALLBACK (%s): %s.\n", win$rule, window_note))
+  warn_days <- if (exists("GRID_WINDOW_WARN_FALLBACK_DAYS")) GRID_WINDOW_WARN_FALLBACK_DAYS else 10L
+  if (win$behind > warn_days)
+    cat(sprintf("  WARNING: that is more than %d days behind the archive edge. Check the quota ledger and the failure ledger.\n",
+                warn_days))
 }
 # EVERY MAPPED CELL SHARES THIS EMERGENCE DATE. It used to be the run's global
 # `emergence`, which equals model_end - CROP_AGE_DAYS only under "latest". Under
@@ -555,12 +551,32 @@ model_start <- model_end - CROP_AGE_DAYS
 
 current_pids <- pt_end[mx >= model_end, pid]
 held_out <- n_cache_pts - length(current_pids)
+# The cells that have NOT reached the window are drawn grey by render_map(),
+# masked out of the interpolation and the GeoTIFF, and described in the footer
+# and the email. They used to vanish: IDW interpolated their neighbours' values
+# across them and nothing said so.
+stale_pts <- if (held_out > 0L)
+  unique(cache[pid %in% pt_end[mx < model_end, pid], .(pid, lon, lat)], by = "pid") else NULL
+stale_note <- if (held_out > 0L)
+  sprintf("%d cell%s (%.0f%%) had not reached %s and %s drawn grey rather than interpolated over: %s",
+          held_out, if (held_out == 1L) "" else "s", 100 * held_out / n_cache_pts,
+          format(model_end, "%d %b"), if (held_out == 1L) "is" else "are",
+          grid_stale_summary(pt_end, model_end)) else ""
+# Why, from what the fetch recorded: the budget, a 429, the deadline, failures,
+# or an earlier run's spend on the ledger.
+fetch_reason <- grid_fetch_reason(
+  stops = phase_stops, n_left = nrow(left), left_cost = sum(left$cost), plan_cap = plan_cap,
+  already = already, wt_cap = wt_cap, spent = spent, waited_s = waited_total,
+  n_failed = if (nrow(led) > 0L) led[status %in% c("http", "transport", "empty"), .N] else 0L,
+  max_minutes = GRID_MAX_MINUTES, held_out = held_out)
 # NOTE the >= . With `>` this yields CROP_AGE_DAYS rows starting one day after
 # model_start, and SEIR's alignment check then throws for every point.
 model_cache <- cache[pid %in% current_pids & date >= model_start & date <= model_end]
-cat(sprintf("Window [%s] ends %s: %d of %d cells reach it, %d absent (%d days behind the archive edge).\n",
-            wmode, format(model_end), length(current_pids), n_cache_pts, held_out,
+cat(sprintf("Window [%s, rule %s] ends %s: %d of %d cells reach it, %d drawn grey (%d days behind the archive edge).\n",
+            wmode, win$rule, format(model_end), length(current_pids), n_cache_pts, held_out,
             as.integer(end_date - model_end)))
+if (nzchar(stale_note))   cat("  ", stale_note, ".\n", sep = "")
+if (nzchar(fetch_reason)) cat("  Why: ", fetch_reason, ".\n", sep = "")
 
 # Distinguish "no EPIRICE because the alignment is wrong" from "no EPIRICE because
 # the cache does not reach back to model_start yet". The second is expected on the
@@ -717,7 +733,7 @@ legend_ticks <- function(hmax, s, n = 5L) {
 }
 
 render_map <- function(pts, valcol, title, colours, hmax, stretch, legend, base,
-                       obs_max = NA_real_, obs_fmt = "%.3f") {
+                       obs_max = NA_real_, obs_fmt = "%.3f", stale_pts = NULL) {
   if (nrow(pts) < 3) {
     cat(sprintf("Too few points to render %s (%d with a value). No PNG this run.\n",
                 base, nrow(pts)))
@@ -750,6 +766,31 @@ render_map <- function(pts, valcol, title, colours, hmax, stretch, legend, base,
     if (!is.null(dcoast)) r[dcoast < cmk * 1000] <- NA
   }
 
+  # STALE CELLS ARE DRAWN, NOT INTERPOLATED OVER. Each stale lattice point owns
+  # the GRID_RES_FINEST cell centred on it; those cells are set to NA in the
+  # value raster (so neither the PNG nor the GeoTIFF carries a neighbour's value
+  # there) and painted COL_STALE on the PNG. The coarse raster is offset by half
+  # a cell so a lattice point sits at a cell CENTRE, then snapped to r0.
+  sm <- NULL
+  if (!is.null(stale_pts) && nrow(stale_pts) > 0L) {
+    sm <- tryCatch({
+      sv <- terra::vect(as.matrix(stale_pts[, .(lon, lat)]), type = "points", crs = "EPSG:4326")
+      half <- GRID_RES_FINEST / 2
+      coarse <- terra::rast(xmin = ext[1] - half, xmax = ext[2] + half,
+                            ymin = ext[3] - half, ymax = ext[4] + half,
+                            resolution = GRID_RES_FINEST, crs = "EPSG:4326")
+      m <- terra::rasterize(sv, coarse, field = 1)
+      m <- terra::resample(m, r0, method = "near")
+      if (!is.null(land_poly)) m <- terra::mask(m, land_poly)
+      m
+    }, error = function(e) {
+      cat(sprintf("Stale-cell mask failed (%s); stale cells will be interpolated over on this map.\n",
+                  conditionMessage(e)))
+      NULL
+    })
+    if (!is.null(sm)) r <- terra::mask(r, sm, inverse = TRUE)
+  }
+
   # The GeoTIFF carries TRUE values; only the PNG is stretched.
   if (isTRUE(WRITE_GEOTIFF))
     terra::writeRaster(r, file.path(OUT, sprintf("%s_%s.tif", base, run_tag)),
@@ -777,6 +818,15 @@ render_map <- function(pts, valcol, title, colours, hmax, stretch, legend, base,
                 main = sprintf("%s  weather to %s", title, format(model_end)),
                 plg = list(title = legend))
 
+  # Grey goes on before the line overlays so roads, rivers and coast sit on top.
+  if (!is.null(sm)) {
+    try(terra::plot(sm, add = TRUE, col = COL_STALE, legend = FALSE, axes = FALSE), silent = TRUE)
+    try(legend("bottomleft", inset = c(0.02, 0.04), bty = "n", cex = 0.62,
+               fill = COL_STALE, border = NSW_GREY_04, text.col = NSW_GREY_04,
+               legend = sprintf("%d cells not refreshed to %s (no value drawn)",
+                                nrow(stale_pts), format(model_end, "%d %b"))), silent = TRUE)
+  }
+
   foot <- sprintf("run %s | %d cells | complete to %s deg | driver %s | colour scale 0 to %s%s",
                   run_tag, nrow(pts),
                   if (is.na(res_complete)) "no level" else sprintf("%.2f", res_complete),
@@ -784,6 +834,8 @@ render_map <- function(pts, valcol, title, colours, hmax, stretch, legend, base,
                   if (abs(stretch - 1) > 1e-9) sprintf(", stretch %.2f", stretch) else "")
   if (isTRUE(SHOW_OBSERVED_MAX) && is.finite(obs_max))
     foot <- paste0(foot, " | observed max ", sprintf(obs_fmt, obs_max))
+  if (!is.null(sm))
+    foot <- paste0(foot, sprintf(" | %d cells grey: not refreshed", nrow(stale_pts)))
   mtext(foot, side = 1, line = 3.2, cex = 0.62, col = NSW_GREY_04)
 
   if (isTRUE(SHOW_RIVERS) && !is.null(rivers)) try(terra::lines(rivers, col = COL_RIVER, lwd = 0.6), silent = TRUE)
@@ -817,10 +869,10 @@ render_map <- function(pts, valcol, title, colours, hmax, stretch, legend, base,
 pm_epi[, intensity_pct := intensity * 100]
 rendered_epi <- render_map(pm_epi, "intensity_pct", "EPIRICE potential risk (%)", HEAT_COLOURS,
            HEAT_MAX, HEAT_STRETCH, "intensity %", "epirice_heatmap",
-           obs_max = obs_max_epi, obs_fmt = "%.4f%%")
+           obs_max = obs_max_epi, obs_fmt = "%.4f%%", stale_pts = stale_pts)
 rendered_bl <- render_map(pm, "events", sprintf("BLASTAM infection days (last %d)", BLASTAM_WINDOW_DAYS),
            BLASTAM_HEAT_COLOURS, BLASTAM_HEAT_MAX, BLASTAM_STRETCH, "days",
-           "blastam_heatmap", obs_max = obs_max_bl, obs_fmt = "%.0f days")
+           "blastam_heatmap", obs_max = obs_max_bl, obs_fmt = "%.0f days", stale_pts = stale_pts)
 
 # ---- Save cache ------------------------------------------------------------
 csvdt <- copy(cache)
@@ -880,10 +932,13 @@ prev_mapped <- if (!file.exists(stats_file)) NA_integer_ else tryCatch({
 
 # Fields 13 and 14 tell run_blast.R whether the window fell back and which maps
 # actually rendered, so a degraded run explains itself in the email instead of
-# silently arriving without attachments.
+# silently arriving without attachments. Fields 15 to 17 carry the number of
+# cells drawn grey, the cohort summary behind them, and the fetch's own account
+# of why, so the banner states what happened rather than a fixed sentence.
 rendered <- paste(c(if (isTRUE(rendered_epi)) "epirice", if (isTRUE(rendered_bl)) "blastam"),
                   collapse = "+")
-writeLines(sprintf("%d|%.2f|%d|%.2f|%s|%.0f|%s|%s|%s|%.0f|%s|%s|%s|%s",
+no_pipe <- function(x) gsub("[|\n]", " ", x)
+writeLines(sprintf("%d|%.2f|%d|%.2f|%s|%.0f|%s|%s|%s|%.0f|%s|%s|%s|%s|%d|%s|%s",
                    nrow(pm), map_spacing,
                    if (is.na(prev_mapped)) 0L else prev_mapped,
                    GRID_RES_FINEST, wc$fmt, wc$kb, read_fmt,
@@ -892,8 +947,9 @@ writeLines(sprintf("%d|%.2f|%d|%.2f|%s|%.0f|%s|%s|%s|%.0f|%s|%s|%s|%s",
                    spent,
                    if (is.na(obs_max_epi)) "" else sprintf("%.4f", obs_max_epi),
                    if (is.na(obs_max_bl))  "" else sprintf("%.0f", obs_max_bl),
-                   gsub("[|\n]", " ", window_note),
-                   rendered),
+                   no_pipe(window_note),
+                   rendered,
+                   held_out, no_pipe(stale_note), no_pipe(fetch_reason)),
            stats_file)
 
 if (Sys.getenv("BLAST_MIDWEEK") == "1") {

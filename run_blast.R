@@ -36,6 +36,10 @@
 #     than producing 31 towns of "no data" as on 2026-09-07. After a 429 that
 #     could not be waited out, the serial fallback is skipped: it is unpaced and
 #     unbudgeted, and it would only be refused too.
+#   * The "Degraded run" banner is built from what the grid run recorded in
+#     map_stats.txt (cells drawn grey, their ages, the fetch's own reason) and no
+#     longer asserts that the daily quota was spent. In September 2026 it said so
+#     three weeks running while the quota had not been spent at all.
 ################################################################################
 
 SCRIPT_DIR <- tryCatch(
@@ -251,7 +255,8 @@ wet_rule <- if (isTRUE(BLASTAM_USE_BJ_THRESHOLD)) {
 # Read the grid's stats line (written by run_blast_grid.R).
 # Fields: mapped | mean_land_spacing | mapped_last_run | finest | fmt | kb |
 #         read_fmt | window_end | complete_res | weighted_spent | obs_max_epi |
-#         obs_max_blastam
+#         obs_max_blastam | fallback_note | rendered | n_grey | stale_note |
+#         fetch_reason
 map_growth_line <- function() {
   f <- file.path(OUT, "map_stats.txt")
   if (!file.exists(f)) return(NULL)
@@ -265,6 +270,7 @@ map_growth_line <- function() {
   mx_epi <- fld(11, as.numeric); mx_bl <- fld(12, as.numeric)
   wnote  <- if (length(s) >= 13 && nzchar(trimws(s[13]))) trimws(s[13]) else NA_character_
   rendered <- if (length(s) >= 14) trimws(s[14]) else NA_character_
+  n_grey <- if (length(s) >= 15) suppressWarnings(as.integer(s[15])) else NA_integer_
 
   chg <- if (is.na(prev) || prev <= 0) ""
          else if (now > prev) sprintf(" (up from %d mapped last run)", prev)
@@ -288,26 +294,36 @@ map_growth_line <- function() {
             if (kb >= 1024) sprintf("%.1f MB", kb / 1024) else sprintf("%.0f KB", kb))
   }
   qbit <- if (is.na(spent)) "" else sprintf(" Used ~%.0f weighted API calls.", spent)
-  sprintf("%d cells on a %.2f deg lattice%s.%s%s%s%s%s",
-          now, finest, chg, cbit, wtxt, mbit, cache_bit, qbit)
+  gbit <- if (!is.na(n_grey) && n_grey > 0)
+    sprintf(" %d cell(s) drawn grey: not refreshed to that window.", n_grey) else ""
+  sprintf("%d cells on a %.2f deg lattice%s.%s%s%s%s%s%s",
+          now, finest, chg, cbit, wtxt, gbit, mbit, cache_bit, qbit)
 }
 mg <- map_growth_line()
 
 # Degraded-run banner. A run that could not refresh still models from cache and
 # still emails, but it must say so rather than quietly arriving with an older
-# window or without a map.
+# window, with grey cells, or without a map. Every sentence here comes from what
+# the grid run recorded: the banner used to end with "usually because the daily
+# weather-API quota was already spent", which in September 2026 was untrue three
+# weeks running.
 map_warning <- function() {
   f <- file.path(OUT, "map_stats.txt")
   if (!file.exists(f)) return(NULL)
   s <- tryCatch(strsplit(readLines(f, warn = FALSE)[1], "\\|")[[1]],
                 error = function(e) NULL)
   if (length(s) < 13) return(NULL)
-  wnote <- if (nzchar(trimws(s[13]))) trimws(s[13]) else ""
-  rend  <- if (length(s) >= 14) trimws(s[14]) else ""
+  fld <- function(i) if (length(s) >= i) trimws(s[i]) else ""
+  wnote  <- fld(13); rend <- fld(14)
+  n_grey <- suppressWarnings(as.integer(fld(15)))
+  stale  <- fld(16); reason <- fld(17)
   miss <- setdiff(c("epirice", "blastam"), strsplit(rend, "\\+")[[1]])
   parts <- c(
     if (nzchar(wnote)) paste0("The map ", wnote,
-      ". This happens when a run cannot refresh the grid, usually because the daily weather-API quota was already spent. The cells are real cached weather, all on one window, just an older one.") else NULL,
+      ". The coloured cells are real cached weather, all on one window, just an older one.") else NULL,
+    if (!is.na(n_grey) && n_grey > 0 && nzchar(stale)) paste0(stale, ".") else NULL,
+    if (nzchar(reason) && (nzchar(wnote) || (!is.na(n_grey) && n_grey > 0)))
+      paste0("Why: ", reason, ".") else NULL,
     if (nzchar(rend) && length(miss) > 0) sprintf(
       "The %s heatmap could not be rendered this run and is not attached.",
       paste(miss, collapse = " and ")) else NULL)

@@ -398,6 +398,20 @@ GRID_WINDOW_MIN_COVERAGE <- 0.90
 # Warn loudly (do not cap) if the fallback lands more than this far back. A very
 # stale map that says so is more useful than no map, but it should be obvious.
 GRID_WINDOW_WARN_FALLBACK_DAYS <- 10L
+# ...but the fallback is no longer unconditional. When fewer than
+# GRID_WINDOW_MIN_COVERAGE reach end_date, the window may step back at most this
+# many days to bring every cell in: a complete map a day or two old beats a
+# current one with holes. Further back than that, and provided at least
+# GRID_WINDOW_MIN_DRAW_COVERAGE of cells are current, the map is drawn at
+# end_date and the stale cells are drawn GREY, with their count and age in the
+# footer and the email. Below that fraction the grid is mostly stale and the old
+# complete map is the more useful thing. See grid_window.R.
+#
+# In September 2026 the unlimited fallback drew every cell at a 16 day old window
+# three weeks running while 76% of the grid was current.
+GRID_WINDOW_MAX_FALLBACK_DAYS <- 3L
+GRID_WINDOW_MIN_DRAW_COVERAGE <- 0.50
+COL_STALE <- COL_NODATA        # cells not refreshed to the window are drawn in this
 # Under "coverage" the common window ends earlier than end_date, so the EPIRICE
 # window STARTS earlier too, and the cache must already hold weather before the
 # current run's emergence date. New points are therefore fetched with this many

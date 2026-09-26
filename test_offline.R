@@ -285,12 +285,7 @@ cat("\n13. A starved run still models from cache\n")
 # calls by the shared ledger after an earlier run the same UTC day, so no cell
 # reached end_date, nothing was modelled, no map rendered and the email step
 # failed on a missing attachment, with 1,874 usable cached points in the repo.
-pick_window_end <- function(pt_end, cap_date, cover) {
-  if (nrow(pt_end) == 0L) return(cap_date)
-  mx <- sort(pt_end$mx, decreasing = TRUE)
-  need <- max(1L, ceiling(cover * length(mx)))
-  min(mx[need], cap_date)
-}
+source("grid_window.R")    # the real pick_window_end(), not a copy
 {
   ed <- as.Date("2026-07-24")
   # every cached cell is one day behind, exactly the failing case
@@ -533,6 +528,59 @@ cat("\n18. An hourly HTTP 429 is waited out; a daily one stops the run\n")
   ok("and every non-429 attempt is charged", abs(r$spent - 55) < 1e-9, sprintf("(spent %.2f)", r$spent))
 
   om_request <- real_om_request; OM_QUOTA_WAIT_S <- old_wait
+}
+
+cat("\n19. Stale cells are drawn grey, not dropped, and the banner says why\n")
+# Regression: with 76% of the grid current and 24% stale, the 90th-percentile
+# fallback drew EVERY cell at a 16 day old window three weeks running (7, 14 and
+# 21 Sep 2026), and the email blamed a daily quota that had not been spent.
+{
+  ed <- as.Date("2026-09-21")
+  mk <- function(...) { v <- c(...); data.table(pid = sprintf("p%04d", seq_along(v)), mx = v) }
+  # The September cache, scaled by ten: 5890 current; 286, 555 and 990 behind.
+  sept <- mk(rep(ed, 589), rep(ed - 15L, 29), rep(ed - 22L, 55), rep(ed - 23L, 99))
+  w <- grid_choose_window(sept, ed, "latest", min_cov = 0.9, draw_cov = 0.5, max_fallback = 3L)
+  ok("the September cache is drawn at end_date", w$model_end == ed && w$rule == "draw-stale",
+     sprintf("(got %s, rule %s)", format(w$model_end), w$rule))
+  ok("with the stale quarter counted rather than hidden",
+     abs(w$reach_now - 589 / 772) < 1e-9 && !nzchar(w$fallback_note))
+  want <- sprintf("29 last updated %s, 55 %s, 99 %s", format(ed - 15L, "%d %b"),
+                  format(ed - 22L, "%d %b"), format(ed - 23L, "%d %b"))
+  ok("and its cohorts summarised newest first", grid_stale_summary(sept, ed) == want,
+     sprintf("(got '%s')", grid_stale_summary(sept, ed)))
+  # The pre-fix Monday: 89% current, 11% one day short. A one day step back that
+  # brings every cell in beats greying out Western Australia.
+  w <- grid_choose_window(mk(rep(ed, 89), rep(ed - 1L, 11)), ed, "latest", 0.9, 0.5, 3L)
+  ok("a short step back that brings everyone in is still taken",
+     w$model_end == ed - 1L && w$rule == "short-fallback" && grepl("fell back 1 day", w$fallback_note))
+  # 7 Sep: 58% current, the rest two days back.
+  w <- grid_choose_window(mk(rep(ed, 58), rep(ed - 2L, 42)), ed, "latest", 0.9, 0.5, 3L)
+  ok("two days back is still a short step", w$model_end == ed - 2L && w$rule == "short-fallback")
+  # Mostly stale: 30% current, 70% sixteen days back. The old complete map wins.
+  w <- grid_choose_window(mk(rep(ed, 30), rep(ed - 16L, 70)), ed, "latest", 0.9, 0.5, 3L)
+  ok("a mostly stale grid still falls back to the old complete map",
+     w$model_end == ed - 16L && w$rule == "mostly-stale" && grepl("16 days", w$fallback_note))
+  w <- grid_choose_window(mk(rep(ed, 100)), ed, "latest")
+  ok("a healthy cache is untouched", w$model_end == ed && w$rule == "current" && !nzchar(w$fallback_note))
+  ok("an empty cache does not error",
+     grid_choose_window(mk(as.Date(character())), ed, "latest")$model_end == ed)
+  ok("coverage mode is unchanged",
+     grid_choose_window(mk(rep(ed, 95), rep(ed - 4L, 5)), ed, "coverage", coverage = 0.98)$model_end == ed - 4L)
+  # The stated reason comes from what the fetch recorded, never a fixed sentence.
+  ok("a 429 stop is named", grepl("HTTP 429", grid_fetch_reason(stops = "quota", spent = 5000, waited_s = 600)))
+  ok("an unaffordable backlog is named",
+     grepl("did not fit", grid_fetch_reason(n_left = 990, left_cost = 2050, plan_cap = 8550)))
+  ok("a ledger cap from an earlier run is named",
+     grepl("earlier run today", grid_fetch_reason(already = 8700, wt_cap = 800)))
+  ok("cells still behind with nothing recorded is said plainly",
+     grepl("incomplete or empty", grid_fetch_reason(held_out = 5)))
+  ok("nothing to explain gives an empty string", grid_fetch_reason() == "")
+  ok("the email no longer asserts a spent quota it cannot know about",
+     !grepl("usually because the daily weather-API quota was already spent", tsrc, fixed = TRUE))
+  ok("the renderer is handed the stale cells", grepl("stale_pts = stale_pts", gsrc, fixed = TRUE))
+  ok("and masks them out of the value raster before the GeoTIFF is written",
+     regexpr("terra::mask(r, sm, inverse = TRUE)", gsrc, fixed = TRUE) <
+     regexpr("WRITE_GEOTIFF))", gsrc, fixed = TRUE))
 }
 
 cat(sprintf("\n%d tests, %d failures\n", n, fails))

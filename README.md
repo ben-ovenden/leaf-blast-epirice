@@ -71,8 +71,9 @@ requires in canopy loggers deployed alongside ERA5 driven model runs.
 | `openmeteo_batch.R` | Batched Open-Meteo fetcher, weighted cost model, pacer and the shared spend ledger |
 | `run_blast.R` | Town table runner: fetch, model, write CSV, HTML and text summary |
 | `run_blast_grid.R` | Continental heatmap runner: fill the cache, model, render maps |
+| `grid_window.R` | Window policy: which date the map is drawn at, which cells are drawn grey for not reaching it, and the fetch's own account of why |
 | `send_email.py` | Python stdlib email sender |
-| `test_offline.R` | Offline regression tests: 92 tests, no network, runs in seconds, in CI |
+| `test_offline.R` | Offline regression tests: 109 tests, no network, runs in seconds, in CI |
 | `australia_land.geojson` | Land polygon for masking ocean and clipping the map |
 | `australia_rivers.geojson` | River overlay |
 | `australia_roads.geojson` | Road overlay |
@@ -123,8 +124,8 @@ Set `BLAST_RUN_DATE=YYYY-MM-DD` to pin the run date; otherwise today is used.
 unset, the current UTC date is used. Required packages: `data.table`, `jsonlite`,
 `curl`, `terra`. The workflow uses the `rocker/geospatial` container.
 
-All 92 offline tests must pass before a run is meaningful. Each test guards a bug
-that was actually shipped.
+All 109 offline tests must pass before a run is meaningful. Each test guards a
+bug that was actually shipped.
 
 ---
 
@@ -364,25 +365,44 @@ Points are added in a bit reversed Morton (Z order) sequence within each
 resolution level, so any partial run is a spatially uniform sample of the
 continent rather than a south to north front.
 
-`GRID_WINDOW_MODE = "latest"` (default) ends every cell at the archive edge on
-the same date, **provided at least `GRID_WINDOW_MIN_COVERAGE` (90%) of cached
-cells have reached it**. If they have not, the window steps back to the newest
-date that 90% do reach, and the email carries a "Degraded run" banner saying by
-how much and why. The same-date guarantee is preserved either way; only the date
-moves.
+`GRID_WINDOW_MODE = "latest"` (default) draws every coloured cell at ONE date,
+decided by four rules in `grid_window.R`:
 
-That fallback exists because the strict form fails badly. A run that cannot
-refresh the grid, typically because the shared weighted ledger has correctly
-capped it after an earlier run the same UTC day, leaves no cell at `end_date`.
-(It also fires when a large minority of cells is stale, as in September 2026,
-when 76% of the grid was current and the map was still drawn 16 days back. The
-percentile rule discards fresh cells in that case; drawing the current cells and
-greying the stale ones would be the better behaviour, and is not yet done.)
-Before the fallback, that meant nothing modelled, no map rendered and the email
-step failing on a missing attachment, with a cache full of perfectly good points
-sitting in the repository. The heatmaps are now **optional** email attachments
-for the same reason: the run that most needs explaining should not be the one
-that goes unreported.
+1. If at least `GRID_WINDOW_MIN_COVERAGE` (90%) of cached cells reach `end_date`,
+   the map is drawn at `end_date`. The few that do not are **drawn grey**, not
+   interpolated over.
+2. Otherwise the newest date that 90% do reach is found. If it is within
+   `GRID_WINDOW_MAX_FALLBACK_DAYS` (3), the window steps back to it: a complete
+   map a day or two old beats a current one with holes.
+3. If it is further back than that, and at least `GRID_WINDOW_MIN_DRAW_COVERAGE`
+   (50%) of cells are current, the map is drawn at `end_date` and the stale cells
+   are drawn grey, with their count and age in the footer and the email.
+4. Below that the grid is mostly stale, and the window steps back to the older
+   date as before, with the loud warning: an old complete map beats a mostly
+   grey one.
+
+Grey means "no value at this window", never an older value. Grey cells are
+masked out of the interpolation and the GeoTIFF as well as the PNG, so a
+neighbour's value is never drawn across them. `map_stats.txt` carries the grey
+count, a summary of how old the grey cells are ("286 last updated 06 Sep, 555
+30 Aug, 990 29 Aug") and the fetch's own account of why (the budget, an HTTP
+429, the deadline, failures, or an earlier run's spend on the ledger), and the
+email's "Degraded run" banner is built from those. It used to end with "usually
+because the daily weather-API quota was already spent" whatever had happened.
+
+Rule 4 is the original fallback and exists because the strict form fails badly.
+A run that cannot refresh the grid at all, typically because the shared weighted
+ledger has correctly capped it after an earlier run the same UTC day, leaves no
+cell at `end_date`. Before the fallback, that meant nothing modelled, no map
+rendered and the email step failing on a missing attachment, with a cache full
+of perfectly good points sitting in the repository. The heatmaps are **optional**
+email attachments for the same reason: the run that most needs explaining should
+not be the one that goes unreported.
+
+Rules 1 and 3 exist because the fallback alone then failed the other way. In
+September 2026 it fired with 76% of the grid current and drew every cell at a
+16 day old window three weeks running, discarding 5,890 fresh cells to honour
+1,831 stale ones, while the banner blamed a quota that had not been spent.
 
 `"coverage"` pulls the window back so nearly all cells are included; it now works, and new points are fetched with
 `GRID_WINDOW_MAX_LAG_DAYS` of extra lookback so the earlier window start is
@@ -678,7 +698,7 @@ The Monday workflow runs:
 
 1. **Resolve run date and UTC date**, pinned once and exported as
    `BLAST_RUN_DATE` and `BLAST_UTC_DATE`.
-2. **Offline tests**, `Rscript test_offline.R`. 92 tests, no network. terra is
+2. **Offline tests**, `Rscript test_offline.R`. 109 tests, no network. terra is
    attached inside the suite on purpose, because `terra::shift` masks
    `data.table::shift` and that masking once turned every grid point into a
    silent "empty" and produced a blank map with no error in the log.
