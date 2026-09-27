@@ -71,8 +71,10 @@ requires in canopy loggers deployed alongside ERA5 driven model runs.
 | `openmeteo_batch.R` | Batched Open-Meteo fetcher, weighted cost model, pacer and the shared spend ledger |
 | `run_blast.R` | Town table runner: fetch, model, write CSV, HTML and text summary |
 | `run_blast_grid.R` | Continental heatmap runner: fill the cache, model, render maps |
-| `send_email.py` | Python stdlib email sender |
-| `test_offline.R` | Offline regression tests: 92 tests, no network, runs in seconds, in CI |
+| `grid_window.R` | Window policy: which date the map is drawn at, which cells are drawn grey for not reaching it, and the fetch's own account of why |
+| `run_health.R` | The run's verdict: is this run degraded, and why. Written to `run_status.txt` for the subject line and the workflow's final step |
+| `send_email.py` | Python stdlib email sender; the subject carries the town window and a `[DEGRADED]` prefix when `run_status.txt` says so |
+| `test_offline.R` | Offline regression tests: 128 tests, no network, runs in seconds, in CI |
 | `australia_land.geojson` | Land polygon for masking ocean and clipping the map |
 | `australia_rivers.geojson` | River overlay |
 | `australia_roads.geojson` | Road overlay |
@@ -123,8 +125,8 @@ Set `BLAST_RUN_DATE=YYYY-MM-DD` to pin the run date; otherwise today is used.
 unset, the current UTC date is used. Required packages: `data.table`, `jsonlite`,
 `curl`, `terra`. The workflow uses the `rocker/geospatial` container.
 
-All 92 offline tests must pass before a run is meaningful. Each test guards a bug
-that was actually shipped.
+All 128 offline tests must pass before a run is meaningful. Each test guards a
+bug that was actually shipped.
 
 ---
 
@@ -202,9 +204,28 @@ date. The heatmap colours every land cell as if rice were grown there.
 
 `weather_cache.csv.gz` (the cache), `cache_version.txt` (its schema version),
 `fetch_failures.csv` (the failure ledger), `weighted_spend.csv` (the shared quota
-ledger), `map_stats.txt` (the grid summary the email reads back) and
-`run_date.txt` (the pinned run date). All are committed so the next run picks up
-where this one stopped. Dated copies of the town CSV and text summary are written
+ledger), `map_stats.txt` (the grid summary the email reads back), `run_date.txt`
+(the pinned run date) and `run_status.txt` (the run's health verdict, below).
+All are committed so the next run picks up where this one stopped.
+
+**`run_status.txt`: is this run degraded?** `run_health.R` judges the run once,
+at the end of `run_blast.R`, and writes key=value lines: the town and map
+windows, towns modelled, cells mapped and drawn grey, `degraded=0/1`, the reasons
+and any notes. A run is degraded when fewer than `HEALTH_MIN_TOWN_FRAC` (90%) of
+towns were modelled, the map window is more than `HEALTH_MAX_MAP_BEHIND_DAYS` (1)
+behind the town table, more than `HEALTH_MAX_GREY_FRAC` (2%) of cells are grey,
+or mapped cells fell by more than `HEALTH_MAX_MAP_DROP_FRAC` (10%) since the last
+run. What the grid fetch recorded as its own reason (a 429, the deadline, an
+unaffordable backlog) is carried as a note, not a failure: the product is judged,
+not the weather API's day.
+
+Three things read the verdict. `send_email.py` prefixes the subject with
+`[DEGRADED]` and puts the **town** window first, adding the map window only when
+it differs: `[DEGRADED] Blast risk summary 2026-09-21 (weather to 2026-09-14;
+maps to 2026-08-29)`. The email body names a town shortfall in the banner. And
+the workflow's final step turns the run red. The 2026-09-07 run delivered 31
+towns of "no data" and the next two a map three weeks stale under a subject that
+said nothing was wrong, and all three showed a green tick. Dated copies of the town CSV and text summary are written
 alongside the `_latest` ones and are not committed.
 
 **Colour scale.** `HEAT_MAX` (2%) and `BLASTAM_HEAT_MAX` (21 days) are fixed
@@ -364,25 +385,44 @@ Points are added in a bit reversed Morton (Z order) sequence within each
 resolution level, so any partial run is a spatially uniform sample of the
 continent rather than a south to north front.
 
-`GRID_WINDOW_MODE = "latest"` (default) ends every cell at the archive edge on
-the same date, **provided at least `GRID_WINDOW_MIN_COVERAGE` (90%) of cached
-cells have reached it**. If they have not, the window steps back to the newest
-date that 90% do reach, and the email carries a "Degraded run" banner saying by
-how much and why. The same-date guarantee is preserved either way; only the date
-moves.
+`GRID_WINDOW_MODE = "latest"` (default) draws every coloured cell at ONE date,
+decided by four rules in `grid_window.R`:
 
-That fallback exists because the strict form fails badly. A run that cannot
-refresh the grid, typically because the shared weighted ledger has correctly
-capped it after an earlier run the same UTC day, leaves no cell at `end_date`.
-(It also fires when a large minority of cells is stale, as in September 2026,
-when 76% of the grid was current and the map was still drawn 16 days back. The
-percentile rule discards fresh cells in that case; drawing the current cells and
-greying the stale ones would be the better behaviour, and is not yet done.)
-Before the fallback, that meant nothing modelled, no map rendered and the email
-step failing on a missing attachment, with a cache full of perfectly good points
-sitting in the repository. The heatmaps are now **optional** email attachments
-for the same reason: the run that most needs explaining should not be the one
-that goes unreported.
+1. If at least `GRID_WINDOW_MIN_COVERAGE` (90%) of cached cells reach `end_date`,
+   the map is drawn at `end_date`. The few that do not are **drawn grey**, not
+   interpolated over.
+2. Otherwise the newest date that 90% do reach is found. If it is within
+   `GRID_WINDOW_MAX_FALLBACK_DAYS` (3), the window steps back to it: a complete
+   map a day or two old beats a current one with holes.
+3. If it is further back than that, and at least `GRID_WINDOW_MIN_DRAW_COVERAGE`
+   (50%) of cells are current, the map is drawn at `end_date` and the stale cells
+   are drawn grey, with their count and age in the footer and the email.
+4. Below that the grid is mostly stale, and the window steps back to the older
+   date as before, with the loud warning: an old complete map beats a mostly
+   grey one.
+
+Grey means "no value at this window", never an older value. Grey cells are
+masked out of the interpolation and the GeoTIFF as well as the PNG, so a
+neighbour's value is never drawn across them. `map_stats.txt` carries the grey
+count, a summary of how old the grey cells are ("286 last updated 06 Sep, 555
+30 Aug, 990 29 Aug") and the fetch's own account of why (the budget, an HTTP
+429, the deadline, failures, or an earlier run's spend on the ledger), and the
+email's "Degraded run" banner is built from those. It used to end with "usually
+because the daily weather-API quota was already spent" whatever had happened.
+
+Rule 4 is the original fallback and exists because the strict form fails badly.
+A run that cannot refresh the grid at all, typically because the shared weighted
+ledger has correctly capped it after an earlier run the same UTC day, leaves no
+cell at `end_date`. Before the fallback, that meant nothing modelled, no map
+rendered and the email step failing on a missing attachment, with a cache full
+of perfectly good points sitting in the repository. The heatmaps are **optional**
+email attachments for the same reason: the run that most needs explaining should
+not be the one that goes unreported.
+
+Rules 1 and 3 exist because the fallback alone then failed the other way. In
+September 2026 it fired with 76% of the grid current and drew every cell at a
+16 day old window three weeks running, discarding 5,890 fresh cells to honour
+1,831 stale ones, while the banner blamed a quota that had not been spent.
 
 `"coverage"` pulls the window back so nearly all cells are included; it now works, and new points are fetched with
 `GRID_WINDOW_MAX_LAG_DAYS` of extra lookback so the earlier window start is
@@ -678,18 +718,24 @@ The Monday workflow runs:
 
 1. **Resolve run date and UTC date**, pinned once and exported as
    `BLAST_RUN_DATE` and `BLAST_UTC_DATE`.
-2. **Offline tests**, `Rscript test_offline.R`. 92 tests, no network. terra is
+2. **Offline tests**, `Rscript test_offline.R`. 128 tests, no network. terra is
    attached inside the suite on purpose, because `terra::shift` masks
    `data.table::shift` and that masking once turned every grid point into a
    silent "empty" and produced a blank map with no error in the log.
 3. **Continental heatmaps**, `Rscript run_blast_grid.R`.
 4. **Town table**, `Rscript run_blast.R`.
-5. **Commit** the cache, trends, run log, spend ledger, failure ledger and map
-   stats. The cache is committed before the email so a failed send does not lose
-   the fetched data.
+5. **Commit** the cache, trends, run log, spend ledger, failure ledger, map
+   stats and run status. The cache is committed before the email so a failed
+   send does not lose the fetched data.
 6. **Email**, `python3 send_email.py`, with the two heatmaps, the two trends CSVs
-   and the run log attached.
+   and the run log attached, and `[DEGRADED]` in the subject when the verdict
+   says so.
 7. **Upload artifact**, all of `blast_outputs/` kept 90 days as a fallback.
+8. **Verdict**, last and `if: always()`: exits non-zero when `run_status.txt` is
+   missing, is from another run date, or says `degraded=1`, so the run shows
+   red and GitHub notifies the workflow's owner. It runs after the commit, the
+   email and the upload on purpose: the R scripts exit 0 on a degraded run so
+   that it *is* reported, and the loud failure comes once nothing can be lost.
 
 Two seasonal cron entries bracket the daylight saving change:
 

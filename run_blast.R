@@ -36,6 +36,14 @@
 #     than producing 31 towns of "no data" as on 2026-09-07. After a 429 that
 #     could not be waited out, the serial fallback is skipped: it is unpaced and
 #     unbudgeted, and it would only be refused too.
+#   * The "Degraded run" banner is built from what the grid run recorded in
+#     map_stats.txt (cells drawn grey, their ages, the fetch's own reason) and no
+#     longer asserts that the daily quota was spent. In September 2026 it said so
+#     three weeks running while the quota had not been spent at all.
+#   * A health verdict (run_health.R) is written to blast_outputs/run_status.txt:
+#     the email subject gains "[DEGRADED]" and the town window, and the workflow's
+#     final step turns the run red, once everything has been committed and sent.
+#     This script still exits 0 on a degraded run, so that it IS sent.
 ################################################################################
 
 SCRIPT_DIR <- tryCatch(
@@ -48,6 +56,7 @@ source(file.path(SCRIPT_DIR, "epirice_model.R"))
 source(file.path(SCRIPT_DIR, "blastam_model.R"))
 source(file.path(SCRIPT_DIR, "openmeteo_wth.R"))
 source(file.path(SCRIPT_DIR, "openmeteo_batch.R"))
+source(file.path(SCRIPT_DIR, "run_health.R"))
 
 suppressPackageStartupMessages({library(data.table); library(methods)})
 
@@ -251,7 +260,8 @@ wet_rule <- if (isTRUE(BLASTAM_USE_BJ_THRESHOLD)) {
 # Read the grid's stats line (written by run_blast_grid.R).
 # Fields: mapped | mean_land_spacing | mapped_last_run | finest | fmt | kb |
 #         read_fmt | window_end | complete_res | weighted_spent | obs_max_epi |
-#         obs_max_blastam
+#         obs_max_blastam | fallback_note | rendered | n_grey | stale_note |
+#         fetch_reason
 map_growth_line <- function() {
   f <- file.path(OUT, "map_stats.txt")
   if (!file.exists(f)) return(NULL)
@@ -265,6 +275,7 @@ map_growth_line <- function() {
   mx_epi <- fld(11, as.numeric); mx_bl <- fld(12, as.numeric)
   wnote  <- if (length(s) >= 13 && nzchar(trimws(s[13]))) trimws(s[13]) else NA_character_
   rendered <- if (length(s) >= 14) trimws(s[14]) else NA_character_
+  n_grey <- if (length(s) >= 15) suppressWarnings(as.integer(s[15])) else NA_integer_
 
   chg <- if (is.na(prev) || prev <= 0) ""
          else if (now > prev) sprintf(" (up from %d mapped last run)", prev)
@@ -288,32 +299,63 @@ map_growth_line <- function() {
             if (kb >= 1024) sprintf("%.1f MB", kb / 1024) else sprintf("%.0f KB", kb))
   }
   qbit <- if (is.na(spent)) "" else sprintf(" Used ~%.0f weighted API calls.", spent)
-  sprintf("%d cells on a %.2f deg lattice%s.%s%s%s%s%s",
-          now, finest, chg, cbit, wtxt, mbit, cache_bit, qbit)
+  gbit <- if (!is.na(n_grey) && n_grey > 0)
+    sprintf(" %d cell(s) drawn grey: not refreshed to that window.", n_grey) else ""
+  sprintf("%d cells on a %.2f deg lattice%s.%s%s%s%s%s%s",
+          now, finest, chg, cbit, wtxt, gbit, mbit, cache_bit, qbit)
 }
 mg <- map_growth_line()
 
 # Degraded-run banner. A run that could not refresh still models from cache and
 # still emails, but it must say so rather than quietly arriving with an older
-# window or without a map.
+# window, with grey cells, or without a map. Every sentence here comes from what
+# the grid run recorded: the banner used to end with "usually because the daily
+# weather-API quota was already spent", which in September 2026 was untrue three
+# weeks running.
 map_warning <- function() {
   f <- file.path(OUT, "map_stats.txt")
   if (!file.exists(f)) return(NULL)
   s <- tryCatch(strsplit(readLines(f, warn = FALSE)[1], "\\|")[[1]],
                 error = function(e) NULL)
   if (length(s) < 13) return(NULL)
-  wnote <- if (nzchar(trimws(s[13]))) trimws(s[13]) else ""
-  rend  <- if (length(s) >= 14) trimws(s[14]) else ""
+  fld <- function(i) if (length(s) >= i) trimws(s[i]) else ""
+  wnote  <- fld(13); rend <- fld(14)
+  n_grey <- suppressWarnings(as.integer(fld(15)))
+  stale  <- fld(16); reason <- fld(17)
   miss <- setdiff(c("epirice", "blastam"), strsplit(rend, "\\+")[[1]])
   parts <- c(
     if (nzchar(wnote)) paste0("The map ", wnote,
-      ". This happens when a run cannot refresh the grid, usually because the daily weather-API quota was already spent. The cells are real cached weather, all on one window, just an older one.") else NULL,
+      ". The coloured cells are real cached weather, all on one window, just an older one.") else NULL,
+    if (!is.na(n_grey) && n_grey > 0 && nzchar(stale)) paste0(stale, ".") else NULL,
+    if (nzchar(reason) && (nzchar(wnote) || (!is.na(n_grey) && n_grey > 0)))
+      paste0("Why: ", reason, ".") else NULL,
     if (nzchar(rend) && length(miss) > 0) sprintf(
       "The %s heatmap could not be rendered this run and is not attached.",
       paste(miss, collapse = " and ")) else NULL)
   if (length(parts) == 0) NULL else paste(parts, collapse = " ")
 }
 mwarn <- map_warning()
+
+# ---- Health verdict --------------------------------------------------------
+# Judged once, here, from the town table and the grid's stats line. Written to
+# RUN_STATUS_FILE for send_email.py (the "[DEGRADED]" subject) and for the
+# workflow's final step (a red run). A town shortfall is named in the banner too;
+# the map's own problems are already described by map_warning().
+ms_fields <- tryCatch(strsplit(readLines(file.path(OUT, "map_stats.txt"), warn = FALSE)[1], "\\|")[[1]],
+                      error = function(e) character(0))
+msf <- function(i) if (length(ms_fields) >= i) trimws(ms_fields[i]) else ""
+map_end  <- suppressWarnings(as.Date(msf(8)))
+towns_ok <- sum(!is.na(results$intensity))
+verdict <- health_verdict(
+  towns_modelled = towns_ok, towns_total = nrow(results),
+  map_behind_days = if (is.na(map_end)) 0L else as.integer(end_date - map_end),
+  map_cells = suppressWarnings(as.integer(msf(1))),
+  map_cells_prev = suppressWarnings(as.integer(msf(3))),
+  map_grey = suppressWarnings(as.integer(msf(15))),
+  fetch_reason = msf(17))
+if (any(grepl("towns modelled", verdict$reasons, fixed = TRUE)))
+  mwarn <- paste(c(sprintf("Only %d of %d towns could be modelled this run; the rest show as no data.",
+                           towns_ok, nrow(results)), mwarn), collapse = " ")
 
 midweek_line <- function() {
   f <- file.path(OUT, "midweek_status.txt")
@@ -634,6 +676,26 @@ append_run_log <- function(f, row) {
 tryCatch(append_run_log(log_f, log_row),
          error = function(e) cat("Run log not updated:", conditionMessage(e), "\n"))
 cat("Run log: ", log_f, "\n")
+
+# ---- Run status ------------------------------------------------------------
+# key=value lines read by send_email.py and by the workflow's Verdict step. This
+# script exits 0 whatever the verdict: a non-zero exit here would stop the
+# workflow before the commit and the email, and the run that most needs
+# explaining is the one that must be reported. The red run comes last.
+status <- list(
+  run_date = format(RUN_DATE), utc_date = format(blast_utc_date()),
+  town_window_end = data_tag, towns_modelled = towns_ok, towns_total = nrow(results),
+  map_window_end = msf(8), map_cells = msf(1), map_cells_grey = msf(15),
+  map_behind_days = if (is.na(map_end)) 0L else as.integer(end_date - map_end),
+  degraded = as.integer(verdict$degraded),
+  reasons = verdict$reasons, warnings = verdict$warnings)
+status_f <- file.path(OUT, RUN_STATUS_FILE)
+writeLines(run_status_lines(status), status_f)
+cat(sprintf("\nRun verdict: %s%s\n",
+            if (verdict$degraded) "DEGRADED" else "healthy",
+            if (verdict$degraded) paste0(" (", paste(verdict$reasons, collapse = "; "), ")") else ""))
+if (length(verdict$warnings)) cat("  notes: ", paste(verdict$warnings, collapse = "; "), "\n", sep = "")
+cat("Status:  ", status_f, "\n")
 
 # ---- Optional simple town point map ----------------------------------------
 band_col <- function(level) {

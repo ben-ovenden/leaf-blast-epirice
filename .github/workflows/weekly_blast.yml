@@ -91,6 +91,9 @@ jobs:
           echo "RUN_DATE=$RD" >> "$GITHUB_ENV"
           echo "BLAST_UTC_DATE=$UD" >> "$GITHUB_ENV"
           echo "Run date pinned to $RD (Australia/Sydney); UTC date $UD"
+          # The previous run's verdict is committed; clear it so the Verdict
+          # step below cannot mistake last week's health for this week's.
+          rm -f blast_outputs/run_status.txt
 
       - name: Install extra R packages
         run: |
@@ -138,7 +141,7 @@ jobs:
             [ -f "blast_outputs/$f" ] && git add -f "blast_outputs/$f" || true
           done
           for f in town_trends.csv blastam_trends.csv run_log.csv map_stats.txt \
-                   midweek_status.txt run_date.txt; do
+                   midweek_status.txt run_date.txt run_status.txt; do
             [ -f "blast_outputs/$f" ] && git add -f "blast_outputs/$f" || true
           done
           git add -u blast_outputs/ 2>/dev/null || true
@@ -170,3 +173,32 @@ jobs:
           name: blast-outputs
           path: blast_outputs/
           retention-days: 90
+
+      # FAIL LOUDLY, LAST. Everything above has already been committed, emailed
+      # and uploaded; this step only decides the colour of the run. run_blast.R
+      # writes run_status.txt with degraded=0/1 and the reasons (run_health.R);
+      # a missing file, or one from another run date, means the town step never
+      # finished. A red run makes GitHub notify the workflow's owner, on top of
+      # the "[DEGRADED]" subject line. The 2026-09-07 run delivered 31 towns of
+      # "no data" and the next two a map three weeks stale, and all three showed
+      # a green tick.
+      - name: Verdict
+        if: always()
+        run: |
+          f=blast_outputs/run_status.txt
+          if [ ! -f "$f" ]; then
+            echo "::error title=Blast run did not finish::$f is missing: run_blast.R did not complete"
+            exit 1
+          fi
+          cat "$f"
+          if ! grep -q "^run_date=${BLAST_RUN_DATE}$" "$f"; then
+            echo "::error title=Blast run did not finish::$f is from another run date"
+            exit 1
+          fi
+          if grep -q '^degraded=1' "$f"; then
+            echo "::error title=Degraded blast run::$(grep '^reasons=' "$f" | cut -d= -f2-)"
+            exit 1
+          fi
+          w=$(grep '^warnings=' "$f" | cut -d= -f2-)
+          if [ -n "$w" ]; then echo "::warning title=Blast run notes::$w"; fi
+          echo "Healthy run."
