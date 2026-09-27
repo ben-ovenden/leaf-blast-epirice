@@ -583,5 +583,56 @@ cat("\n19. Stale cells are drawn grey, not dropped, and the banner says why\n")
      regexpr("WRITE_GEOTIFF))", gsrc, fixed = TRUE))
 }
 
+cat("\n20. A degraded run is called degraded: verdict, status file, subject, workflow\n")
+# Regression: the 2026-09-07 run delivered 31 towns of "no data" and the 09-14
+# and 09-21 runs a map three weeks stale; all three exited 0, showed a green tick
+# and went out under a subject that said nothing was wrong.
+source("run_health.R")
+{
+  v <- health_verdict(0L, 31L)
+  ok("31 towns of no data is degraded", v$degraded && grepl("only 0 of 31 towns", v$reasons[1]))
+  ok("29 of 31 towns (94%) is not", !health_verdict(29L, 31L)$degraded)
+  ok("27 of 31 towns is", health_verdict(27L, 31L)$degraded)
+  v <- health_verdict(31L, 31L, map_behind_days = 16L)
+  ok("a map 16 days behind the table is degraded", v$degraded && grepl("16 days behind", v$reasons))
+  ok("one day behind is tolerated", !health_verdict(31L, 31L, map_behind_days = 1L)$degraded)
+  v <- health_verdict(31L, 31L, map_cells = 5890L, map_grey = 1831L)
+  ok("a quarter of the grid grey is degraded", v$degraded && grepl("1831 map cells \\(24%\\)", v$reasons))
+  v <- health_verdict(31L, 31L, map_cells = 7700L, map_grey = 21L)
+  ok("a few grey cells are a note, not a failure", !v$degraded && length(v$warnings) == 1L)
+  v <- health_verdict(31L, 31L, map_cells = 5000L, map_cells_prev = 7721L)
+  ok("a 35% drop in mapped cells is degraded", v$degraded && grepl("fell from 7721 to 5000", v$reasons))
+  ok("growth is not", !health_verdict(31L, 31L, map_cells = 7721L, map_cells_prev = 5000L)$degraded)
+  v <- health_verdict(31L, 31L, fetch_reason = "the weather API refused further requests (HTTP 429)")
+  ok("a fetch reason alone is a note, not a failure", !v$degraded && grepl("HTTP 429", v$warnings))
+  ok("missing map stats neither error nor fail",
+     !health_verdict(31L, 31L, map_cells = NA, map_cells_prev = NA, map_grey = NA)$degraded)
+  f <- tempfile(fileext = ".txt")
+  writeLines(run_status_lines(list(run_date = "2026-09-21", degraded = 1L,
+                                   reasons = c("a | b", "c\nd"), warnings = character(0))), f)
+  st <- read_run_status(f)
+  ok("the status file round-trips and is pipe- and newline-safe",
+     st$run_date == "2026-09-21" && st$degraded == "1" && st$reasons == "a   b; c d" &&
+     identical(st$warnings, ""), sprintf("(reasons '%s')", st$reasons))
+  unlink(f)
+  ok("run_blast.R judges the run and writes the status file",
+     grepl("health_verdict(", tsrc, fixed = TRUE) && grepl("RUN_STATUS_FILE", tsrc, fixed = TRUE))
+  py <- paste(readLines("send_email.py", warn = FALSE), collapse = "\n")
+  ok("send_email.py reads the status and marks the subject",
+     grepl("run_status.txt", py, fixed = TRUE) && grepl("[DEGRADED]", py, fixed = TRUE))
+  ok("and puts the town window first, adding the map window only when it differs",
+     grepl("town_window_end", py, fixed = TRUE) && grepl("maps to", py, fixed = TRUE))
+  yml <- paste(readLines(".github/workflows/weekly_blast.yml", warn = FALSE), collapse = "\n")
+  ok("the workflow ends with a Verdict step that fails on degraded=1",
+     grepl("name: Verdict", yml, fixed = TRUE) && grepl("degraded=1", yml, fixed = TRUE))
+  ok("which runs after the email and the artifact upload",
+     regexpr("name: Verdict", yml, fixed = TRUE) > regexpr("name: Upload artifact", yml, fixed = TRUE) &&
+     regexpr("name: Verdict", yml, fixed = TRUE) > regexpr("name: Email summary", yml, fixed = TRUE))
+  ok("and clears the previous run's status at the start",
+     grepl("rm -f blast_outputs/run_status.txt", yml, fixed = TRUE))
+  ok("and commits the status file with the other state",
+     grepl("run_status.txt", sub("Email summary.*$", "", sub("^.*Commit cache and trends", "", yml)), fixed = TRUE))
+}
+
 cat(sprintf("\n%d tests, %d failures\n", n, fails))
 quit(status = if (fails > 0L) 1L else 0L)

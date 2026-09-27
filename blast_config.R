@@ -558,6 +558,25 @@ HISTORY_RUNS <- 12
 RUN_LOG_FILE <- "run_log.csv"
 
 ################################################################################
+# 6a. Run health: when is a run degraded? (run_health.R)
+################################################################################
+# One verdict per run, written to RUN_STATUS_FILE by run_blast.R. It prefixes the
+# email subject with "[DEGRADED]" and turns the workflow run red in its final
+# step, after everything has been committed, emailed and uploaded. Until this
+# existed, a run that delivered 31 towns of "no data" (2026-09-07) or a map three
+# weeks stale (09-14, 09-21) exited 0 and showed a green tick.
+#
+# These fail the run:
+HEALTH_MIN_TOWN_FRAC       <- 0.9   # fewer towns modelled than this share
+HEALTH_MAX_MAP_BEHIND_DAYS <- 1L    # map window more than this behind the towns
+HEALTH_MAX_GREY_FRAC       <- 0.02  # more than this share of cells drawn grey
+HEALTH_MAX_MAP_DROP_FRAC   <- 0.10  # mapped cells fell by more than this vs last run
+# Anything the grid fetch recorded as its reason (a 429, the deadline, a budget
+# shortfall) is carried as a WARNING, not a failure: it is the product that is
+# judged, not the weather API's day.
+RUN_STATUS_FILE <- "run_status.txt"
+
+################################################################################
 # 7. Citation (added to the summary and to the heatmap footer)
 ################################################################################
 CITATION <- paste(

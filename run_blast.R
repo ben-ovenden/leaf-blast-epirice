@@ -40,6 +40,10 @@
 #     map_stats.txt (cells drawn grey, their ages, the fetch's own reason) and no
 #     longer asserts that the daily quota was spent. In September 2026 it said so
 #     three weeks running while the quota had not been spent at all.
+#   * A health verdict (run_health.R) is written to blast_outputs/run_status.txt:
+#     the email subject gains "[DEGRADED]" and the town window, and the workflow's
+#     final step turns the run red, once everything has been committed and sent.
+#     This script still exits 0 on a degraded run, so that it IS sent.
 ################################################################################
 
 SCRIPT_DIR <- tryCatch(
@@ -52,6 +56,7 @@ source(file.path(SCRIPT_DIR, "epirice_model.R"))
 source(file.path(SCRIPT_DIR, "blastam_model.R"))
 source(file.path(SCRIPT_DIR, "openmeteo_wth.R"))
 source(file.path(SCRIPT_DIR, "openmeteo_batch.R"))
+source(file.path(SCRIPT_DIR, "run_health.R"))
 
 suppressPackageStartupMessages({library(data.table); library(methods)})
 
@@ -330,6 +335,27 @@ map_warning <- function() {
   if (length(parts) == 0) NULL else paste(parts, collapse = " ")
 }
 mwarn <- map_warning()
+
+# ---- Health verdict --------------------------------------------------------
+# Judged once, here, from the town table and the grid's stats line. Written to
+# RUN_STATUS_FILE for send_email.py (the "[DEGRADED]" subject) and for the
+# workflow's final step (a red run). A town shortfall is named in the banner too;
+# the map's own problems are already described by map_warning().
+ms_fields <- tryCatch(strsplit(readLines(file.path(OUT, "map_stats.txt"), warn = FALSE)[1], "\\|")[[1]],
+                      error = function(e) character(0))
+msf <- function(i) if (length(ms_fields) >= i) trimws(ms_fields[i]) else ""
+map_end  <- suppressWarnings(as.Date(msf(8)))
+towns_ok <- sum(!is.na(results$intensity))
+verdict <- health_verdict(
+  towns_modelled = towns_ok, towns_total = nrow(results),
+  map_behind_days = if (is.na(map_end)) 0L else as.integer(end_date - map_end),
+  map_cells = suppressWarnings(as.integer(msf(1))),
+  map_cells_prev = suppressWarnings(as.integer(msf(3))),
+  map_grey = suppressWarnings(as.integer(msf(15))),
+  fetch_reason = msf(17))
+if (any(grepl("towns modelled", verdict$reasons, fixed = TRUE)))
+  mwarn <- paste(c(sprintf("Only %d of %d towns could be modelled this run; the rest show as no data.",
+                           towns_ok, nrow(results)), mwarn), collapse = " ")
 
 midweek_line <- function() {
   f <- file.path(OUT, "midweek_status.txt")
@@ -650,6 +676,26 @@ append_run_log <- function(f, row) {
 tryCatch(append_run_log(log_f, log_row),
          error = function(e) cat("Run log not updated:", conditionMessage(e), "\n"))
 cat("Run log: ", log_f, "\n")
+
+# ---- Run status ------------------------------------------------------------
+# key=value lines read by send_email.py and by the workflow's Verdict step. This
+# script exits 0 whatever the verdict: a non-zero exit here would stop the
+# workflow before the commit and the email, and the run that most needs
+# explaining is the one that must be reported. The red run comes last.
+status <- list(
+  run_date = format(RUN_DATE), utc_date = format(blast_utc_date()),
+  town_window_end = data_tag, towns_modelled = towns_ok, towns_total = nrow(results),
+  map_window_end = msf(8), map_cells = msf(1), map_cells_grey = msf(15),
+  map_behind_days = if (is.na(map_end)) 0L else as.integer(end_date - map_end),
+  degraded = as.integer(verdict$degraded),
+  reasons = verdict$reasons, warnings = verdict$warnings)
+status_f <- file.path(OUT, RUN_STATUS_FILE)
+writeLines(run_status_lines(status), status_f)
+cat(sprintf("\nRun verdict: %s%s\n",
+            if (verdict$degraded) "DEGRADED" else "healthy",
+            if (verdict$degraded) paste0(" (", paste(verdict$reasons, collapse = "; "), ")") else ""))
+if (length(verdict$warnings)) cat("  notes: ", paste(verdict$warnings, collapse = "; "), "\n", sep = "")
+cat("Status:  ", status_f, "\n")
 
 # ---- Optional simple town point map ----------------------------------------
 band_col <- function(level) {
