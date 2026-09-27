@@ -634,5 +634,108 @@ source("run_health.R")
      grepl("run_status.txt", sub("Email summary.*$", "", sub("^.*Commit cache and trends", "", yml)), fixed = TRUE))
 }
 
+cat("\n21. A rerun over the same window cannot make the record worse\n")
+# Regression: on 2026-09-21 a manual rerun the same UTC day, correctly capped by
+# the spend ledger at 42 weighted calls for the towns, fell through to a serial
+# fallback that was unpaced, uncharged and invisible to the ledger, fetched 29
+# towns off the books, and then overwrote the scheduled run's 31-town trends
+# column and run log row with its own (Moree and Borroloola became NA).
+{
+  # (a) the second pass goes through fetch_points_batched(), one town per request
+  real_om_request <- om_request; calls <- 0L
+  om_request <- function(lats, lons, start_date, end_date, timeout_s = 60) {
+    calls <<- calls + 1L
+    list(status = "ok", code = 200L, retry_after = NA_real_, msg = "",
+         body = lapply(seq_along(lats), function(i) list(hourly = list(
+           time = as.list(format(as.POSIXct("2026-06-01 00:00", tz = "UTC") + (0:23) * 3600,
+                                 "%Y-%m-%dT%H:%M")),
+           temperature_2m = as.list(rep(25, 24)), relative_humidity_2m = as.list(rep(80, 24)),
+           precipitation = as.list(rep(0, 24))))))
+  }
+  pts5 <- data.table(pid = sprintf("s%d", 1:5), lon = 145 + (1:5) / 10, lat = -25)
+  one <- function(pid, lon, lat, hw) data.table(pid = pid)
+  r <- fetch_points_batched(pts5, as.Date("2026-06-01"), as.Date("2026-06-14"), one,
+                            budget = Inf, label = "test-single", batch_size = 1L,
+                            pacer = function(w) invisible(NULL))
+  ok("batch_size = 1 sends one request per town", calls == 5L && r$n_ok == 5L, sprintf("(%d requests)", calls))
+  r <- fetch_points_batched(pts5, as.Date("2026-06-01"), as.Date("2026-06-14"), one,
+                            budget = 3, label = "test-single-budget", batch_size = 1L,
+                            pacer = function(w) invisible(NULL))
+  ok("and it stops at the budget like any other fetch",
+     r$n_ok == 3L && r$stopped == "budget" && abs(r$spent - 3) < 1e-9)
+  om_request <- real_om_request
+  ok("run_blast.R no longer fetches towns outside the batch path",
+     !grepl("get_openmeteo_hourly", tsrc, fixed = TRUE) && grepl("batch_size = 1L", tsrc, fixed = TRUE))
+  # (b) trends: this run's blanks are filled from the earlier run's column
+  hist <- data.table(town = c("Moree", "Borroloola", "Dubbo"),
+                     `2026-09-07` = c(1, 2, 3), `2026-09-14` = c(0.0009, 3, 0.0059))
+  today <- data.table(town = c("Moree", "Borroloola", "Dubbo")); today[["2026-09-14"]] <- c(NA, NA, 0.0061)
+  m <- trends_merge_rerun(today, hist, "2026-09-14")
+  ok("towns the rerun could not model keep the earlier value",
+     m$n_kept == 2L && m$today[town == "Moree"][["2026-09-14"]] == 0.0009 &&
+     m$today[town == "Borroloola"][["2026-09-14"]] == 3)
+  ok("towns it did model take the new value", m$today[town == "Dubbo"][["2026-09-14"]] == 0.0061)
+  ok("the earlier column is dropped so the merged one replaces it",
+     !"2026-09-14" %in% names(m$hist) && "2026-09-07" %in% names(m$hist))
+  m2 <- trends_merge_rerun(today, hist[, .(town, `2026-09-07`)], "2026-09-14")
+  ok("a first run over a window merges nothing",
+     m2$n_kept == 0L && identical(m2$today[["2026-09-14"]], c(NA, NA, 0.0061)))
+  # (c) run log: the row that modelled the most towns is the one kept
+  old <- data.table(run_date = c("2026-09-14", "2026-09-21"),
+                    data_end = c("2026-09-07", "2026-09-14"), towns_modelled = c(31L, 31L))
+  k <- runlog_keep_better(old, data.table(run_date = "2026-09-21", data_end = "2026-09-14",
+                                          towns_modelled = 29L), "2026-09-14")
+  ok("a rerun that modelled fewer towns does not replace the row", !k$write_new && k$prev_towns == 31L)
+  k <- runlog_keep_better(old, data.table(run_date = "2026-09-21", data_end = "2026-09-14",
+                                          towns_modelled = 31L), "2026-09-14")
+  ok("an equal or better rerun does, and the old row goes", k$write_new && nrow(k$old) == 1L)
+  k <- runlog_keep_better(old, data.table(run_date = "2026-09-28", data_end = "2026-09-21",
+                                          towns_modelled = 5L), "2026-09-21")
+  ok("a new window is always written", k$write_new && nrow(k$old) == 2L)
+  ok("an empty log is always written", runlog_keep_better(NULL, data.table(towns_modelled = 1L), "x")$write_new)
+  # (d) the spend ledger is keyed on the run's pinned UTC date, not the clock: the
+  # Sunday grid run ends after 00:00 UTC, and booking it to Monday starved the
+  # 2026-09-21 rerun of budget the API had mostly counted against Sunday.
+  oldu <- Sys.getenv("BLAST_UTC_DATE", unset = NA)
+  Sys.setenv(BLAST_UTC_DATE = "2026-09-20")
+  ok("the spend ledger day is the pinned UTC date", om_spend_utc_day() == as.Date("2026-09-20"),
+     sprintf("(got %s)", format(om_spend_utc_day())))
+  lf <- tempfile(fileext = ".csv"); om_spend_add(lf, 8550, "grid")
+  Sys.setenv(BLAST_UTC_DATE = "2026-09-21")
+  ok("so a run on the next pinned day starts with a clean budget", om_spend_read(lf) == 0)
+  Sys.setenv(BLAST_UTC_DATE = "2026-09-20")
+  ok("and a rerun on the same pinned day still shares it", om_spend_read(lf) == 8550)
+  unlink(lf); if (is.na(oldu)) Sys.unsetenv("BLAST_UTC_DATE") else Sys.setenv(BLAST_UTC_DATE = oldu)
+}
+
+cat("\n22. The midweek top-up: a second fetch day, no maps, no email\n")
+# The grid takes about twelve weekly runs to fill from cold and, after an
+# interrupted run, several to recover; a second fetch day halves both. A
+# BLAST_MIDWEEK branch existed in run_blast_grid.R but ran the whole pipeline,
+# nothing invoked it, and the email line assumed a daily job that never existed.
+{
+  ok("MIDWEEK_MAX_AGE_DAYS is configured for a weekly job",
+     exists("MIDWEEK_MAX_AGE_DAYS") && MIDWEEK_MAX_AGE_DAYS >= 7L)
+  ok("in midweek mode the grid runner saves the cache and stops before modelling",
+     regexpr("quit(save = \"no\", status = 0)", gsrc, fixed = TRUE) > 0 &&
+     regexpr("quit(save = \"no\", status = 0)", gsrc, fixed = TRUE) <
+     regexpr("writeLines(run_tag, file.path(OUT, \"run_date.txt\"))", gsrc, fixed = TRUE))
+  ok("the same cache writer serves both paths",
+     lengths(regmatches(gsrc, gregexpr("save_cache_now(cache)", gsrc, fixed = TRUE))) == 2L)
+  ymlm <- if (file.exists(".github/workflows/midweek_topup.yml"))
+    paste(readLines(".github/workflows/midweek_topup.yml", warn = FALSE), collapse = "\n") else ""
+  ok("a midweek workflow exists", nzchar(ymlm))
+  ok("it sets BLAST_MIDWEEK and runs the grid script",
+     grepl("BLAST_MIDWEEK", ymlm, fixed = TRUE) && grepl("run_blast_grid.R", ymlm, fixed = TRUE))
+  ok("it shares the weekly run's concurrency group", grepl("group: blast-grid", ymlm, fixed = TRUE))
+  ok("it sends no email and runs no town table",
+     !grepl("send_email.py", ymlm, fixed = TRUE) && !grepl("run_blast.R", ymlm, fixed = TRUE))
+  ok("it commits the cache and the top-up status",
+     grepl("weather_cache.csv.gz", ymlm, fixed = TRUE) && grepl("midweek_status.txt", ymlm, fixed = TRUE))
+  ok("it fires on a different UTC day from the Monday run", grepl("cron: '30 0 \\* \\* 4'", ymlm))
+  ok("the Monday email reports the top-up on a weekly cadence",
+     grepl("MIDWEEK_MAX_AGE_DAYS", tsrc, fixed = TRUE) && !grepl("Daily top-up", tsrc, fixed = TRUE))
+}
+
 cat(sprintf("\n%d tests, %d failures\n", n, fails))
 quit(status = if (fails > 0L) 1L else 0L)

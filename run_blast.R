@@ -44,6 +44,15 @@
 #     the email subject gains "[DEGRADED]" and the town window, and the workflow's
 #     final step turns the run red, once everything has been committed and sent.
 #     This script still exits 0 on a degraded run, so that it IS sent.
+#   * Towns the batch did not deliver are retried one per request through the
+#     SAME fetch_points_batched() path: budget, pacer, ledger and 429 handling.
+#     The old serial fallback called the single-point adapter directly, so a
+#     rerun the ledger had capped at 42 weighted calls fetched 29 towns off the
+#     books (2026-09-21).
+#   * A rerun over the same data window cannot make the record worse: trends
+#     blanks are filled from the earlier run's column, and the run log keeps the
+#     row that modelled the most towns.
+#   * The Monday email reports the Thursday top-up run on a weekly cadence.
 ################################################################################
 
 SCRIPT_DIR <- tryCatch(
@@ -200,29 +209,27 @@ fr <- fetch_points_batched(sites[, .(pid, lon, lat)], fetch_from, data_end,
                            quota_wait_max_s = TOWN_QUOTA_WAIT_MAX_MIN * 60)
 om_spend_add(ledger_path, fr$spent, "towns")
 
-# Serial fallback for towns the batch did not deliver, on a clean connection.
-# Not after a 429 that could not be waited out: the serial path is unpaced and
-# unbudgeted, so it would hammer a ceiling the batch fetch has just hit and its
-# spend would not reach the ledger.
+# Second pass for towns the batch did not deliver: one town per request, through
+# the SAME budget, pacer, spend ledger and 429 handling as the first pass. This
+# used to call get_openmeteo_hourly() directly: unpaced, uncharged and invisible
+# to the ledger, so the 2026-09-21 rerun, which the ledger had correctly capped
+# at 42 weighted calls, went on to fetch 29 towns off the books.
+#
+# Not after a 429 that could not be waited out: it would only be refused again.
 missing <- setdiff(sites$pid, ls(town_daily))
-if (length(missing) > 0 && identical(fr$stopped, "quota"))
-  cat(sprintf("Serial fallback skipped for %d town(s): the API quota ceiling was hit and could not be waited out.\n",
+if (length(missing) > 0 && identical(fr$stopped, "quota")) {
+  cat(sprintf("Second pass skipped for %d town(s): the API quota ceiling was hit and could not be waited out.\n",
               length(missing)))
-if (length(missing) > 0 && fr$spent < town_budget && !identical(fr$stopped, "quota")) {
-  cat(sprintf("Serial fallback for %d town(s): %s\n",
+} else if (length(missing) > 0 && fr$spent < town_budget) {
+  cat(sprintf("Second pass for %d town(s), one per request: %s\n",
               length(missing), paste(missing, collapse = ", ")))
-  for (nm in missing) {
-    s <- sites[pid == nm]
-    hw <- tryCatch(get_openmeteo_hourly(s$lat, s$lon, fetch_from, data_end),
-                   error = function(e) NULL)
-    if (!is.null(hw) && nrow(hw) > 0) {
-      w <- tryCatch(blastam_daily_from_hourly(hw, lon = s$lon), error = function(e) NULL)
-      if (!is.null(w) && nrow(w) > 0) {
-        w <- w[date >= emergence & date <= end_date]
-        if (nrow(w) > 0) assign(nm, as.data.table(w), envir = town_daily)
-      }
-    }
-  }
+  fr2 <- fetch_points_batched(sites[pid %in% missing, .(pid, lon, lat)], fetch_from, data_end,
+                              on_point = on_town, budget = town_budget - fr$spent,
+                              label = "towns-retry", batch_size = 1L,
+                              quota_wait_max_s = TOWN_QUOTA_WAIT_MAX_MIN * 60)
+  om_spend_add(ledger_path, fr2$spent, "towns-retry")
+  fr$spent <- fr$spent + fr2$spent          # the run log records the whole town spend
+  if (identical(fr2$stopped, "quota")) fr$stopped <- "quota"
 }
 
 results <- rbindlist(lapply(seq_len(nrow(sites)), function(k) {
@@ -357,6 +364,11 @@ if (any(grepl("towns modelled", verdict$reasons, fixed = TRUE)))
   mwarn <- paste(c(sprintf("Only %d of %d towns could be modelled this run; the rest show as no data.",
                            towns_ok, nrow(results)), mwarn), collapse = " ")
 
+# The Thursday top-up (.github/workflows/midweek_topup.yml) writes
+# midweek_status.txt: date | cells after | cells before | added | fmt | KB |
+# cells fetched. It is a weekly job, so "none in the last MIDWEEK_MAX_AGE_DAYS"
+# is the complaint; the line used to assume a DAILY job that never existed and
+# would have complained every Monday.
 midweek_line <- function() {
   f <- file.path(OUT, "midweek_status.txt")
   if (!file.exists(f)) return(NULL)
@@ -364,12 +376,16 @@ midweek_line <- function() {
                 error = function(e) NULL)
   if (length(s) < 4) return(NULL)
   d <- suppressWarnings(as.Date(s[1])); pts <- as.integer(s[2]); added <- as.integer(s[4])
-  if (is.na(d) || as.integer(RUN_DATE - d) > 2)
-    sprintf("Daily top-up: no run in the last 2 days (last %s); check the top-up job.",
-            if (is.na(d)) "never" else format(d, "%d %b"))
+  fetched <- if (length(s) >= 7) suppressWarnings(as.integer(s[7])) else NA_integer_
+  max_age <- if (exists("MIDWEEK_MAX_AGE_DAYS")) MIDWEEK_MAX_AGE_DAYS else 7L
+  if (is.na(d) || as.integer(RUN_DATE - d) > max_age)
+    sprintf("Midweek top-up: none in the last %d days (last %s); check the top-up workflow.",
+            max_age, if (is.na(d)) "never" else format(d, "%d %b"))
   else
-    sprintf("Daily top-up ran %s: +%d points, cache now %d (ok).",
-            format(d, "%d %b"), added, pts)
+    sprintf("Midweek top-up ran %s: %s%d new cell(s), cache now %d.",
+            format(d, "%a %d %b"),
+            if (is.na(fetched)) "" else sprintf("%d cell(s) fetched, ", fetched),
+            added, pts)
 }
 mw <- midweek_line()
 
@@ -614,7 +630,9 @@ writeLines(html, file.path(OUT, "blast_summary_latest.html"))
 # Columns used to be keyed on the RUN date, so three test runs on 28, 29 and 30
 # July each took a column while describing almost the same weather, and with a
 # short history that evicts the genuinely older columns. Keying on the data end
-# date means a re-run over the same window replaces its column instead.
+# date means a re-run over the same window MERGES into its column: towns this run
+# modelled take this run's value, towns it could not keep the earlier one. The
+# 2026-09-21 rerun used to replace the column outright and turned two towns NA.
 #
 # Blanks are written as NA. In the delivered 2026-07-11 column an absent town
 # read as an empty cell, which is indistinguishable from a zero in a spreadsheet.
@@ -625,7 +643,11 @@ write_trends <- function(values, file_name) {
   hist <- if (file.exists(f))
     fread(f, header = TRUE, colClasses = list(character = "town"), na.strings = "NA") else
     data.table(town = character())
-  if (data_tag %in% names(hist)) hist[, (data_tag) := NULL]
+  m <- trends_merge_rerun(today, hist, data_tag)
+  if (m$n_kept > 0L)
+    cat(sprintf("Trends %s: %d town(s) with no value this run keep the earlier run's value for the same window.\n",
+                file_name, m$n_kept))
+  today <- m$today; hist <- m$hist
   hist <- merge(hist, today, by = "town", all = TRUE)
   ord <- c(results$name, setdiff(hist$town, results$name))
   hist <- hist[match(ord, town)]
@@ -664,14 +686,23 @@ log_f <- file.path(OUT, RUN_LOG_FILE)
 # real outputs are already on disk.
 append_run_log <- function(f, row) {
   old <- if (file.exists(f)) tryCatch(fread(f), error = function(e) NULL) else NULL
+  # One row per window: the run that modelled the most towns. A rerun that did
+  # worse leaves the earlier row alone (its own spend is on the ledger anyway).
+  k <- runlog_keep_better(old, row, data_tag)
+  if (!k$write_new) {
+    cat(sprintf("Run log: an earlier run over the same window modelled %d towns against %d now; its row is kept.\n",
+                k$prev_towns, row$towns_modelled[1]))
+    return(invisible(FALSE))
+  }
+  old <- k$old
   if (!is.null(old) && nrow(old) > 0) {
-    if ("data_end" %in% names(old)) old <- old[as.character(data_end) != data_tag]
     for (cl in intersect(names(row), names(old)))
       if (!identical(class(old[[cl]]), class(row[[cl]])))
         set(old, j = cl, value = methods::as(as.character(old[[cl]]), class(row[[cl]])[1]))
   }
   fwrite(if (is.null(old) || nrow(old) == 0) row else rbind(old, row, fill = TRUE),
          f, na = "NA")
+  invisible(TRUE)
 }
 tryCatch(append_run_log(log_f, log_row),
          error = function(e) cat("Run log not updated:", conditionMessage(e), "\n"))

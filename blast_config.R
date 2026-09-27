@@ -420,6 +420,13 @@ COL_STALE <- COL_NODATA        # cells not refreshed to the window are drawn in 
 # for a reason unrelated to the alignment bug this replaced.
 GRID_WINDOW_MAX_LAG_DAYS <- 7L
 
+# Midweek top-up (.github/workflows/midweek_topup.yml): a second fetch day each
+# week, run with BLAST_MIDWEEK=1, which fetches, saves the cache and stops. It
+# halves the time the grid takes to fill from cold and to recover after an
+# interrupted run. run_blast.R reports its last run in the Monday email and
+# complains when that is older than this.
+MIDWEEK_MAX_AGE_DAYS <- 7L
+
 # Rendering. The IDW search radius is derived from the achieved spacing.
 IDW_RADIUS_MULT <- 1.5   # search radius = this many times the mean land spacing
 IDW_RADIUS_MAX  <- 1.0   # absolute cap, degrees (~110 km)

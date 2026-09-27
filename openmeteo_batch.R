@@ -261,6 +261,9 @@ om_request <- function(lats, lons, start_date, end_date, timeout_s = 60) {
 #              full one. NULL makes a private pacer.
 #   quota_wait_max_s  total seconds this call may spend waiting out minutely or
 #              hourly HTTP 429s before giving up. A daily 429 is never waited out.
+#   batch_size locations per request. The town runner's second pass uses 1, so a
+#              town that failed inside a batch is retried on its own through the
+#              same budget, pacer and ledger rather than through a side path.
 #
 # Returns list(rows, ledger, spent, stopped, n_ok, waited_s).
 #   stopped is "" | "deadline" | "budget" | "quota"
@@ -271,14 +274,15 @@ fetch_points_batched <- function(pts, start_date, end_date, on_point,
                                  budget = Inf,
                                  label = "fetch",
                                  pacer = NULL,
-                                 quota_wait_max_s = .cfg("OM_QUOTA_WAIT_MAX_MIN", 60) * 60) {
+                                 quota_wait_max_s = .cfg("OM_QUOTA_WAIT_MAX_MIN", 60) * 60,
+                                 batch_size = .cfg("OM_BATCH_SIZE", 25L)) {
   n <- nrow(pts)
   if (n == 0L)
     return(list(rows = list(), ledger = data.table(pid = character(), status = character(),
                                                    code = integer()),
                 spent = 0, stopped = "", n_ok = 0L, waited_s = 0))
 
-  batch_size <- as.integer(.cfg("OM_BATCH_SIZE", 25L))
+  batch_size <- max(1L, as.integer(batch_size))
   rate       <- .cfg("GRID_TARGET_PER_MIN", 80)
   timeout_s  <- as.integer(.cfg("OM_TIMEOUT_S", 60L))
   max_att    <- as.integer(.cfg("OM_MAX_ATTEMPTS", 3L))
@@ -424,7 +428,17 @@ fetch_points_batched <- function(pts, start_date, end_date, on_point,
 # Both scripts now append their spend here, keyed on the UTC day the quota resets
 # on, and read it back before deciding their own budget.
 ################################################################################
-om_spend_utc_day <- function() as.Date(format(Sys.time(), "%Y-%m-%d", tz = "UTC"))
+# The ledger day is the run's PINNED UTC date (BLAST_UTC_DATE, via blast_utc_date()
+# when blast_config.R is loaded), not the clock at the moment of writing. The
+# Sunday-evening grid run crosses 00:00 UTC, so the wall clock booked its whole
+# 8,550 to Monday: the 2026-09-21 evening rerun then read "8,700 already spent
+# today" and was capped to 800, for spend the API had largely counted against
+# Sunday. Keyed on the day the run started, a rerun on the same pinned day still
+# shares the budget, which is the property the ledger exists for.
+om_spend_utc_day <- function() {
+  if (exists("blast_utc_date", mode = "function")) return(as.Date(blast_utc_date()))
+  as.Date(format(Sys.time(), "%Y-%m-%d", tz = "UTC"))
+}
 
 om_spend_read <- function(file, day = om_spend_utc_day()) {
   if (!file.exists(file)) return(0)

@@ -2,9 +2,12 @@
 # openmeteo_wth.R
 #
 # Single point weather adapters for the Open-Meteo historical archive (ERA5).
-# The GRID path no longer lives here: see openmeteo_batch.R, which fetches many
-# locations per request. What remains is used by run_blast.R for the town table
-# and by the offline tests.
+# Neither runner uses this file any more. The grid path moved to
+# openmeteo_batch.R, and since September 2026 the town table's second pass goes
+# through fetch_points_batched() too (one town per request), so that it is paced,
+# charged and on the spend ledger like every other fetch: the serial fallback here
+# was none of those and fetched 29 towns off the books on 2026-09-21. Kept for ad
+# hoc single point checks.
 #
 # Returns the schema the SEIR model expects:
 #   YYYYMMDD (Date), DOY (int), TEMP (mean C), RHUM (mean %), RAIN (mm), LAT, LON

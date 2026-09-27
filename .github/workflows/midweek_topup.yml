@@ -1,0 +1,106 @@
+name: Midweek grid top-up (Thursday, no email)
+
+# A second fetch day each week. The Monday run refreshes the whole grid and has
+# little budget left over to recover cells that fell behind or to add new ones;
+# this run spends another UTC day's quota on the same cache, so a backlog clears
+# in half the time and the grid fills from cold in about six weeks rather than
+# twelve. It fetches, merges and commits the cache, and stops: no maps, no town
+# table, no email (BLAST_MIDWEEK=1 in run_blast_grid.R). The Monday email reports
+# when it last ran.
+on:
+  schedule:
+    # 00:30 UTC Thursday = 10:30 AEST / 11:30 AEDT. After 00:00 UTC so the
+    # archive day the window asks for is complete (blast_data_end), three days
+    # from the Monday run either way, and a different UTC day from it, so the
+    # two never share a daily quota.
+    - cron: '30 0 * * 4'
+  workflow_dispatch:
+    inputs:
+      run_date:
+        description: 'Override the run date (YYYY-MM-DD). Leave blank for today in Sydney.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+# The same group as the weekly workflow: two runs must never write the weather
+# cache at once, whichever workflow they belong to.
+concurrency:
+  group: blast-grid
+  cancel-in-progress: false
+
+jobs:
+  topup:
+    runs-on: ubuntu-latest
+    # GRID_MAX_MINUTES (200) plus GRID_RESERVE_MINUTES (25) plus commit.
+    timeout-minutes: 240
+    container:
+      image: rocker/geospatial:latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Same pinning as the weekly run: one run date and one UTC date for the
+      # whole job. run_status.txt is the MONDAY run's verdict and is left alone.
+      - name: Resolve run date
+        run: |
+          RD="${{ github.event.inputs.run_date }}"
+          [ -z "$RD" ] && RD=$(TZ=Australia/Sydney date +%F)
+          UD=$(date -u +%F)
+          echo "BLAST_RUN_DATE=$RD" >> "$GITHUB_ENV"
+          echo "BLAST_UTC_DATE=$UD" >> "$GITHUB_ENV"
+          echo "Run date pinned to $RD (Australia/Sydney); UTC date $UD"
+
+      - name: Install extra R packages
+        run: |
+          pkgs <- c("data.table", "jsonlite", "curl", "terra")
+          need <- pkgs[!pkgs %in% rownames(installed.packages())]
+          if (length(need)) install.packages(need)
+        shell: Rscript {0}
+
+      - name: Offline tests
+        run: Rscript test_offline.R
+
+      - name: Fetch and save the cache
+        env:
+          BLAST_MIDWEEK: "1"
+        run: Rscript run_blast_grid.R
+
+      - name: Commit cache and top-up status
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --local user.email "github-actions@github.com"
+          git config --local user.name "github-actions"
+          for f in weather_cache.csv.gz weather_cache.csv fetch_failures.csv \
+                   cache_version.txt weighted_spend.csv midweek_status.txt; do
+            [ -f "blast_outputs/$f" ] && git add -f "blast_outputs/$f" || true
+          done
+          git add -u blast_outputs/ 2>/dev/null || true
+          if git diff --staged --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "Midweek top-up (cache) ${BLAST_RUN_DATE}"
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+            for i in 1 2 3; do git push && break || sleep $((i*10)); done
+          fi
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blast-topup-outputs
+          path: blast_outputs/
+          retention-days: 30
+
+      # The top-up has one job: leave a fresher committed cache behind. A missing
+      # or stale status file means it did not get that far.
+      - name: Verdict
+        if: always()
+        run: |
+          f=blast_outputs/midweek_status.txt
+          if [ ! -f "$f" ] || ! grep -q "^${BLAST_RUN_DATE}|" "$f"; then
+            echo "::error title=Midweek top-up did not finish::$f is missing or from another run"
+            exit 1
+          fi
+          echo "Top-up status: $(cat "$f")"
