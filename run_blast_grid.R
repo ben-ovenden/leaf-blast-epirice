@@ -56,6 +56,9 @@
 #     count and age in the footer. map_stats.txt carries the count, the cohort
 #     summary and the fetch's own reason, so the email banner states what
 #     actually happened rather than a fixed sentence about the quota.
+#   * BLAST_MIDWEEK=1 (the Thursday top-up workflow) fetches, merges, saves the
+#     cache and STOPS: no window, no models, no maps, no map_stats.txt. The old
+#     branch of that name ran the whole pipeline and nothing invoked it.
 #
 # The test hook is GRID_ON_POINT(pid, lon, lat, hourly_dt) -> cache rows.
 ################################################################################
@@ -514,6 +517,78 @@ cache <- if (keep_hist) {
 setorder(cache, pid, date)
 cache <- unique(cache, by = c("pid", "date"), fromLast = TRUE)
 
+# ---- Cache writer ----------------------------------------------------------
+# Defined before the model rather than after it, because a midweek top-up run
+# saves the cache and stops here.
+#
+# fwrite() decides whether to compress from the FILE EXTENSION, so a temp file
+# named ".tmp" is written as plain text and then renamed to ".gz". gzfile()
+# reads it back happily, so the verify passes and an 8x larger file is committed
+# under a .gz name. Hence both the ".tmp.gz" naming and this explicit check.
+is_gzip <- function(f) {
+  con <- file(f, "rb"); on.exit(close(con), add = TRUE)
+  identical(as.integer(readBin(con, "raw", 2L)), c(31L, 139L))
+}
+
+write_cache <- function(dt) {
+  tmp_gz <- paste0(gz_file, ".tmp.gz")     # extension must survive, see is_gzip()
+  ok_gz <- tryCatch({
+    fwrite(dt, tmp_gz, na = "NA")
+    if (!is_gzip(tmp_gz)) {
+      cat("gz cache was NOT compressed (data.table built without zlib?); using plain CSV.\n")
+      FALSE
+    } else nrow(read_gz_dt(tmp_gz)) == nrow(dt)
+  }, error = function(e) { cat("gz verify error:", conditionMessage(e), "\n"); FALSE })
+  if (ok_gz) {
+    file.rename(tmp_gz, gz_file)
+    if (WEATHER_CACHE_KEEP_CSV) {
+      tmp_csv <- paste0(csv_file, ".tmp.csv"); fwrite(dt, tmp_csv, na = "NA")
+      file.rename(tmp_csv, csv_file); fmt <- "gz+csv"
+    } else {
+      if (file.exists(csv_file)) file.remove(csv_file); fmt <- "gz"
+    }
+    return(list(fmt = fmt, kb = file.info(gz_file)$size / 1024))
+  }
+  unlink(tmp_gz)
+  cat("gz cache write/verify failed; falling back to plain CSV.\n")
+  tmp_csv <- paste0(csv_file, ".tmp.csv"); fwrite(dt, tmp_csv, na = "NA")
+  file.rename(tmp_csv, csv_file)
+  if (file.exists(gz_file)) file.remove(gz_file)
+  list(fmt = "csv", kb = file.info(csv_file)$size / 1024)
+}
+
+save_cache_now <- function(cache) {
+  csvdt <- copy(cache)
+  csvdt[, `:=`(TEMP = round(TEMP, 1), RHUM = round(RHUM, 0), RAIN = round(RAIN, 1),
+               temp_wet = round(temp_wet, 1), wet_hours = round(wet_hours, 0),
+               lon = round(lon, 4), lat = round(lat, 4))]
+  wc <- write_cache(csvdt)
+  writeLines(as.character(want_ver), ver_file)
+  cat(sprintf("Cache saved: %d points, %d rows as %s (%.0f KB)\n",
+              length(unique(cache$pid)), nrow(cache), wc$fmt, wc$kb))
+  wc
+}
+
+# ---- Midweek top-up: fetch, save, stop -------------------------------------
+# A second fetch day each week (.github/workflows/midweek_topup.yml). The cache
+# is what carries over; nothing downstream of it is wanted midweek, and writing
+# run_date.txt or map_stats.txt here would hand the Monday run a stale date and
+# a stale "mapped last run". midweek_status.txt is what the Monday email reads.
+MIDWEEK <- identical(Sys.getenv("BLAST_MIDWEEK"), "1")
+if (MIDWEEK) {
+  wc <- save_cache_now(cache)
+  n_after <- length(unique(cache$pid))
+  added   <- n_after - length(cached_pids)
+  writeLines(sprintf("%s|%d|%d|%d|%s|%.0f|%d",
+                     format(RUN_DATE), n_after, length(cached_pids), added, wc$fmt, wc$kb,
+                     length(new_rows)),
+             file.path(OUT, "midweek_status.txt"))
+  cat(sprintf("Midweek top-up: %d cell(s) fetched (%d new), cache now %d cells, ~%.0f weighted spent. No maps, no email. Done in %.1f min.\n",
+              length(new_rows), added, n_after, spent,
+              as.numeric(difftime(Sys.time(), RUN_T0, units = "mins"))))
+  quit(save = "no", status = 0)
+}
+
 # ---- Model both per point --------------------------------------------------
 writeLines(run_tag, file.path(OUT, "run_date.txt"))
 
@@ -875,50 +950,7 @@ rendered_bl <- render_map(pm, "events", sprintf("BLASTAM infection days (last %d
            "blastam_heatmap", obs_max = obs_max_bl, obs_fmt = "%.0f days", stale_pts = stale_pts)
 
 # ---- Save cache ------------------------------------------------------------
-csvdt <- copy(cache)
-csvdt[, `:=`(TEMP = round(TEMP, 1), RHUM = round(RHUM, 0), RAIN = round(RAIN, 1),
-             temp_wet = round(temp_wet, 1), wet_hours = round(wet_hours, 0),
-             lon = round(lon, 4), lat = round(lat, 4))]
-
-# fwrite() decides whether to compress from the FILE EXTENSION, so a temp file
-# named ".tmp" is written as plain text and then renamed to ".gz". gzfile()
-# reads it back happily, so the verify passes and an 8x larger file is committed
-# under a .gz name. Hence both the ".tmp.gz" naming and this explicit check.
-is_gzip <- function(f) {
-  con <- file(f, "rb"); on.exit(close(con), add = TRUE)
-  identical(as.integer(readBin(con, "raw", 2L)), c(31L, 139L))
-}
-
-write_cache <- function(dt) {
-  tmp_gz <- paste0(gz_file, ".tmp.gz")     # extension must survive, see is_gzip()
-  ok_gz <- tryCatch({
-    fwrite(dt, tmp_gz, na = "NA")
-    if (!is_gzip(tmp_gz)) {
-      cat("gz cache was NOT compressed (data.table built without zlib?); using plain CSV.\n")
-      FALSE
-    } else nrow(read_gz_dt(tmp_gz)) == nrow(dt)
-  }, error = function(e) { cat("gz verify error:", conditionMessage(e), "\n"); FALSE })
-  if (ok_gz) {
-    file.rename(tmp_gz, gz_file)
-    if (WEATHER_CACHE_KEEP_CSV) {
-      tmp_csv <- paste0(csv_file, ".tmp.csv"); fwrite(dt, tmp_csv, na = "NA")
-      file.rename(tmp_csv, csv_file); fmt <- "gz+csv"
-    } else {
-      if (file.exists(csv_file)) file.remove(csv_file); fmt <- "gz"
-    }
-    return(list(fmt = fmt, kb = file.info(gz_file)$size / 1024))
-  }
-  unlink(tmp_gz)
-  cat("gz cache write/verify failed; falling back to plain CSV.\n")
-  tmp_csv <- paste0(csv_file, ".tmp.csv"); fwrite(dt, tmp_csv, na = "NA")
-  file.rename(tmp_csv, csv_file)
-  if (file.exists(gz_file)) file.remove(gz_file)
-  list(fmt = "csv", kb = file.info(csv_file)$size / 1024)
-}
-wc <- write_cache(csvdt)
-writeLines(as.character(want_ver), ver_file)
-cat(sprintf("Cache saved: %d points, %d rows as %s (%.0f KB)\n",
-            length(unique(cache$pid)), nrow(cache), wc$fmt, wc$kb))
+wc <- save_cache_now(cache)
 
 # ---- Stats line for the email ----------------------------------------------
 # Field 3 is the number MAPPED on the previous run, read back before this run
@@ -952,13 +984,4 @@ writeLines(sprintf("%d|%.2f|%d|%.2f|%s|%.0f|%s|%s|%s|%.0f|%s|%s|%s|%s|%d|%s|%s",
                    held_out, no_pipe(stale_note), no_pipe(fetch_reason)),
            stats_file)
 
-if (Sys.getenv("BLAST_MIDWEEK") == "1") {
-  added <- length(unique(cache$pid)) - length(cached_pids)
-  writeLines(sprintf("%s|%d|%d|%d|%s|%.0f",
-                     format(RUN_DATE), length(unique(cache$pid)),
-                     length(cached_pids), added, wc$fmt, wc$kb),
-             file.path(OUT, "midweek_status.txt"))
-  cat(sprintf("Midweek fetch-only run: +%d points, cache now %d.\n",
-              added, length(unique(cache$pid))))
-}
 cat(sprintf("Done. Spent ~%.0f of %.0f weighted calls this run.\n", spent, wt_cap))

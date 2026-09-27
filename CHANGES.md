@@ -6,7 +6,7 @@ The 2026-09-07, 09-14 and 09-21 emails all carried the map "weather to
 2026-08-29" (identical maxima, 0.058% and 10 days) beside a town table that was
 current; the 09-07 email had 31 towns of "no data". Diagnosed from
 `map_stats.txt`, `weighted_spend.csv`, `run_log.csv` and the committed cache. The
-offline suite went from 62 tests to 128; all pass.
+offline suite went from 62 tests to 152; all pass.
 
 | # | Item | Fix | Guarded by |
 | --- | --- | --- | --- |
@@ -15,6 +15,8 @@ offline suite went from 62 tests to 128; all pass.
 | C | The 09-07 grid fetch hit the **hourly** 5,000 ceiling at exactly 5,000.0 weighted about an hour in; every 429 was treated as "quota spent, stop", so 42% of the grid was abandoned with 140 minutes of deadline unused, and the town fetch in the same hour was refused too. The 80/min pacer was 96% of the ceiling, retries were not paced, and the town run always lands in the grid's final hour. | Minutely and hourly 429s are waited out (`OM_QUOTA_WAIT_S`, bounded by `OM_QUOTA_WAIT_MAX_MIN` / `TOWN_QUOTA_WAIT_MAX_MIN` and the fetch deadline) and the same batch is resent; only a daily 429 stops a run. `GRID_TARGET_PER_MIN` 80 to 70. Retries go through the pacer. The town run's serial fallback, which is unpaced and unbudgeted, is skipped after a 429 that could not be waited out. Workflow timeout 240 to 255. | test 18 |
 | D | With 76% of the grid current, the 90th-percentile fallback drew **every** cell at a 16 day old window, three weeks running, and IDW would otherwise have interpolated neighbours' values across the stale cells without a word. The banner ended "usually because the daily weather-API quota was already spent", which was untrue each time. | `grid_window.R`: the window steps back at most `GRID_WINDOW_MAX_FALLBACK_DAYS` (3) to bring every cell in; beyond that, if at least `GRID_WINDOW_MIN_DRAW_COVERAGE` (50%) are current, the map is drawn at `end_date` and the stale cells are **drawn grey**, masked out of the interpolation and the GeoTIFF, with count, share and ages in the footer, the legend and the email. Below 50% the old complete map still wins. `map_stats.txt` gains the grey count, the cohort summary and the fetch's own reason (budget, 429, deadline, failures, ledger), and the banner is built from those. | test 19, and test 13 now runs against the real `pick_window_end()` |
 | F | Every one of those runs exited 0 and showed a green tick: 31 towns of "no data" on 09-07, a map three weeks stale on 09-14 and 09-21. The subject carried the **map** window alone, so it read "weather to 2026-08-29" above a town table modelled to a later date, and said nothing about the run being degraded. | `run_health.R`: one verdict per run from the town table and `map_stats.txt` (towns modelled below `HEALTH_MIN_TOWN_FRAC`, map more than `HEALTH_MAX_MAP_BEHIND_DAYS` behind the towns, more than `HEALTH_MAX_GREY_FRAC` grey, mapped cells down more than `HEALTH_MAX_MAP_DROP_FRAC`), written to `run_status.txt`. `send_email.py` puts the **town** window in the subject, adds the map window only when it differs, and prefixes `[DEGRADED]`. The banner names a town shortfall. The workflow gains a final `if: always()` **Verdict** step that exits non-zero on a missing, stale or degraded status, after the commit, email and upload, so the run turns red and GitHub notifies the owner without anything being lost. The R scripts still exit 0 on a degraded run, deliberately. | test 20 |
+| E | The 2026-09-21 evening rerun, correctly capped by the spend ledger at 42 weighted for the towns, fell through to a **serial fallback** that was unpaced, uncharged and invisible to the ledger, fetched 29 towns off the books, and then **overwrote** the scheduled run's 31-town trends column and run log row with its worse result. The ledger itself had booked the Sunday run's whole 8,550 to Monday because the run crossed 00:00 UTC. | The second pass is a `fetch_points_batched()` call with `batch_size = 1`: same budget, pacer, ledger and 429 handling; `get_openmeteo_hourly()` is no longer called by any runner. `trends_merge_rerun()` fills a rerun's blanks from the earlier run's column and `runlog_keep_better()` keeps the row that modelled the most towns, so a rerun can improve the record and cannot worsen it. The ledger day is the pinned `BLAST_UTC_DATE`. | test 21 |
+| G | The grid needs about twelve fetch days to fill from cold and several to recover from an interrupted run, and the only scheduled workflow was weekly. A `BLAST_MIDWEEK` branch existed but ran the whole pipeline, nothing invoked it, and the email line assumed a *daily* job. | `.github/workflows/midweek_topup.yml`: Thursday 00:30 UTC, same concurrency group as the weekly run, a different UTC quota day. `run_blast_grid.R` with `BLAST_MIDWEEK=1` fetches, merges, saves the cache, writes `midweek_status.txt` and quits before the window, models, maps or `map_stats.txt`. The Monday email reports the last top-up on a weekly cadence (`MIDWEEK_MAX_AGE_DAYS`). | test 22 |
 
 Verified end to end against a stubbed Open-Meteo in a scratch copy: a seeded
 cache in the four cohorts of the live one (6, 14, 21 and 22 days behind) was
@@ -28,12 +30,19 @@ not reached 20 Sep and are drawn grey rather than interpolated over: 30 last
 updated 30 Aug, 30 29 Aug. Why: 60 cached cell(s) did not fit the 266 weighted
 budget (about 122 more needed)." That run's `run_status.txt` read `degraded=1`
 with the grey-cell reason and the budget shortfall as a note; the full-recovery
-run's read `degraded=0`.
+run's read `degraded=0`. A third harness ran a Thursday top-up in a child process
+(cache saved and grown, `midweek_status.txt` written, no maps, no `map_stats.txt`,
+no `run_date.txt`, spend on the ledger) followed by the Monday run, whose email
+read "Midweek top-up ran Thu 01 Oct: 375 cell(s) fetched, 75 new cell(s), cache
+now 375". Before the ledger was keyed on the pinned date, that harness also
+showed the town second pass fetching towns one at a time until the budget ran out
+and the verdict calling the result degraded, which is what the live 09-21 rerun
+should have said.
 
-**Not done, deliberately** (each is a separate change): the serial town fallback
-still bypasses the ledger when it does run; a same-day re-run still overwrites
-the earlier run's trends column and run log row; and there is still no midweek
-top up workflow.
+**Not done:** an "email only, no fetch" dispatch mode. The HTML body and the PNGs
+live in the run artifact, not the repository, so resending a past email means
+downloading that artifact; a mode that rebuilt them from the committed cache would
+still need the towns' 150 weighted calls.
 
 ---
 

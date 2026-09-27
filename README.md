@@ -5,9 +5,9 @@
 > is now cut at 10:00 local solar rather than local midnight, so every `TEMP`,
 > `RHUM` and `RAIN` value changes; the preceding 5 day mean is lagged so it
 > genuinely precedes, so `infect` and `semi` change; and night completeness now
-> requires a minimum number of observed hours. Expect about twelve runs
-> before the 0.3 degree grid is full again, so on the weekly schedule the map
-> will be coarse for a couple of months unless a midweek top up job is added.
+> requires a minimum number of observed hours. Expect about twelve fetch days
+> before the 0.3 degree grid is full again: about six weeks with the Monday run
+> and the Thursday top-up together.
 
 A self contained pipeline that runs two complementary leaf blast models each week
 from GitHub Actions, using free Open-Meteo ERA5 weather. Two risk maps, a 31 town
@@ -67,18 +67,19 @@ requires in canopy loggers deployed alongside ERA5 driven model runs.
 | `blast_config.R` | **Every tunable parameter.** Sites, thresholds, grid, API, output, colours. Sourced first, and the model files guard their own defaults with `if (!exists(...))`, so a value set here always wins. |
 | `epirice_model.R` | Vendored SEIR engine and leaf blast parameters from epicrop, with a selectable RcT optimum |
 | `blastam_model.R` | BLASTAM infection warning model and the shared daily aggregator that feeds both models |
-| `openmeteo_wth.R` | Single point Open-Meteo adapter (used by the `run_blast.R` fallback) |
+| `openmeteo_wth.R` | Single point Open-Meteo adapters. No longer used by either runner; kept for ad hoc checks |
 | `openmeteo_batch.R` | Batched Open-Meteo fetcher, weighted cost model, pacer and the shared spend ledger |
 | `run_blast.R` | Town table runner: fetch, model, write CSV, HTML and text summary |
 | `run_blast_grid.R` | Continental heatmap runner: fill the cache, model, render maps |
 | `grid_window.R` | Window policy: which date the map is drawn at, which cells are drawn grey for not reaching it, and the fetch's own account of why |
 | `run_health.R` | The run's verdict: is this run degraded, and why. Written to `run_status.txt` for the subject line and the workflow's final step |
 | `send_email.py` | Python stdlib email sender; the subject carries the town window and a `[DEGRADED]` prefix when `run_status.txt` says so |
-| `test_offline.R` | Offline regression tests: 128 tests, no network, runs in seconds, in CI |
+| `test_offline.R` | Offline regression tests: 152 tests, no network, runs in seconds, in CI |
 | `australia_land.geojson` | Land polygon for masking ocean and clipping the map |
 | `australia_rivers.geojson` | River overlay |
 | `australia_roads.geojson` | Road overlay |
-| `.github/workflows/weekly_blast.yml` | Monday workflow: pin the run and UTC dates, test, fetch, model, commit, email |
+| `.github/workflows/weekly_blast.yml` | Monday workflow: pin the run and UTC dates, test, fetch, model, commit, email, verdict |
+| `.github/workflows/midweek_topup.yml` | Thursday workflow: fetch, save the cache, commit, stop. No maps, no email |
 
 ---
 
@@ -125,7 +126,7 @@ Set `BLAST_RUN_DATE=YYYY-MM-DD` to pin the run date; otherwise today is used.
 unset, the current UTC date is used. Required packages: `data.table`, `jsonlite`,
 `curl`, `terra`. The workflow uses the `rocker/geospatial` container.
 
-All 128 offline tests must pass before a run is meaningful. Each test guards a
+All 152 offline tests must pass before a run is meaningful. Each test guards a
 bug that was actually shipped.
 
 ---
@@ -176,11 +177,14 @@ dispatched after 10:00 Sydney are unaffected.
   schema, RcT peak, day cut hour and BLASTAM bounds.
 
 **Trends columns are keyed on the DATA end date, not the run date**, so a re-run
-over the same window replaces its column instead of adding one. Three test runs
-on 28, 29 and 30 July previously took three columns describing almost the same
-weather, and with a short history that evicts genuinely older columns. Blanks are
-written as `NA`, because an empty cell is indistinguishable from a zero in a
-spreadsheet.
+over the same window merges into its column instead of adding one: towns modelled
+this time take the new value, towns that could not be keep the earlier one, and
+`run_log.csv` keeps the row of the run that modelled the most towns. (A
+quota-starved rerun on 2026-09-21 used to replace both outright, turning two
+towns to `NA`.) Three test runs on 28, 29 and 30 July previously took three
+columns describing almost the same weather, and with a short history that evicts
+genuinely older columns. Blanks are written as `NA`, because an empty cell is
+indistinguishable from a zero in a spreadsheet.
 
 Emergence is `end_date − CROP_AGE_DAYS` and therefore **moves with each run**.
 The trends CSVs are a rolling 60 day window through time, not a season total.
@@ -307,9 +311,18 @@ refused as well, so that email carried 31 towns of "no data".
 fetch its towns with an unlimited budget on top of whatever the grid run had
 already spent, and charged retries could push the grid past its own plan: the
 2026-07-30 run reported 8,667 weighted against a planned 8,550. Both scripts now
-append to `blast_outputs/weighted_spend.csv`, keyed on the UTC day the quota
-resets, and read it back before setting their own budget, with a combined ceiling
-of `DAILY_WEIGHTED_HARD_CAP` (9,500).
+append to `blast_outputs/weighted_spend.csv` and read it back before setting
+their own budget, with a combined ceiling of `DAILY_WEIGHTED_HARD_CAP` (9,500).
+
+The ledger day is the run's pinned `BLAST_UTC_DATE`, not the clock at the moment
+of writing. The Sunday-evening grid run crosses 00:00 UTC, so the wall clock
+booked its whole spend to Monday, and the 2026-09-21 evening rerun was capped to
+800 weighted for spend the API had largely counted against Sunday. A rerun on the
+same pinned day still shares the budget, which is the property the ledger exists
+for. Every town fetch goes through it too: the town runner's second pass, one town
+per request for anything the batch did not deliver, is a `fetch_points_batched()`
+call, not the old serial path, which was unpaced, uncharged and invisible to the
+ledger and on 2026-09-21 fetched 29 towns off the books.
 
 ### Weather cache
 
@@ -374,12 +387,19 @@ anything. Working the recursion through, adds per run are
 | 11 | ~7,710 | |
 | 12 | 7,721 | 0.3 deg complete |
 
-On the weekly schedule that is about three months. Earlier versions of this table
-claimed four to nine "daily runs", which was wrong twice over: the arithmetic was
-optimistic and the only scheduled workflow is weekly. `run_blast_grid.R` has a
-`BLAST_MIDWEEK` branch and `run_blast.R` reports on `midweek_status.txt`, but a
-top up workflow is not in this repository. Adding one is the way to make the fill
-rate match the table.
+Each row is one **fetch day**. There are two a week: the Monday run and the
+Thursday top-up (`.github/workflows/midweek_topup.yml`, which runs
+`run_blast_grid.R` with `BLAST_MIDWEEK=1`), so a cold fill takes about six weeks
+and a backlog after an interrupted run clears in half the time it otherwise
+would. The top-up fetches, merges, saves and commits the cache, and stops: no
+window, no models, no maps, no town table, no email. It shares the weekly
+workflow's concurrency group so the two can never write the cache at once, and
+fires at 00:30 UTC Thursday, a different UTC day from the Monday run, so they
+never share a daily quota. `midweek_status.txt` records each top-up and the
+Monday email reports when it last ran, complaining if that is more than
+`MIDWEEK_MAX_AGE_DAYS` (7) ago. Earlier versions of this table claimed four to
+nine "daily runs", which was wrong twice over: the arithmetic was optimistic and,
+until September 2026, the only scheduled workflow was the weekly one.
 
 Points are added in a bit reversed Morton (Z order) sequence within each
 resolution level, so any partial run is a spatially uniform sample of the
@@ -718,7 +738,7 @@ The Monday workflow runs:
 
 1. **Resolve run date and UTC date**, pinned once and exported as
    `BLAST_RUN_DATE` and `BLAST_UTC_DATE`.
-2. **Offline tests**, `Rscript test_offline.R`. 128 tests, no network. terra is
+2. **Offline tests**, `Rscript test_offline.R`. 152 tests, no network. terra is
    attached inside the suite on purpose, because `terra::shift` masks
    `data.table::shift` and that masking once turned every grid point into a
    silent "empty" and produced a blank map with no error in the log.
@@ -736,6 +756,12 @@ The Monday workflow runs:
    red and GitHub notifies the workflow's owner. It runs after the commit, the
    email and the upload on purpose: the R scripts exit 0 on a degraded run so
    that it *is* reported, and the loud failure comes once nothing can be lost.
+
+The **Thursday top-up** (`midweek_topup.yml`, 00:30 UTC Thursday) is the same
+job cut short: pin the dates, test, run `run_blast_grid.R` with `BLAST_MIDWEEK=1`
+(fetch, save the cache, stop), commit the cache and `midweek_status.txt`, upload
+the artifact, and fail if the status file is missing or from another run. It
+leaves `run_status.txt` alone; that is the Monday run's verdict.
 
 Two seasonal cron entries bracket the daylight saving change:
 

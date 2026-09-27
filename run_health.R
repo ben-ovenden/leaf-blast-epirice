@@ -88,3 +88,51 @@ read_run_status <- function(path) {
   k <- sub("=.*$", "", ln); v <- sub("^[^=]*=", "", ln)
   setNames(as.list(v), k)
 }
+
+################################################################################
+# Same-window reruns
+#
+# Trends columns and run log rows are keyed on the DATA window, so a second run
+# over the same window replaces the first. On 2026-09-21 a manual rerun on the
+# same UTC day, correctly capped by the spend ledger, modelled 29 towns where the
+# scheduled run had modelled 31, and overwrote both: Moree and Borroloola became
+# NA in the trends CSVs and the run log said the towns had cost 0 weighted calls.
+# A rerun may now improve the record and may not make it worse.
+################################################################################
+
+# Fill this run's blanks from the earlier run's column for the same window, and
+# drop that column from the history so the merged one replaces it. Towns this run
+# DID model take this run's value.
+trends_merge_rerun <- function(today, hist, data_tag) {
+  today <- as.data.table(today); hist <- as.data.table(hist)
+  n_kept <- 0L
+  if (data_tag %in% names(hist)) {
+    prev <- data.table(town = hist$town, prev__ = hist[[data_tag]])
+    today <- merge(today, prev, by = "town", all.x = TRUE, sort = FALSE)
+    keep <- is.na(today[[data_tag]]) & !is.na(today$prev__)
+    n_kept <- sum(keep)
+    if (n_kept > 0L)
+      set(today, which(keep), data_tag,
+          methods::as(today$prev__[keep], class(today[[data_tag]])[1]))
+    today[, prev__ := NULL]
+    hist[, (data_tag) := NULL]
+  }
+  list(today = today, hist = hist, n_kept = n_kept)
+}
+
+# The run log keeps, for each window, the row of the run that modelled the most
+# towns. Returns the history without the same-window row(s) when the new row is
+# to be written, and write_new = FALSE when it is not.
+runlog_keep_better <- function(old, row, data_tag) {
+  if (is.null(old) || nrow(old) == 0L || !"data_end" %in% names(old))
+    return(list(old = old, write_new = TRUE, prev_towns = NA_integer_))
+  old <- as.data.table(old)
+  same <- old[as.character(data_end) == data_tag]
+  prev_towns <- if (nrow(same) > 0L && "towns_modelled" %in% names(same))
+    suppressWarnings(max(as.integer(same$towns_modelled), na.rm = TRUE)) else NA_integer_
+  new_towns <- suppressWarnings(as.integer(row$towns_modelled[1]))
+  write_new <- !(isTRUE(is.finite(prev_towns)) && isTRUE(is.finite(new_towns)) &&
+                 new_towns < prev_towns)
+  list(old = if (write_new) old[as.character(data_end) != data_tag] else old,
+       write_new = write_new, prev_towns = prev_towns)
+}
