@@ -1,1 +1,1 @@
-7721|0.30|7721|0.30|gz|6079|gz|2026-08-29|0.30|758|0.0580|10|window fell back 16 days to 2026-08-29 (only 76% of cached cells reached 2026-09-14)|epirice+blastam
+7272|0.31|7721|0.30|gz|6496|gz|2026-09-20|0.60|8550|0.0164|8||epirice+blastam|449|449 cells (6%) had not reached 20 Sep and are drawn grey rather than interpolated over: 449 last updated 29 Aug|449 cached cell(s) did not fit the 8550 weighted budget (about 930 more needed)

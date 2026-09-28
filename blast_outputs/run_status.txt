@@ -1,0 +1,12 @@
+run_date=2026-09-28
+utc_date=2026-09-27
+town_window_end=2026-09-20
+towns_modelled=31
+towns_total=31
+map_window_end=2026-09-20
+map_cells=7272
+map_cells_grey=449
+map_behind_days=0
+degraded=1
+reasons=449 map cells (6%) not refreshed, drawn grey
+warnings=grid fetch: 449 cached cell(s) did not fit the 8550 weighted budget (about 930 more needed)
