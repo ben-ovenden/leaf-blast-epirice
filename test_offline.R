@@ -737,5 +737,77 @@ cat("\n22. The midweek top-up: a second fetch day, no maps, no email\n")
      grepl("MIDWEEK_MAX_AGE_DAYS", tsrc, fixed = TRUE) && !grepl("Daily top-up", tsrc, fixed = TRUE))
 }
 
+cat("\n23. The email sender runs end to end, minus the SMTP conversation\n")
+# Regression: the 2026-09-28 email was SENT and the step still failed. A variable
+# renamed in main() (window_end to map_end) was left behind in the final "Email
+# sent" print, so send_email.py died with a NameError one line after
+# server.send_message(). Nothing had executed the script before the live run: the
+# suite only grepped it. BLAST_EMAIL_DRY_RUN=1 runs every line except the SMTP
+# block, here against fixture files and in CI before any fetching starts.
+{
+  py_src <- paste(readLines("send_email.py", warn = FALSE), collapse = "\n")
+  py_code <- paste(sub("#.*$", "", readLines("send_email.py", warn = FALSE)), collapse = "\n")
+  ok("no code path refers to the removed window_end variable",
+     !grepl("(?<![A-Za-z_])window_end", py_code, perl = TRUE))
+  ok("the sender has a dry-run mode and an output-directory override",
+     grepl("BLAST_EMAIL_DRY_RUN", py_src, fixed = TRUE) && grepl("BLAST_OUT_DIR", py_src, fixed = TRUE))
+  ok("the weekly workflow installs python before the tests, so the dry run is not skipped there",
+     regexpr("name: Ensure python3", yml, fixed = TRUE) > 0 &&
+     regexpr("name: Ensure python3", yml, fixed = TRUE) < regexpr("name: Offline tests", yml, fixed = TRUE))
+  # Take the first interpreter that actually RUNS. On Windows `python3` is often
+  # the Microsoft Store stub, which exists on PATH and exits non-zero.
+  cands <- Sys.which(c("python3", "python", "py")); cands <- unname(cands[nzchar(cands)])
+  runs <- function(p) isTRUE(tryCatch(
+    suppressWarnings(system2(p, "--version", stdout = FALSE, stderr = FALSE)) == 0L,
+    error = function(e) FALSE))
+  py <- NA_character_
+  for (p in cands) if (runs(p)) { py <- p; break }
+  if (is.na(py)) {
+    cat("  SKIP  no working python here; the dry run is exercised in CI\n")
+  } else {
+    fx <- tempfile("blast_email_"); dir.create(fx)
+    writeLines("plain body", file.path(fx, "blast_summary_latest.txt"))
+    writeLines("<p>html body</p>", file.path(fx, "blast_summary_latest.html"))
+    writeLines(c("town,2026-09-20", "Dubbo,0"), file.path(fx, "town_trends.csv"))
+    writeLines(c("town,2026-09-20", "Dubbo,0"), file.path(fx, "blastam_trends.csv"))
+    writeLines("7272|0.31|7721|0.30|gz|6496|gz|2026-08-29|0.60|8550|0.0164|8||epirice+blastam|449|x|y",
+               file.path(fx, "map_stats.txt"))
+    run_dry <- function(status_lines) {
+      sf <- file.path(fx, "run_status.txt")
+      if (is.null(status_lines)) unlink(sf) else writeLines(status_lines, sf)
+      vars <- c("MAIL_USERNAME", "MAIL_PASSWORD", "MAIL_TO", "BLAST_RUN_DATE", "RUN_DATE",
+                "BLAST_OUT_DIR", "BLAST_EMAIL_DRY_RUN")
+      old <- Sys.getenv(vars, unset = NA)
+      Sys.setenv(MAIL_USERNAME = "sender@example.org", MAIL_PASSWORD = "x",
+                 MAIL_TO = "a@example.org, b@example.org", BLAST_RUN_DATE = "2026-09-21",
+                 BLAST_OUT_DIR = fx, BLAST_EMAIL_DRY_RUN = "1")
+      on.exit(for (v in names(old))
+        if (is.na(old[[v]])) Sys.unsetenv(v) else do.call(Sys.setenv, as.list(setNames(old[[v]], v))),
+        add = TRUE)
+      out <- suppressWarnings(system2(py, "send_email.py", stdout = TRUE, stderr = TRUE))
+      st <- attr(out, "status")
+      list(status = if (is.null(st)) 0L else as.integer(st), out = paste(out, collapse = "\n"))
+    }
+    r <- run_dry(c("town_window_end=2026-09-14", "degraded=1",
+                   "reasons=1831 map cells (24%) not refreshed, drawn grey"))
+    ok("a degraded dry run exits 0 and reaches the final line",
+       r$status == 0L && grepl("DRY RUN", r$out, fixed = TRUE),
+       sprintf("(status %d: %s)", r$status, substr(r$out, 1, 400)))
+    ok("with the subject September should have had",
+       grepl("[DEGRADED] Blast risk summary 2026-09-21 (weather to 2026-09-14; maps to 2026-08-29)",
+             r$out, fixed = TRUE))
+    ok("and the attachments counted", grepl("with 2 attachments", r$out, fixed = TRUE))
+    r <- run_dry(c("town_window_end=2026-08-29", "degraded=0", "reasons="))
+    ok("a healthy dry run has a plain subject carrying one window",
+       r$status == 0L && grepl("subject 'Blast risk summary 2026-09-21 (weather to 2026-08-29)'",
+                                r$out, fixed = TRUE), sprintf("(%s)", substr(r$out, 1, 300)))
+    r <- run_dry(NULL)
+    ok("without a status file it falls back to the map window",
+       r$status == 0L && grepl("(weather to 2026-08-29)", r$out, fixed = TRUE) &&
+       !grepl("[DEGRADED]", r$out, fixed = TRUE))
+    unlink(fx, recursive = TRUE)
+  }
+}
+
 cat(sprintf("\n%d tests, %d failures\n", n, fails))
 quit(status = if (fails > 0L) 1L else 0L)

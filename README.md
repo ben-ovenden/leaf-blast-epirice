@@ -74,7 +74,7 @@ requires in canopy loggers deployed alongside ERA5 driven model runs.
 | `grid_window.R` | Window policy: which date the map is drawn at, which cells are drawn grey for not reaching it, and the fetch's own account of why |
 | `run_health.R` | The run's verdict: is this run degraded, and why. Written to `run_status.txt` for the subject line and the workflow's final step |
 | `send_email.py` | Python stdlib email sender; the subject carries the town window and a `[DEGRADED]` prefix when `run_status.txt` says so |
-| `test_offline.R` | Offline regression tests: 152 tests, no network, runs in seconds, in CI |
+| `test_offline.R` | Offline regression tests: 160 tests, no network, runs in seconds, in CI |
 | `australia_land.geojson` | Land polygon for masking ocean and clipping the map |
 | `australia_rivers.geojson` | River overlay |
 | `australia_roads.geojson` | Road overlay |
@@ -126,7 +126,13 @@ Set `BLAST_RUN_DATE=YYYY-MM-DD` to pin the run date; otherwise today is used.
 unset, the current UTC date is used. Required packages: `data.table`, `jsonlite`,
 `curl`, `terra`. The workflow uses the `rocker/geospatial` container.
 
-All 152 offline tests must pass before a run is meaningful. Each test guards a
+`send_email.py` can be run without sending anything: `BLAST_EMAIL_DRY_RUN=1`
+executes every line except the SMTP conversation and prints the subject it would
+have used, and `BLAST_OUT_DIR` points it at another directory. The offline suite
+does exactly that against fixture files whenever a working Python is on the path
+(on Windows use `python`; `python3` is usually the Store stub).
+
+All 160 offline tests must pass before a run is meaningful. Each test guards a
 bug that was actually shipped.
 
 ---
@@ -738,7 +744,11 @@ The Monday workflow runs:
 
 1. **Resolve run date and UTC date**, pinned once and exported as
    `BLAST_RUN_DATE` and `BLAST_UTC_DATE`.
-2. **Offline tests**, `Rscript test_offline.R`. 152 tests, no network. terra is
+2. **Offline tests**, `Rscript test_offline.R`. 160 tests, no network, preceded
+   by a step that makes sure `python3` exists, because the suite executes
+   `send_email.py` in dry-run mode: the 2026-09-28 email was sent and the step
+   then failed on a `NameError` in the line after the send, and nothing had ever
+   run the script before the live run. terra is
    attached inside the suite on purpose, because `terra::shift` masks
    `data.table::shift` and that masking once turned every grid point into a
    silent "empty" and produced a blank map with no error in the log.

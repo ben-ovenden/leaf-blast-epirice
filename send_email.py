@@ -23,7 +23,11 @@ import smtplib
 import mimetypes
 from email.message import EmailMessage
 
-OUT = "blast_outputs"
+# BLAST_OUT_DIR points the script at another directory, which is how the offline
+# suite runs it against fixture files. With BLAST_EMAIL_DRY_RUN=1 every line runs
+# except the SMTP conversation, so a mistake anywhere else is caught by the tests,
+# before a run, rather than by the live send.
+OUT = os.environ.get("BLAST_OUT_DIR", "").strip() or "blast_outputs"
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 465
 FROM_NAME = "WWAI Cereal Pathology: blast models"
@@ -115,8 +119,11 @@ def main():
     if status.get("degraded") == "1":
         print(f"::warning title=Degraded blast run::{status.get('reasons', '')}")
 
+    dry_run = os.environ.get("BLAST_EMAIL_DRY_RUN", "").strip() == "1"
+    subject = build_subject(run_date, status, map_end)
+
     msg = EmailMessage()
-    msg["Subject"] = build_subject(run_date, status, map_end)
+    msg["Subject"] = subject
     msg["From"] = f"{FROM_NAME} <{user}>"
     msg["To"] = ", ".join(recipients)
 
@@ -168,13 +175,23 @@ def main():
         # A warning, not an error: the email still goes out and explains itself.
         print(f"::warning::not attached (absent or empty): {', '.join(skipped)}")
 
-    context = ssl.create_default_context()
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=60) as server:
-        server.login(user, password)
-        server.send_message(msg)
+    if dry_run:
+        # Everything above has run: bodies read, subject built, files attached.
+        # Only the SMTP conversation is skipped.
+        verb = "DRY RUN, nothing sent:"
+    else:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=60) as server:
+            server.login(user, password)
+            server.send_message(msg)
+        verb = "Email sent"
 
-    print(f"Email sent to {', '.join(recipients)} with {n} attachments "
-          f"(run date {run_date}, weather to {window_end or 'unknown'})."
+    # This line used to read `window_end`, a name removed when the subject began
+    # to carry the town window. The 2026-09-28 email was sent and the step then
+    # failed here with a NameError.
+    window = status.get("town_window_end") or map_end or "unknown"
+    print(f"{verb} to {', '.join(recipients)} with {n} attachments "
+          f"(subject '{subject}', run date {run_date}, weather to {window})."
           + (f" Skipped: {', '.join(skipped)}." if skipped else ""))
 
 

@@ -6,7 +6,7 @@ The 2026-09-07, 09-14 and 09-21 emails all carried the map "weather to
 2026-08-29" (identical maxima, 0.058% and 10 days) beside a town table that was
 current; the 09-07 email had 31 towns of "no data". Diagnosed from
 `map_stats.txt`, `weighted_spend.csv`, `run_log.csv` and the committed cache. The
-offline suite went from 62 tests to 152; all pass.
+offline suite went from 62 tests to 160; all pass.
 
 | # | Item | Fix | Guarded by |
 | --- | --- | --- | --- |
@@ -17,6 +17,14 @@ offline suite went from 62 tests to 152; all pass.
 | F | Every one of those runs exited 0 and showed a green tick: 31 towns of "no data" on 09-07, a map three weeks stale on 09-14 and 09-21. The subject carried the **map** window alone, so it read "weather to 2026-08-29" above a town table modelled to a later date, and said nothing about the run being degraded. | `run_health.R`: one verdict per run from the town table and `map_stats.txt` (towns modelled below `HEALTH_MIN_TOWN_FRAC`, map more than `HEALTH_MAX_MAP_BEHIND_DAYS` behind the towns, more than `HEALTH_MAX_GREY_FRAC` grey, mapped cells down more than `HEALTH_MAX_MAP_DROP_FRAC`), written to `run_status.txt`. `send_email.py` puts the **town** window in the subject, adds the map window only when it differs, and prefixes `[DEGRADED]`. The banner names a town shortfall. The workflow gains a final `if: always()` **Verdict** step that exits non-zero on a missing, stale or degraded status, after the commit, email and upload, so the run turns red and GitHub notifies the owner without anything being lost. The R scripts still exit 0 on a degraded run, deliberately. | test 20 |
 | E | The 2026-09-21 evening rerun, correctly capped by the spend ledger at 42 weighted for the towns, fell through to a **serial fallback** that was unpaced, uncharged and invisible to the ledger, fetched 29 towns off the books, and then **overwrote** the scheduled run's 31-town trends column and run log row with its worse result. The ledger itself had booked the Sunday run's whole 8,550 to Monday because the run crossed 00:00 UTC. | The second pass is a `fetch_points_batched()` call with `batch_size = 1`: same budget, pacer, ledger and 429 handling; `get_openmeteo_hourly()` is no longer called by any runner. `trends_merge_rerun()` fills a rerun's blanks from the earlier run's column and `runlog_keep_better()` keeps the row that modelled the most towns, so a rerun can improve the record and cannot worsen it. The ledger day is the pinned `BLAST_UTC_DATE`. | test 21 |
 | G | The grid needs about twelve fetch days to fill from cold and several to recover from an interrupted run, and the only scheduled workflow was weekly. A `BLAST_MIDWEEK` branch existed but ran the whole pipeline, nothing invoked it, and the email line assumed a *daily* job. | `.github/workflows/midweek_topup.yml`: Thursday 00:30 UTC, same concurrency group as the weekly run, a different UTC quota day. `run_blast_grid.R` with `BLAST_MIDWEEK=1` fetches, merges, saves the cache, writes `midweek_status.txt` and quits before the window, models, maps or `map_stats.txt`. The Monday email reports the last top-up on a weekly cadence (`MIDWEEK_MAX_AGE_DAYS`). | test 22 |
+| H | **Introduced by F, caught on its first live run.** The 2026-09-28 email was sent, correctly subjected `[DEGRADED] ... (weather to 2026-09-20)`, and the step then failed: `main()`'s `window_end` had been renamed `map_end` and the final "Email sent" print still used the old name, so `send_email.py` died with a `NameError` one line after `server.send_message()`. The run would have shown red every week, healthy or not. Nothing had ever executed the script before a live run; the suite only grepped it. | The print uses the town window. `BLAST_EMAIL_DRY_RUN=1` runs every line except the SMTP conversation and `BLAST_OUT_DIR` redirects the inputs; the offline suite runs the sender that way against fixture files, and the weekly workflow installs `python3` before the tests so the check is not skipped in CI. Verified with Python 3.12: the old file reproduces the failure with SMTP stubbed, the new one exits 0 through the same stub. | test 23 |
+
+**First live runs of the above (28 Sep and 1 Oct 2026).** Monday: map back on
+the current window (20 Sep) with 7,272 cells modelled and the last 449 of the 29
+August cohort drawn grey, as the planner's arithmetic says (9,479 needed against
+8,550); 31 of 31 towns; no cell west of 120 E a day short. Verdict degraded, for
+the 6% grey. Thursday top-up, first scheduled run: all 7,721 cells fetched for
+8,330 weighted (7,272 at 1.00 plus 449 at 2.36), every cell at 24 September.
 
 Verified end to end against a stubbed Open-Meteo in a scratch copy: a seeded
 cache in the four cohorts of the live one (6, 14, 21 and 22 days behind) was
