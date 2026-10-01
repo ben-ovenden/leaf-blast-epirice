@@ -74,7 +74,7 @@ requires in canopy loggers deployed alongside ERA5 driven model runs.
 | `grid_window.R` | Window policy: which date the map is drawn at, which cells are drawn grey for not reaching it, and the fetch's own account of why |
 | `run_health.R` | The run's verdict: is this run degraded, and why. Written to `run_status.txt` for the subject line and the workflow's final step |
 | `send_email.py` | Python stdlib email sender; the subject carries the town window and a `[DEGRADED]` prefix when `run_status.txt` says so |
-| `test_offline.R` | Offline regression tests: 160 tests, no network, runs in seconds, in CI |
+| `test_offline.R` | Offline regression tests: 166 tests, no network, runs in seconds, in CI |
 | `australia_land.geojson` | Land polygon for masking ocean and clipping the map |
 | `australia_rivers.geojson` | River overlay |
 | `australia_roads.geojson` | Road overlay |
@@ -132,7 +132,7 @@ have used, and `BLAST_OUT_DIR` points it at another directory. The offline suite
 does exactly that against fixture files whenever a working Python is on the path
 (on Windows use `python`; `python3` is usually the Store stub).
 
-All 160 offline tests must pass before a run is meaningful. Each test guards a
+All 166 offline tests must pass before a run is meaningful. Each test guards a
 bug that was actually shipped.
 
 ---
@@ -744,7 +744,7 @@ The Monday workflow runs:
 
 1. **Resolve run date and UTC date**, pinned once and exported as
    `BLAST_RUN_DATE` and `BLAST_UTC_DATE`.
-2. **Offline tests**, `Rscript test_offline.R`. 160 tests, no network, preceded
+2. **Offline tests**, `Rscript test_offline.R`. 166 tests, no network, preceded
    by a step that makes sure `python3` exists, because the suite executes
    `send_email.py` in dry-run mode: the 2026-09-28 email was sent and the step
    then failed on a `NameError` in the line after the send, and nothing had ever
@@ -776,9 +776,19 @@ leaves `run_status.txt` alone; that is the Monday run's verdict.
 Two seasonal cron entries bracket the daylight saving change:
 
 ```
-- cron: '30 20 * * 0'   # 06:30 Monday AEST (winter, UTC+10)
-- cron: '30 19 * * 0'   # 06:30 Monday AEDT (summer, UTC+11)
+- cron: '47 15 * * 0'   # 01:47 Monday AEST (winter, UTC+10)
+- cron: '47 14 * * 0'   # 01:47 Monday AEDT (summer, UTC+11)
 ```
+
+They are set for 01:47 local, not for when the email is wanted, because GitHub
+does not fire a cron on time. The previous 20:30 UTC entry started between 14
+minutes and 2 h 40 late through August and September 2026, later every week from
+30 August, and the run itself takes about 2 h 05: the email of 28 September
+arrived at 11:16. From 01:47 a run fired on time lands about 04:00 and one fired
+three hours late about 07:00. Both entries are still Sunday in UTC, so the data
+window is the same as before. **The gate job compares these strings literally**;
+change one without the other and both crons defer to each other, skipping the
+week with two green ticks. A test checks that they agree.
 
 The gate job matches the fired schedule against the current UTC offset, so a late
 firing cron does not skip the week. A `concurrency` group prevents two
