@@ -3,10 +3,22 @@ name: Weekly leaf blast risk (Monday ~7am AET email)
 # GitHub cron is UTC only, and eastern-Australia clocks shift an hour at daylight
 # saving. Two schedules bracket the change and the gate job lets only the one
 # matching the current offset proceed.
+#
+# SCHEDULED FOR 01:47 LOCAL, NOT 06:30. GitHub does not fire a cron on time: the
+# old 20:30 UTC entry started between 14 minutes and 2 h 40 late through August
+# and September 2026 (later every week from 30 August), and the run itself takes
+# about 2 h 05, so the "7am" email of 28 September arrived at 11:16. From 01:47 a
+# run fired on time lands about 04:00 and one fired three hours late about 07:00.
+# Minute 47 keeps it off the hour and half hour, where the scheduler is busiest.
+# Both entries are still SUNDAY in UTC, so blast_data_end() gives the same window.
+#
+# THE GATE JOB BELOW COMPARES THESE STRINGS LITERALLY. Change one without the
+# other and both crons answer "the other seasonal cron handles this": the week is
+# skipped with two green ticks. test_offline.R (test 24) checks they agree.
 on:
   schedule:
-    - cron: '30 20 * * 0'   # 06:30 Monday AEST (winter, UTC+10)
-    - cron: '30 19 * * 0'   # 06:30 Monday AEDT (summer, UTC+11)
+    - cron: '47 15 * * 0'   # 01:47 Monday AEST (winter, UTC+10)
+    - cron: '47 14 * * 0'   # 01:47 Monday AEDT (summer, UTC+11)
   workflow_dispatch:
     inputs:
       run_date:
@@ -35,14 +47,14 @@ jobs:
             echo "run=yes" >> "$GITHUB_OUTPUT"; exit 0
           fi
           # Match the schedule that fired against the current UTC offset rather
-          # than against the local hour. GitHub cron routinely fires 5 to 30
-          # minutes late, and an hour check ("is it 06?") silently skipped the
+          # than against the local hour. GitHub cron fires anything from minutes
+          # to hours late, and an hour check ("is it 06?") silently skipped the
           # entire week whenever a run started at 07:0x local.
           OFF=$(TZ=Australia/Sydney date +%z)     # +1000 (AEST) or +1100 (AEDT)
           SCHED='${{ github.event.schedule }}'
           echo "Offset $OFF, schedule '$SCHED'"
-          if { [ "$OFF" = "+1000" ] && [ "$SCHED" = "30 20 * * 0" ]; } || \
-             { [ "$OFF" = "+1100" ] && [ "$SCHED" = "30 19 * * 0" ]; }; then
+          if { [ "$OFF" = "+1000" ] && [ "$SCHED" = "47 15 * * 0" ]; } || \
+             { [ "$OFF" = "+1100" ] && [ "$SCHED" = "47 14 * * 0" ]; }; then
             echo "run=yes" >> "$GITHUB_OUTPUT"
           else
             echo "The other seasonal cron handles this offset."

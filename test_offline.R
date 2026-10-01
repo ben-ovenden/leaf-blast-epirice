@@ -381,7 +381,7 @@ cat("\n16. The data window follows the UTC date, not only the Sydney date\n")
 {
   old <- Sys.getenv(c("BLAST_RUN_DATE", "BLAST_UTC_DATE"), unset = NA)
   Sys.setenv(BLAST_RUN_DATE = "2026-09-21", BLAST_UTC_DATE = "2026-09-20")
-  ok("Monday 06:30 Sydney (still Sunday UTC) counts the lag from the UTC date",
+  ok("the Monday run (fired while it is still Sunday UTC) counts the lag from the UTC date",
      blast_data_end(blast_run_date()) == as.Date("2026-09-20") - ARCHIVE_LAG_DAYS,
      sprintf("(got %s)", format(blast_data_end(blast_run_date()))))
   Sys.setenv(BLAST_UTC_DATE = "2026-09-21")
@@ -807,6 +807,36 @@ cat("\n23. The email sender runs end to end, minus the SMTP conversation\n")
        !grepl("[DEGRADED]", r$out, fixed = TRUE))
     unlink(fx, recursive = TRUE)
   }
+}
+
+cat("\n24. The weekly crons and the gate agree, and fire early enough\n")
+# The gate job compares the fired schedule STRING with the current Sydney offset.
+# A cron edited without the gate, or the reverse, makes both entries answer "the
+# other seasonal cron handles this", and the week is skipped with two green ticks.
+# And GitHub does not fire on time: the 20:30 UTC cron started 14 minutes to 2 h 40
+# late through August and September 2026, so the 28 September email, due about
+# 7am, arrived at 11:16.
+{
+  wl <- readLines(".github/workflows/weekly_blast.yml", warn = FALSE)
+  crons <- unlist(regmatches(wl, gregexpr("(?<=cron: ')[^']+", wl, perl = TRUE)))
+  gl    <- grep("$SCHED\" = \"", wl, fixed = TRUE, value = TRUE)
+  gate  <- sub(".*\\$SCHED\" = \"([^\"]+)\".*", "\\1", gl)
+  ok("there are two seasonal crons", length(crons) == 2L, sprintf("(found %d)", length(crons)))
+  ok("the gate names exactly the strings the crons use", setequal(crons, gate),
+     sprintf("(crons: %s; gate: %s)", paste(crons, collapse = " | "), paste(gate, collapse = " | ")))
+  sched_for <- function(off) sub(".*\\$SCHED\" = \"([^\"]+)\".*", "\\1", grep(off, gl, fixed = TRUE, value = TRUE))
+  aest <- sched_for("+1000"); aedt <- sched_for("+1100")
+  f <- function(s) strsplit(s, " ")[[1]]
+  ok("the AEDT entry fires one UTC hour before the AEST one, same minute and day",
+     length(aest) == 1L && length(aedt) == 1L &&
+     as.integer(f(aest)[2]) - as.integer(f(aedt)[2]) == 1L && identical(f(aest)[-2], f(aedt)[-2]))
+  local_start <- (as.integer(f(aest)[2]) + 10L) %% 24L + as.integer(f(aest)[1]) / 60
+  ok("a run fired three hours late still lands by about 7am local",
+     local_start + 3 + 2.2 <= 7.25, sprintf("(scheduled %.2f h local)", local_start))
+  ok("both entries are on Sunday UTC, so the data window is unchanged",
+     f(aest)[5] == "0" && f(aedt)[5] == "0")
+  ok("and off the hour and half hour, where the scheduler is busiest",
+     !as.integer(f(aest)[1]) %in% c(0L, 30L))
 }
 
 cat(sprintf("\n%d tests, %d failures\n", n, fails))
