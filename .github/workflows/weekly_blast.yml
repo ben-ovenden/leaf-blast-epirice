@@ -104,6 +104,15 @@ jobs:
           if (length(need)) install.packages(need)
         shell: Rscript {0}
 
+      # send_email.py is executed by the offline suite in dry-run mode, so the
+      # interpreter has to exist BEFORE the tests, not only at send time. The
+      # 2026-09-28 email was sent and the step still failed, on a NameError in the
+      # line after the send: nothing had ever run the script before the live run.
+      - name: Ensure python3
+        run: |
+          command -v python3 >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq python3; }
+          python3 --version
+
       # Offline regression tests: no network, no quota, a few seconds. Fails the
       # run before three hours of fetching are spent on broken code. terra is
       # attached inside the suite on purpose: terra::shift masks
