@@ -107,6 +107,38 @@ om_quota_kind <- function(msg) {
 }
 
 ################################################################################
+# Archive edge: which day can the archive actually serve?
+#
+# om_archive_edge_from_hourly() is the pure part: the newest UTC day whose first
+# `need_hours` hours are all present. Those are the hours of the last fetched day
+# that the westernmost cell needs to complete its final model day; ERA5 arrives a
+# whole UTC day at a time, so in practice this is "the newest published day".
+#
+# om_probe_archive_edge() makes the one request. See probe_archive_edge.R for
+# why: the arithmetic edge names a day that is not published yet for the first
+# part of every UTC day, and the western cells then land a day short.
+################################################################################
+om_archive_edge_from_hourly <- function(hw, need_hours = 3L) {
+  if (is.null(hw) || nrow(hw) == 0L) return(as.Date(NA))
+  h <- data.table::copy(as.data.table(hw))
+  h[, `:=`(day = as.Date(format(dt, "%Y-%m-%d", tz = "UTC")),
+           hr  = as.integer(format(dt, "%H", tz = "UTC")))]
+  ok <- h[hr < need_hours,
+          .(n = sum(!is.na(temp) & !is.na(rh) & !is.na(rain))), by = day][n >= need_hours, day]
+  if (length(ok) == 0L) as.Date(NA) else max(ok)
+}
+
+om_probe_archive_edge <- function(edge, lon, lat, need_hours = 3L, look_back = 6L) {
+  edge <- as.Date(edge)
+  res <- om_request(lat, lon, edge - as.integer(look_back), edge)
+  if (!identical(res$status, "ok"))
+    return(list(date = as.Date(NA), status = res$status, msg = res$msg %||% ""))
+  el <- if (!is.null(res$body$hourly)) res$body else res$body[[1]]
+  hw <- tryCatch(.om_hourly_dt(el), error = function(e) NULL)
+  list(date = om_archive_edge_from_hourly(hw, need_hours), status = "ok", msg = "")
+}
+
+################################################################################
 # Refresh planner: one cohort per "how far behind", each paying only for the
 # days it is missing.
 #

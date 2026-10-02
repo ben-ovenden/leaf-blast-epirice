@@ -1,23 +1,30 @@
-name: Midweek grid top-up (Thursday, no email)
+name: Grid top-up (Thursday and Sunday, no email)
 
-# A second fetch day each week. The Monday run refreshes the whole grid and has
-# little budget left over to recover cells that fell behind or to add new ones;
-# this run spends another UTC day's quota on the same cache, so a backlog clears
-# in half the time and the grid fills from cold in about six weeks rather than
-# twelve. It fetches, merges and commits the cache, and stops: no maps, no town
-# table, no email (BLAST_MIDWEEK=1 in run_blast_grid.R). The Monday email reports
-# when it last ran.
+# Two extra fetch days a week on the same cache: fetch, save, stop. No maps, no
+# town table, no email (BLAST_MIDWEEK=1 in run_blast_grid.R). The Monday email
+# reports when the last one ran.
+#
+# THURSDAY clears whatever a bad Monday left behind and halves the time the grid
+# takes to fill from cold. SUNDAY is insurance for Monday: if Monday's grid fetch
+# is cut short, the cells it did not reach are one day behind rather than three,
+# the map steps back a single day, complete, and is not flagged as degraded. It
+# is the latest day that can be, because the weekly run fires on Monday UTC and
+# the two must not share a daily quota.
 on:
   schedule:
-    # 00:30 UTC Thursday = 10:30 AEST / 11:30 AEDT. After 00:00 UTC so the
-    # archive day the window asks for is complete (blast_data_end), three days
-    # from the Monday run either way, and a different UTC day from it, so the
-    # two never share a daily quota.
-    - cron: '30 0 * * 4'
+    # 03:17 UTC = 13:17 AEST / 14:17 AEDT. After the archive's daily update
+    # (about 00:30 to 01:00 UTC), so a top-up fetches the same newest day the
+    # Monday run will, and off the hour and half hour.
+    - cron: '17 3 * * 4'   # Thursday
+    - cron: '17 3 * * 0'   # Sunday
   workflow_dispatch:
     inputs:
       run_date:
         description: 'Override the run date (YYYY-MM-DD). Leave blank for today in Sydney.'
+        required: false
+        default: ''
+      weighted_cap:
+        description: 'Cap this run at N weighted API calls (e.g. 30 for a three minute smoke test). Leave blank for the full budget.'
         required: false
         default: ''
 
@@ -33,7 +40,9 @@ concurrency:
 jobs:
   topup:
     runs-on: ubuntu-latest
-    # GRID_MAX_MINUTES (200) plus GRID_RESERVE_MINUTES (25) plus commit.
+    # GRID_MAX_MINUTES (200) plus GRID_RESERVE_MINUTES (25) plus commit. The
+    # July 2026 attempt at this workflow had 60, the fetch alone took 56, and its
+    # one scheduled run was cancelled by the timeout with nothing saved.
     timeout-minutes: 240
     container:
       image: rocker/geospatial:latest
@@ -52,6 +61,27 @@ jobs:
           echo "BLAST_UTC_DATE=$UD" >> "$GITHUB_ENV"
           echo "Run date pinned to $RD (Australia/Sydney); UTC date $UD"
 
+      # The weather cache lives on the `cache-data` branch, one commit replaced on
+      # every run; see weekly_blast.yml. Restoring it is not optional.
+      - name: Restore weather cache
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir -p blast_outputs
+          ok=0
+          for i in 1 2 3; do
+            if git fetch --no-tags --depth 1 origin cache-data; then ok=1; break; fi
+            sleep $((i*10))
+          done
+          if [ "$ok" != 1 ]; then
+            echo "::error title=Weather cache not restored::could not fetch the cache-data branch. Refusing to run on an empty cache: rebuilding it takes about twelve fetch days."
+            exit 1
+          fi
+          CACHE_BASE=$(git rev-parse FETCH_HEAD)
+          echo "CACHE_BASE=$CACHE_BASE" >> "$GITHUB_ENV"
+          git cat-file blob "$CACHE_BASE:weather_cache.csv.gz" > blast_outputs/weather_cache.csv.gz
+          git cat-file blob "$CACHE_BASE:cache_version.txt" > blast_outputs/cache_version.txt
+          echo "Restored $(git log -1 --format='%h %s' "$CACHE_BASE"): $(stat -c %s blast_outputs/weather_cache.csv.gz) bytes, schema $(cat blast_outputs/cache_version.txt)"
+
       - name: Install extra R packages
         run: |
           pkgs <- c("data.table", "jsonlite", "curl", "terra")
@@ -62,25 +92,62 @@ jobs:
       - name: Offline tests
         run: Rscript test_offline.R
 
-      - name: Fetch and save the cache
+      # Ask the archive what it has, once, without waiting: a top-up takes
+      # whatever is published. See weekly_blast.yml.
+      - name: Resolve archive edge
+        env:
+          BLAST_EDGE_WAIT_MIN: "0"
+        run: |
+          DE=$(Rscript probe_archive_edge.R | sed -n 's/^EDGE=//p' | tail -n 1)
+          case "$DE" in
+            20[0-9][0-9]-[01][0-9]-[0-3][0-9])
+              echo "BLAST_DATA_END=$DE" >> "$GITHUB_ENV"
+              echo "Archive edge pinned: $DE" ;;
+            *)
+              echo "::warning title=Archive edge not probed::probe returned '$DE'; the script falls back to the arithmetic edge" ;;
+          esac
+
+      - name: Fetch
         env:
           BLAST_MIDWEEK: "1"
+          BLAST_WEIGHTED_CAP: ${{ github.event.inputs.weighted_cap }}
         run: Rscript run_blast_grid.R
 
-      - name: Commit cache and top-up status
+      - name: Save weather cache
         run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          f=blast_outputs/weather_cache.csv.gz; v=blast_outputs/cache_version.txt
+          if [ ! -s "$f" ] || [ ! -s "$v" ]; then
+            echo "::error title=Weather cache not saved::$f or $v is missing or empty"
+            exit 1
+          fi
+          new=$(stat -c %s "$f"); old=$(git cat-file -s "$CACHE_BASE:weather_cache.csv.gz")
+          oldv=$(git cat-file blob "$CACHE_BASE:cache_version.txt" | tr -d '[:space:]'); newv=$(tr -d '[:space:]' < "$v")
+          if [ "$oldv" = "$newv" ] && [ "$new" -lt $((old / 2)) ]; then
+            echo "::error title=Weather cache not saved::new cache is $new bytes against $old restored, same schema $newv. Refusing to replace it."
+            exit 1
+          fi
+          blob=$(git hash-object -w "$f"); vblob=$(git hash-object -w "$v")
+          tree=$(printf '100644 blob %s\tcache_version.txt\n100644 blob %s\tweather_cache.csv.gz\n' "$vblob" "$blob" | git mktree)
+          commit=$(git -c user.name=github-actions -c user.email=github-actions@github.com commit-tree "$tree" -m "Weather cache ${BLAST_RUN_DATE} (${new} bytes, schema ${newv})")
+          for i in 1 2 3; do git push --force origin "$commit:refs/heads/cache-data" && break || sleep $((i*10)); done
+          if ! git ls-remote origin refs/heads/cache-data | grep -q "$commit"; then
+            echo "::error title=Weather cache not saved::the push to cache-data did not land"
+            exit 1
+          fi
+          echo "Saved cache as $commit ($new bytes)"
+
+      - name: Commit top-up status
+        run: |
           git config --local user.email "github-actions@github.com"
           git config --local user.name "github-actions"
-          for f in weather_cache.csv.gz weather_cache.csv fetch_failures.csv \
-                   cache_version.txt weighted_spend.csv midweek_status.txt; do
+          for f in fetch_failures.csv weighted_spend.csv midweek_status.txt; do
             [ -f "blast_outputs/$f" ] && git add -f "blast_outputs/$f" || true
           done
           git add -u blast_outputs/ 2>/dev/null || true
           if git diff --staged --quiet; then
             echo "Nothing to commit."
           else
-            git commit -m "Midweek top-up (cache) ${BLAST_RUN_DATE}"
+            git commit -m "Grid top-up ${BLAST_RUN_DATE}"
             git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
             for i in 1 2 3; do git push && break || sleep $((i*10)); done
           fi
@@ -93,14 +160,14 @@ jobs:
           path: blast_outputs/
           retention-days: 30
 
-      # The top-up has one job: leave a fresher committed cache behind. A missing
-      # or stale status file means it did not get that far.
+      # The top-up has one job: leave a fresher cache behind. A missing or stale
+      # status file means it did not get that far.
       - name: Verdict
         if: always()
         run: |
           f=blast_outputs/midweek_status.txt
           if [ ! -f "$f" ] || ! grep -q "^${BLAST_RUN_DATE}|" "$f"; then
-            echo "::error title=Midweek top-up did not finish::$f is missing or from another run"
+            echo "::error title=Grid top-up did not finish::$f is missing or from another run"
             exit 1
           fi
           echo "Top-up status: $(cat "$f")"

@@ -8,17 +8,21 @@
 # Weekly map/summary outputs are delivered by email, not committed. Keep only the
 # state that must persist across runs.
 #
-# weather_cache.csv (the uncompressed copy) is no longer written:
-# WEATHER_CACHE_KEEP_CSV is FALSE, because it was 16.4 MB against 2.1 MB for the
-# gz and both were being committed every run. The negation is kept so an existing
-# copy can still be staged for deletion.
+# The weather cache (weather_cache.csv.gz) and its schema marker
+# (cache_version.txt) are NOT on this branch. They live on the `cache-data`
+# branch as one commit that every run replaces, because git keeps every version
+# of a committed file: 38 runs had put 104 MB of old caches into main's history.
+# To get the cache into a local checkout:
+#   git fetch origin cache-data
+#   git cat-file blob FETCH_HEAD:weather_cache.csv.gz > blast_outputs/weather_cache.csv.gz
+#   git cat-file blob FETCH_HEAD:cache_version.txt   > blast_outputs/cache_version.txt
 blast_outputs/*
 !blast_outputs/town_trends.csv
 !blast_outputs/blastam_trends.csv
-!blast_outputs/weather_cache.csv
-!blast_outputs/weather_cache.csv.gz
 !blast_outputs/fetch_failures.csv
-!blast_outputs/cache_version.txt
 !blast_outputs/map_stats.txt
 !blast_outputs/midweek_status.txt
 !blast_outputs/.gitkeep
+
+# Python bytecode from running or compiling send_email.py locally
+__pycache__/

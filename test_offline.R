@@ -631,7 +631,7 @@ source("run_health.R")
   ok("and clears the previous run's status at the start",
      grepl("rm -f blast_outputs/run_status.txt", yml, fixed = TRUE))
   ok("and commits the status file with the other state",
-     grepl("run_status.txt", sub("Email summary.*$", "", sub("^.*Commit cache and trends", "", yml)), fixed = TRUE))
+     grepl("run_status.txt", sub("Email summary.*$", "", sub("^.*Commit trends and run state", "", yml)), fixed = TRUE))
 }
 
 cat("\n21. A rerun over the same window cannot make the record worse\n")
@@ -714,8 +714,8 @@ cat("\n22. The midweek top-up: a second fetch day, no maps, no email\n")
 # BLAST_MIDWEEK branch existed in run_blast_grid.R but ran the whole pipeline,
 # nothing invoked it, and the email line assumed a daily job that never existed.
 {
-  ok("MIDWEEK_MAX_AGE_DAYS is configured for a weekly job",
-     exists("MIDWEEK_MAX_AGE_DAYS") && MIDWEEK_MAX_AGE_DAYS >= 7L)
+  ok("MIDWEEK_MAX_AGE_DAYS is set so that a missed Sunday top-up is reported on Monday",
+     exists("MIDWEEK_MAX_AGE_DAYS") && MIDWEEK_MAX_AGE_DAYS >= 1L && MIDWEEK_MAX_AGE_DAYS <= 3L)
   ok("in midweek mode the grid runner saves the cache and stops before modelling",
      regexpr("quit(save = \"no\", status = 0)", gsrc, fixed = TRUE) > 0 &&
      regexpr("quit(save = \"no\", status = 0)", gsrc, fixed = TRUE) <
@@ -730,9 +730,19 @@ cat("\n22. The midweek top-up: a second fetch day, no maps, no email\n")
   ok("it shares the weekly run's concurrency group", grepl("group: blast-grid", ymlm, fixed = TRUE))
   ok("it sends no email and runs no town table",
      !grepl("send_email.py", ymlm, fixed = TRUE) && !grepl("run_blast.R", ymlm, fixed = TRUE))
-  ok("it commits the cache and the top-up status",
+  ok("it saves the cache and commits the top-up status",
      grepl("weather_cache.csv.gz", ymlm, fixed = TRUE) && grepl("midweek_status.txt", ymlm, fixed = TRUE))
-  ok("it fires on a different UTC day from the Monday run", grepl("cron: '30 0 \\* \\* 4'", ymlm))
+  # Thursday recovers from a bad Monday; Sunday is Monday's insurance (cells the
+  # Monday fetch does not reach are then one day behind, not three). Neither may
+  # share the weekly run's UTC day, which is Monday, or its daily quota.
+  tl <- strsplit(ymlm, "\n")[[1]]
+  tcr <- unlist(regmatches(tl, gregexpr("(?<=cron: ')[^']+", tl, perl = TRUE)))
+  tday <- vapply(strsplit(tcr, " "), function(x) x[5], character(1))
+  thr  <- vapply(strsplit(tcr, " "), function(x) as.integer(x[2]), integer(1))
+  ok("there are two top-ups a week, Thursday and Sunday UTC", setequal(tday, c("4", "0")),
+     sprintf("(crons: %s)", paste(tcr, collapse = " | ")))
+  ok("neither on the weekly run's UTC day", !"1" %in% tday)
+  ok("both after the archive's daily update, so they fetch the newest day", all(thr >= 2L))
   ok("the Monday email reports the top-up on a weekly cadence",
      grepl("MIDWEEK_MAX_AGE_DAYS", tsrc, fixed = TRUE) && !grepl("Daily top-up", tsrc, fixed = TRUE))
 }
@@ -809,34 +819,119 @@ cat("\n23. The email sender runs end to end, minus the SMTP conversation\n")
   }
 }
 
-cat("\n24. The weekly crons and the gate agree, and fire early enough\n")
-# The gate job compares the fired schedule STRING with the current Sydney offset.
-# A cron edited without the gate, or the reverse, makes both entries answer "the
-# other seasonal cron handles this", and the week is skipped with two green ticks.
-# And GitHub does not fire on time: the 20:30 UTC cron started 14 minutes to 2 h 40
-# late through August and September 2026, so the 28 September email, due about
-# 7am, arrived at 11:16.
+cat("\n24. The weekly run fires once, on Monday UTC\n")
+# History. Two seasonal crons at 06:30 local, with a gate job choosing between
+# them by daylight-saving offset; GitHub fired them up to 2 h 40 late, so they
+# moved to 01:47. Both were SUNDAY in UTC, which capped the map at eight days old.
+# The archive publishes one more day at about 00:30 to 01:00 UTC, so a run on
+# MONDAY UTC models a day later. That constraint is in UTC: one cron, no gate.
 {
   wl <- readLines(".github/workflows/weekly_blast.yml", warn = FALSE)
   crons <- unlist(regmatches(wl, gregexpr("(?<=cron: ')[^']+", wl, perl = TRUE)))
-  gl    <- grep("$SCHED\" = \"", wl, fixed = TRUE, value = TRUE)
-  gate  <- sub(".*\\$SCHED\" = \"([^\"]+)\".*", "\\1", gl)
-  ok("there are two seasonal crons", length(crons) == 2L, sprintf("(found %d)", length(crons)))
-  ok("the gate names exactly the strings the crons use", setequal(crons, gate),
-     sprintf("(crons: %s; gate: %s)", paste(crons, collapse = " | "), paste(gate, collapse = " | ")))
-  sched_for <- function(off) sub(".*\\$SCHED\" = \"([^\"]+)\".*", "\\1", grep(off, gl, fixed = TRUE, value = TRUE))
-  aest <- sched_for("+1000"); aedt <- sched_for("+1100")
   f <- function(s) strsplit(s, " ")[[1]]
-  ok("the AEDT entry fires one UTC hour before the AEST one, same minute and day",
-     length(aest) == 1L && length(aedt) == 1L &&
-     as.integer(f(aest)[2]) - as.integer(f(aedt)[2]) == 1L && identical(f(aest)[-2], f(aedt)[-2]))
-  local_start <- (as.integer(f(aest)[2]) + 10L) %% 24L + as.integer(f(aest)[1]) / 60
-  ok("a run fired three hours late still lands by about 7am local",
-     local_start + 3 + 2.2 <= 7.25, sprintf("(scheduled %.2f h local)", local_start))
-  ok("both entries are on Sunday UTC, so the data window is unchanged",
-     f(aest)[5] == "0" && f(aedt)[5] == "0")
-  ok("and off the hour and half hour, where the scheduler is busiest",
-     !as.integer(f(aest)[1]) %in% c(0L, 30L))
+  ok("there is exactly one weekly cron", length(crons) == 1L,
+     sprintf("(found: %s)", paste(crons, collapse = " | ")))
+  ok("on Monday in UTC, so the UTC date equals the Sydney run date",
+     length(crons) == 1L && f(crons[1])[5] == "1")
+  ok("early in the UTC day, so the email is still Monday afternoon in Sydney",
+     length(crons) == 1L && as.integer(f(crons[1])[2]) <= 2L)
+  ok("off the hour and half hour, where the scheduler is busiest",
+     length(crons) == 1L && !as.integer(f(crons[1])[1]) %in% c(0L, 30L))
+  ok("no seasonal gate is left to disagree with it",
+     !any(grepl("$SCHED\" = \"", wl, fixed = TRUE)) && !any(grepl("needs: gate", wl, fixed = TRUE)))
+  vars <- c("BLAST_RUN_DATE", "BLAST_UTC_DATE", "BLAST_DATA_END"); old <- Sys.getenv(vars, unset = NA)
+  Sys.setenv(BLAST_RUN_DATE = "2026-10-05", BLAST_UTC_DATE = "2026-10-05"); Sys.unsetenv("BLAST_DATA_END")
+  ok("a Monday-UTC run models to the previous Monday, a day later than a Sunday-UTC one",
+     blast_data_end(blast_run_date()) - DAY_CUT_LAG_DAYS == as.Date("2026-09-28"),
+     sprintf("(got %s)", format(blast_data_end(blast_run_date()) - DAY_CUT_LAG_DAYS)))
+  for (v in vars) if (is.na(old[[v]])) Sys.unsetenv(v) else do.call(Sys.setenv, as.list(setNames(old[[v]], v)))
+}
+
+cat("\n25. The weather cache is not versioned on main\n")
+# Every run committed a new 6.5 MB cache to main, and git keeps every version of
+# a committed file: after 38 runs the old caches came to 104 MB of the 110 MB
+# repository, and three runs a week would add about a gigabyte a year. No model
+# reads weather older than the crop window. The cache now lives on `cache-data`
+# as ONE parentless commit that each run replaces.
+{
+  for (wf in c("weekly_blast.yml", "midweek_topup.yml")) {
+    y <- paste(readLines(file.path(".github/workflows", wf), warn = FALSE), collapse = "\n")
+    pos <- function(s) regexpr(s, y, fixed = TRUE)
+    ok(sprintf("%s restores the cache before the grid script and saves it straight after", wf),
+       pos("name: Restore weather cache") > 0 &&
+       pos("name: Restore weather cache") < pos("run: Rscript run_blast_grid.R") &&
+       pos("run: Rscript run_blast_grid.R") < pos("name: Save weather cache"))
+    ok(sprintf("%s refuses to run on an empty cache", wf),
+       grepl("Refusing to run on an empty cache", y, fixed = TRUE))
+    ok(sprintf("%s writes a parentless commit and force-pushes cache-data, nothing else", wf),
+       grepl("commit-tree", y, fixed = TRUE) &&
+       lengths(regmatches(y, gregexpr("push --force", y, fixed = TRUE))) == 1L &&
+       grepl("push --force origin \"$commit:refs/heads/cache-data\"", y, fixed = TRUE))
+    ok(sprintf("%s will not replace the cache with one under half its size", wf),
+       grepl("Refusing to replace it", y, fixed = TRUE))
+    commit_step <- sub("\n      - name:.*$", "", sub("^.*\n      - name: Commit ", "", y))
+    ok(sprintf("%s no longer adds the cache to main", wf),
+       !grepl("weather_cache", commit_step, fixed = TRUE) && !grepl("cache_version", commit_step, fixed = TRUE))
+  }
+  gi <- readLines(".gitignore", warn = FALSE)
+  ok("the cache and its schema marker are ignored on main",
+     !any(grepl("^!blast_outputs/(weather_cache|cache_version)", gi)))
+  tracked <- tryCatch(suppressWarnings(system2("git", c("ls-files", "blast_outputs"), stdout = TRUE, stderr = FALSE)),
+                      error = function(e) character(0))
+  if (length(tracked) == 0L) cat("  SKIP  not a git checkout; cannot check what is tracked\n") else
+    ok("and no longer tracked there", !any(grepl("weather_cache|cache_version", tracked)),
+       sprintf("(tracked: %s)", paste(grep("cache", tracked, value = TRUE), collapse = ", ")))
+  need <- CROP_AGE_DAYS + 1L + GRID_WINDOW_MAX_LAG_DAYS
+  ok("the cache keeps what the models need, with room for a fallback window",
+     CACHE_HISTORY_DAYS >= need + 14L, sprintf("(%d days kept, %d needed)", CACHE_HISTORY_DAYS, need))
+  ok("and no more than about three months", CACHE_HISTORY_DAYS <= 93L)
+}
+
+cat("\n26. The run asks the archive what it has, rather than assuming\n")
+# Regression: the last day fetched was arithmetic, "UTC date minus 6". Open-Meteo
+# publishes that day at about 00:30 to 01:00 UTC, so earlier in a UTC day it is
+# not there, and every cell west of 120 E, which needs three hours of it, lands a
+# day short (test 16). It was still missing at 00:08, 00:11 and 00:16 UTC on
+# 2 October 2026; a run that began at 00:26 UTC on 25 August caught it part way.
+{
+  mkh <- function(last_full, next_day_hours = integer(0)) {
+    tt <- seq(as.POSIXct("2026-09-20 00:00", tz = "UTC"),
+              as.POSIXct(paste(as.Date(last_full) + 1L, "23:00"), tz = "UTC"), by = "hour")
+    d <- data.table(dt = tt, temp = 20, rh = 60, rain = 0)
+    nxt  <- as.Date(format(d$dt, "%Y-%m-%d", tz = "UTC")) == as.Date(last_full) + 1L
+    keep <- as.integer(format(d$dt, "%H", tz = "UTC")) %in% next_day_hours
+    d[nxt & !keep, `:=`(temp = NA_real_, rh = NA_real_, rain = NA_real_)]
+    d
+  }
+  ok("an unpublished last day is not counted",
+     om_archive_edge_from_hourly(mkh("2026-09-25"), 3L) == as.Date("2026-09-25"))
+  ok("a day counts once the hours the westernmost cell needs are there",
+     om_archive_edge_from_hourly(mkh("2026-09-25", 0:2), 3L) == as.Date("2026-09-26"))
+  ok("two of the three hours is not enough",
+     om_archive_edge_from_hourly(mkh("2026-09-25", 0:1), 3L) == as.Date("2026-09-25"))
+  ok("no data at all gives NA, not an error", is.na(om_archive_edge_from_hourly(NULL, 3L)))
+  ok("the hours needed follow from the day cut and the western edge of the grid",
+     ceiling(BLASTAM_DAY_CUT_HOUR - GRID_EXTENT[1] / 15) == 3)
+  vars <- c("BLAST_RUN_DATE", "BLAST_UTC_DATE", "BLAST_DATA_END"); old <- Sys.getenv(vars, unset = NA)
+  Sys.setenv(BLAST_RUN_DATE = "2026-10-05", BLAST_UTC_DATE = "2026-10-05")   # arithmetic edge 2026-09-29
+  Sys.setenv(BLAST_DATA_END = "2026-09-28")
+  ok("a probed edge behind the arithmetic one is used", blast_data_end(blast_run_date()) == as.Date("2026-09-28"))
+  Sys.setenv(BLAST_DATA_END = "2026-10-02")
+  ok("a probed edge ahead of it is ignored", blast_data_end(blast_run_date()) == as.Date("2026-09-29"))
+  Sys.setenv(BLAST_DATA_END = "rubbish")
+  ok("and so is one that is not a date", blast_data_end(blast_run_date()) == as.Date("2026-09-29"))
+  for (v in vars) if (is.na(old[[v]])) Sys.unsetenv(v) else do.call(Sys.setenv, as.list(setNames(old[[v]], v)))
+  wk <- paste(readLines(".github/workflows/weekly_blast.yml", warn = FALSE), collapse = "\n")
+  tu <- paste(readLines(".github/workflows/midweek_topup.yml", warn = FALSE), collapse = "\n")
+  for (y in list(wk, tu))
+    ok("the workflow probes after the tests and before the grid script",
+       regexpr("name: Offline tests", y, fixed = TRUE) < regexpr("name: Resolve archive edge", y, fixed = TRUE) &&
+       regexpr("name: Resolve archive edge", y, fixed = TRUE) < regexpr("run: Rscript run_blast_grid.R", y, fixed = TRUE))
+  ok("the weekly run waits for the daily update; a top-up takes what is there",
+     !grepl("BLAST_EDGE_WAIT_MIN", wk, fixed = TRUE) && grepl("BLAST_EDGE_WAIT_MIN: \"0\"", tu, fixed = TRUE))
+  ok("and the weekly job's timeout allows for that wait",
+     as.integer(sub(".*timeout-minutes: ([0-9]+).*", "\\1", wk)) >=
+       ARCHIVE_EDGE_WAIT_MAX_MIN + GRID_MAX_MINUTES + GRID_RESERVE_MINUTES + TOWN_QUOTA_WAIT_MAX_MIN)
 }
 
 cat(sprintf("\n%d tests, %d failures\n", n, fails))
