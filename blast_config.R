@@ -46,8 +46,20 @@ blast_utc_date <- function() {
 # clock, not of the Sydney calendar, so the lag is counted from whichever of the
 # two dates is EARLIER. See ARCHIVE_LAG_DAYS in section 2 for what went wrong
 # when it was counted from the Sydney date alone.
-blast_data_end <- function(run_date = blast_run_date()) {
+blast_archive_edge <- function(run_date = blast_run_date()) {
   min(as.Date(run_date), blast_utc_date()) - ARCHIVE_LAG_DAYS
+}
+
+# The arithmetic above is an UPPER bound. Open-Meteo publishes each new ERA5 day
+# at about 00:30 to 01:00 UTC, so early in a UTC day the arithmetic edge is not
+# there yet. The workflows run probe_archive_edge.R, which asks the archive, and
+# export its answer as BLAST_DATA_END; it may only pull the window BACK. Unset
+# (a local run), the arithmetic edge is used, as before.
+blast_data_end <- function(run_date = blast_run_date()) {
+  edge <- blast_archive_edge(run_date)
+  v <- Sys.getenv("BLAST_DATA_END", "")
+  d <- if (nzchar(v)) tryCatch(suppressWarnings(as.Date(v)), error = function(e) as.Date(NA)) else as.Date(NA)
+  if (!is.na(d) && d <= edge) d else edge
 }
 
 ################################################################################
@@ -99,6 +111,19 @@ MIN_DAYS <- 16
 # from the UTC date costs one day of freshness on the Monday email and removes
 # the whole chain. Manual runs after 10:00 Sydney are unaffected.
 ARCHIVE_LAG_DAYS <- 6L
+
+# WHEN THE NEW DAY APPEARS. "UTC date minus 6" is published at about 00:30 to
+# 01:00 UTC, not at midnight: it was still missing at 00:08 and 00:11 UTC on
+# 2 October 2026, a run that began at 00:26 UTC on 25 August caught it a few
+# minutes in (38 western cells a day short, 649 not), and every run that started
+# at 05:09 UTC or later had it. So the workflows ask (probe_archive_edge.R). The
+# probe requests one far-western point, because that is where the last day's
+# hours are needed, and the weekly run waits for the update because the extra day
+# is the reason it runs on Monday UTC at all.
+ARCHIVE_EDGE_PROBE_LON    <- 114.0
+ARCHIVE_EDGE_PROBE_LAT    <- -26.0
+ARCHIVE_EDGE_WAIT_MAX_MIN <- 90    # weekly run: wait at most this long for the new day
+ARCHIVE_EDGE_POLL_MIN     <- 10    # and ask again this often (1 weighted call each)
 
 # Why the extra day. The model day now runs from BLASTAM_DAY_CUT_HOUR local solar
 # (see section 4a), so the last fetched day is only partially covered, and how
@@ -329,6 +354,13 @@ GRID_MAX_FETCHES_PER_RUN <- 8500L
 REFRESH_MIN_STALE_DAYS   <- 0L
 # Budget per run (unit: WEIGHTED CALLS). Below the 10,000/day free ceiling.
 DAILY_WEIGHTED_CAP       <- 9000
+# BLAST_WEIGHTED_CAP can only LOWER it. The top-up workflow's manual dispatch
+# passes it, so a change to the workflows can be proved end to end (restore the
+# cache, probe, fetch a batch, save, commit) in three minutes and thirty calls
+# instead of two hours and a day's quota.
+.cap_env <- suppressWarnings(as.numeric(Sys.getenv("BLAST_WEIGHTED_CAP", "")))
+if (isTRUE(is.finite(.cap_env)) && .cap_env >= 0)
+  DAILY_WEIGHTED_CAP <- min(DAILY_WEIGHTED_CAP, .cap_env)
 
 # Sustained request pacing (unit: WEIGHTED CALLS PER MINUTE).
 # The hourly ceiling (5,000/h = 83/min) binds long before the per minute one
@@ -420,12 +452,14 @@ COL_STALE <- COL_NODATA        # cells not refreshed to the window are drawn in 
 # for a reason unrelated to the alignment bug this replaced.
 GRID_WINDOW_MAX_LAG_DAYS <- 7L
 
-# Midweek top-up (.github/workflows/midweek_topup.yml): a second fetch day each
-# week, run with BLAST_MIDWEEK=1, which fetches, saves the cache and stops. It
-# halves the time the grid takes to fill from cold and to recover after an
-# interrupted run. run_blast.R reports its last run in the Monday email and
-# complains when that is older than this.
-MIDWEEK_MAX_AGE_DAYS <- 7L
+# Grid top-ups (.github/workflows/midweek_topup.yml): two extra fetch days a
+# week, Thursday and Sunday UTC, run with BLAST_MIDWEEK=1, which fetches, saves
+# the cache and stops. Thursday recovers from a bad Monday and speeds a cold
+# fill; Sunday is Monday's insurance, leaving unreached cells one day behind
+# instead of three. run_blast.R reports the last top-up in the Monday email and
+# complains when it is older than this, which on a Monday means Sunday's did not
+# run.
+MIDWEEK_MAX_AGE_DAYS <- 2L
 
 # Rendering. The IDW search radius is derived from the achieved spacing.
 IDW_RADIUS_MULT <- 1.5   # search radius = this many times the mean land spacing
@@ -466,8 +500,16 @@ COL_TOWN  <- "#111111"
 WEATHER_CACHE_GZ   <- "weather_cache.csv.gz"
 WEATHER_CACHE_CSV  <- "weather_cache.csv"
 WEATHER_CACHE_KEEP_CSV <- FALSE
+# How far back the cache reaches. The models need CROP_AGE_DAYS + 1 = 61 days (68
+# in coverage mode); 90 leaves room for a fallback window three weeks back and
+# nothing reads anything older. It was 120. The outputs that matter over a season
+# are in the trends CSVs, not here.
+#
+# This bounds the FILE. What bounds the REPOSITORY is that the cache is no longer
+# committed to main at all (see "Restore weather cache" in the workflows): git
+# keeps every version of a committed file, however short each one is.
 CACHE_KEEP_HISTORY <- TRUE
-CACHE_HISTORY_DAYS <- 120L
+CACHE_HISTORY_DAYS <- 90L
 
 # Cache schema version. BUMP THIS whenever a change alters the VALUES stored in
 # the cache, not just its columns. On a mismatch the cache is discarded and

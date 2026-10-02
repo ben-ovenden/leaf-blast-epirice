@@ -174,8 +174,12 @@ sites <- as.data.table(MONITOR_TOWNS)
 sites[, pid := sprintf("%s", name)]
 
 cat("Run date:   ", format(RUN_DATE, "%A %d %B %Y"), " (UTC date ", format(blast_utc_date()), ")\n", sep = "")
-cat("Fetched to: ", format(data_end, "%Y-%m-%d"), " (archive lag ", ARCHIVE_LAG_DAYS,
-    " days from the earlier of the two dates)\n", sep = "")
+cat("Fetched to: ", format(data_end, "%Y-%m-%d"),
+    if (data_end < blast_archive_edge(RUN_DATE))
+      sprintf(" (the archive's newest day, as probed; the arithmetic edge is %s)\n",
+              format(blast_archive_edge(RUN_DATE)))
+    else sprintf(" (archive lag %d days from the earlier of the two dates)\n", ARCHIVE_LAG_DAYS),
+    sep = "")
 cat("Modelled to:", format(end_date, "%Y-%m-%d"), " (model day cut at ",
     BLASTAM_DAY_CUT_HOUR, ":00 local solar, so the last fetched day is partial)\n", sep = "")
 cat("Crop age:   ", CROP_AGE_DAYS, " days (rolling emergence ",
@@ -379,10 +383,10 @@ midweek_line <- function() {
   fetched <- if (length(s) >= 7) suppressWarnings(as.integer(s[7])) else NA_integer_
   max_age <- if (exists("MIDWEEK_MAX_AGE_DAYS")) MIDWEEK_MAX_AGE_DAYS else 7L
   if (is.na(d) || as.integer(RUN_DATE - d) > max_age)
-    sprintf("Midweek top-up: none in the last %d days (last %s); check the top-up workflow.",
-            max_age, if (is.na(d)) "never" else format(d, "%d %b"))
+    sprintf("Grid top-up: none in the last %d days (last %s); check the top-up workflow.",
+            max_age, if (is.na(d)) "never" else format(d, "%a %d %b"))
   else
-    sprintf("Midweek top-up ran %s: %s%d new cell(s), cache now %d.",
+    sprintf("Grid top-up ran %s: %s%d new cell(s), cache now %d.",
             format(d, "%a %d %b"),
             if (is.na(fetched)) "" else sprintf("%d cell(s) fetched, ", fetched),
             added, pts)

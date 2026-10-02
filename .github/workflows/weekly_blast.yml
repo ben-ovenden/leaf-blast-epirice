@@ -1,24 +1,25 @@
-name: Weekly leaf blast risk (Monday ~7am AET email)
+name: Weekly leaf blast risk (Monday afternoon AET email)
 
-# GitHub cron is UTC only, and eastern-Australia clocks shift an hour at daylight
-# saving. Two schedules bracket the change and the gate job lets only the one
-# matching the current offset proceed.
+# ONE cron, in UTC, on MONDAY.
 #
-# SCHEDULED FOR 01:47 LOCAL, NOT 06:30. GitHub does not fire a cron on time: the
-# old 20:30 UTC entry started between 14 minutes and 2 h 40 late through August
-# and September 2026 (later every week from 30 August), and the run itself takes
-# about 2 h 05, so the "7am" email of 28 September arrived at 11:16. From 01:47 a
-# run fired on time lands about 04:00 and one fired three hours late about 07:00.
-# Minute 47 keeps it off the hour and half hour, where the scheduler is busiest.
-# Both entries are still SUNDAY in UTC, so blast_data_end() gives the same window.
+# The map can only be as new as the ERA5 archive, and the archive publishes one
+# more day at about 00:30 to 01:00 UTC (measured: not yet there at 00:08 and
+# 00:11 UTC on 2 October 2026; a run that began at 00:26 UTC on 25 August caught
+# it a few minutes in; every run from 05:09 UTC on had it). Running once that day
+# is out makes the map ONE DAY NEWER than the old Sunday-UTC schedule could:
+# weather to the previous Monday, seven days before the email, not eight.
 #
-# THE GATE JOB BELOW COMPARES THESE STRINGS LITERALLY. Change one without the
-# other and both crons answer "the other seasonal cron handles this": the week is
-# skipped with two green ticks. test_offline.R (test 24) checks they agree.
+# So this fires at 00:47 UTC Monday (10:47 AEST, 11:47 AEDT) and the "Resolve
+# archive edge" step then ASKS the archive what it has, waiting up to
+# ARCHIVE_EDGE_WAIT_MAX_MIN for the new day. The run takes about 2 h 05 and
+# GitHub fires schedules anything from minutes to hours late, so expect the email
+# early to mid afternoon. The price of the extra day is the morning delivery.
+#
+# The constraint is in UTC, so daylight saving no longer matters: the two
+# seasonal crons and the gate job that chose between them are gone.
 on:
   schedule:
-    - cron: '47 15 * * 0'   # 01:47 Monday AEST (winter, UTC+10)
-    - cron: '47 14 * * 0'   # 01:47 Monday AEDT (summer, UTC+11)
+    - cron: '47 0 * * 1'   # 00:47 UTC Monday = 10:47 AEST / 11:47 AEDT
   workflow_dispatch:
     inputs:
       run_date:
@@ -35,40 +36,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  gate:
-    runs-on: ubuntu-latest
-    outputs:
-      run: ${{ steps.check.outputs.run }}
-    steps:
-      - id: check
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Manual trigger; running."
-            echo "run=yes" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          # Match the schedule that fired against the current UTC offset rather
-          # than against the local hour. GitHub cron fires anything from minutes
-          # to hours late, and an hour check ("is it 06?") silently skipped the
-          # entire week whenever a run started at 07:0x local.
-          OFF=$(TZ=Australia/Sydney date +%z)     # +1000 (AEST) or +1100 (AEDT)
-          SCHED='${{ github.event.schedule }}'
-          echo "Offset $OFF, schedule '$SCHED'"
-          if { [ "$OFF" = "+1000" ] && [ "$SCHED" = "47 15 * * 0" ]; } || \
-             { [ "$OFF" = "+1100" ] && [ "$SCHED" = "47 14 * * 0" ]; }; then
-            echo "run=yes" >> "$GITHUB_OUTPUT"
-          else
-            echo "The other seasonal cron handles this offset."
-            echo "run=no" >> "$GITHUB_OUTPUT"
-          fi
-
   blast:
-    needs: gate
-    if: needs.gate.outputs.run == 'yes'
     runs-on: ubuntu-latest
-    # Must exceed GRID_MAX_MINUTES (200) plus GRID_RESERVE_MINUTES (25) plus the
-    # town run's TOWN_QUOTA_WAIT_MAX_MIN (10) with room to commit and email, so
-    # the scripts' own graceful stops fire first and the run still saves.
-    timeout-minutes: 255
+    # Must exceed ARCHIVE_EDGE_WAIT_MAX_MIN (90) plus GRID_MAX_MINUTES (200) plus
+    # GRID_RESERVE_MINUTES (25) plus the town run's TOWN_QUOTA_WAIT_MAX_MIN (10)
+    # with room to commit and email, so the scripts' own graceful stops fire first
+    # and the run still saves. The hosted-runner ceiling is 360.
+    timeout-minutes: 345
     env:
       MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
     # rocker/geospatial ships R with terra, sf and a matching GDAL already built.
@@ -87,13 +61,9 @@ jobs:
       # started on the far side of local midnight and took a third. Pinning the
       # date here and exporting it makes all three impossible.
       #
-      # The UTC date is pinned alongside it. The archive's availability follows
-      # the UTC clock, and this job fires at ~22:30 UTC on SUNDAY: "Sydney Monday
-      # minus 6" was only five days behind the archive and that day was not there
-      # yet, so every cell west of 120 E landed a day short on every scheduled
-      # run. blast_data_end() counts the lag from the earlier of the two dates.
-      # Pinned here for the same reason as the run date: the grid run crosses
-      # 00:00 UTC and the town script must see the same date the grid script did.
+      # The UTC date is pinned alongside it: the archive's availability follows
+      # the UTC clock, and blast_data_end() counts the lag from the earlier of the
+      # two dates. On the scheduled run they are now the same day.
       - name: Resolve run date
         run: |
           RD="${{ github.event.inputs.run_date }}"
@@ -106,6 +76,35 @@ jobs:
           # The previous run's verdict is committed; clear it so the Verdict
           # step below cannot mistake last week's health for this week's.
           rm -f blast_outputs/run_status.txt
+
+      # THE WEATHER CACHE LIVES ON ITS OWN BRANCH, `cache-data`: one parentless
+      # commit, replaced on every run. It used to be committed to main, and git
+      # keeps every version of a file: 38 runs had put 104 MB of old caches into
+      # the history, and three runs a week would add about a gigabyte a year. No
+      # model reads weather older than the crop window, so nothing is lost by not
+      # keeping the old versions.
+      #
+      # Restoring it is NOT optional. A run that carried on with an empty cache
+      # would spend about twelve fetch days rebuilding the grid, and would then
+      # overwrite the good cache with its fragment.
+      - name: Restore weather cache
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir -p blast_outputs
+          ok=0
+          for i in 1 2 3; do
+            if git fetch --no-tags --depth 1 origin cache-data; then ok=1; break; fi
+            sleep $((i*10))
+          done
+          if [ "$ok" != 1 ]; then
+            echo "::error title=Weather cache not restored::could not fetch the cache-data branch. Refusing to run on an empty cache: rebuilding it takes about twelve fetch days."
+            exit 1
+          fi
+          CACHE_BASE=$(git rev-parse FETCH_HEAD)
+          echo "CACHE_BASE=$CACHE_BASE" >> "$GITHUB_ENV"
+          git cat-file blob "$CACHE_BASE:weather_cache.csv.gz" > blast_outputs/weather_cache.csv.gz
+          git cat-file blob "$CACHE_BASE:cache_version.txt" > blast_outputs/cache_version.txt
+          echo "Restored $(git log -1 --format='%h %s' "$CACHE_BASE"): $(stat -c %s blast_outputs/weather_cache.csv.gz) bytes, schema $(cat blast_outputs/cache_version.txt)"
 
       - name: Install extra R packages
         run: |
@@ -143,33 +142,74 @@ jobs:
             echo "::warning::test_offline.R not found; skipping offline tests"
           fi
 
+      # ASK THE ARCHIVE WHAT IT HAS. The last day fetched used to be pure
+      # arithmetic, "UTC date minus 6", and when that day was not published yet
+      # every cell west of 120 E landed a day short. probe_archive_edge.R requests
+      # one western point, waits for the daily update if it has not landed, and
+      # prints the newest day that is really there; both R scripts then use it.
+      # If the probe cannot answer, they fall back to the arithmetic.
+      - name: Resolve archive edge
+        run: |
+          DE=$(Rscript probe_archive_edge.R | sed -n 's/^EDGE=//p' | tail -n 1)
+          case "$DE" in
+            20[0-9][0-9]-[01][0-9]-[0-3][0-9])
+              echo "BLAST_DATA_END=$DE" >> "$GITHUB_ENV"
+              echo "Archive edge pinned: $DE" ;;
+            *)
+              echo "::warning title=Archive edge not probed::probe returned '$DE'; the scripts fall back to the arithmetic edge" ;;
+          esac
+
       - name: Continental heatmaps
         run: Rscript run_blast_grid.R
+
+      # Saved straight after the fetch, before the town table, so a failure further
+      # down no longer costs the two hours of weather just fetched. One parentless
+      # commit, force-pushed to cache-data and nowhere else.
+      - name: Save weather cache
+        run: |
+          f=blast_outputs/weather_cache.csv.gz; v=blast_outputs/cache_version.txt
+          if [ ! -s "$f" ] || [ ! -s "$v" ]; then
+            echo "::error title=Weather cache not saved::$f or $v is missing or empty"
+            exit 1
+          fi
+          new=$(stat -c %s "$f"); old=$(git cat-file -s "$CACHE_BASE:weather_cache.csv.gz")
+          oldv=$(git cat-file blob "$CACHE_BASE:cache_version.txt" | tr -d '[:space:]'); newv=$(tr -d '[:space:]' < "$v")
+          # On the same schema, a cache under half the size of the one restored is
+          # far more likely a bug than progress. A schema bump legitimately starts
+          # again from nothing, so it is exempt.
+          if [ "$oldv" = "$newv" ] && [ "$new" -lt $((old / 2)) ]; then
+            echo "::error title=Weather cache not saved::new cache is $new bytes against $old restored, same schema $newv. Refusing to replace it."
+            exit 1
+          fi
+          blob=$(git hash-object -w "$f"); vblob=$(git hash-object -w "$v")
+          tree=$(printf '100644 blob %s\tcache_version.txt\n100644 blob %s\tweather_cache.csv.gz\n' "$vblob" "$blob" | git mktree)
+          commit=$(git -c user.name=github-actions -c user.email=github-actions@github.com commit-tree "$tree" -m "Weather cache ${BLAST_RUN_DATE} (${new} bytes, schema ${newv})")
+          for i in 1 2 3; do git push --force origin "$commit:refs/heads/cache-data" && break || sleep $((i*10)); done
+          if ! git ls-remote origin refs/heads/cache-data | grep -q "$commit"; then
+            echo "::error title=Weather cache not saved::the push to cache-data did not land"
+            exit 1
+          fi
+          echo "Saved cache as $commit ($new bytes)"
 
       - name: Site table and summary
         run: Rscript run_blast.R
 
-      # Commit the cache FIRST, and never let a missing optional file abort the
-      # step. `run:` uses bash -e, so a `git add` on a path that does not exist
-      # used to abort before `git push`, losing the cache as well as the trends.
-      - name: Commit cache and trends
+      # Never let a missing optional file abort the step. `run:` uses bash -e, so
+      # a `git add` on a path that does not exist used to abort before `git push`.
+      # The weather cache is NOT in this list: see "Save weather cache".
+      - name: Commit trends and run state
         run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config --local user.email "github-actions@github.com"
           git config --local user.name "github-actions"
-          for f in weather_cache.csv.gz weather_cache.csv fetch_failures.csv \
-                   cache_version.txt weighted_spend.csv; do
-            [ -f "blast_outputs/$f" ] && git add -f "blast_outputs/$f" || true
-          done
-          for f in town_trends.csv blastam_trends.csv run_log.csv map_stats.txt \
-                   midweek_status.txt run_date.txt run_status.txt; do
+          for f in fetch_failures.csv weighted_spend.csv town_trends.csv blastam_trends.csv \
+                   run_log.csv map_stats.txt midweek_status.txt run_date.txt run_status.txt; do
             [ -f "blast_outputs/$f" ] && git add -f "blast_outputs/$f" || true
           done
           git add -u blast_outputs/ 2>/dev/null || true
           if git diff --staged --quiet; then
             echo "Nothing to commit."
           else
-            git commit -m "Weekly run (cache + trends) ${BLAST_RUN_DATE}"
+            git commit -m "Weekly run (trends + run state) ${BLAST_RUN_DATE}"
             git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
             for i in 1 2 3; do git push && break || sleep $((i*10)); done
           fi
