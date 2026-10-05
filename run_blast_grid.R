@@ -29,8 +29,9 @@
 #   * Overlay line parts are split at long jumps. australia_roads.geojson holds a
 #     feature with a 3.25 deg step from Victoria to Tasmania, which drew as a line
 #     across Bass Strait on every map.
-#   * Town labels are placed by a declutter pass and pushed inward near the east
-#     coast, so "Gympie" is no longer clipped to "Gym".
+#   * Town labels are placed by place_labels() (map_labels.R), which tests what
+#     the text covers, and the frame carries a strip of sea on the east, so
+#     "Gympie" is not clipped to "Gym" and "Humpty Doo" does not run into Jabiru.
 #   * Optional COAST_MASK_KM blanks the partly marine coastal fringe, which was
 #     carrying most of the BLASTAM signal in country where rice is not grown.
 #   * The target lattice extent is rounded out to a whole number of cells, so the
@@ -75,6 +76,7 @@ source(file.path(SCRIPT_DIR, "blastam_model.R"))
 source(file.path(SCRIPT_DIR, "openmeteo_wth.R"))
 source(file.path(SCRIPT_DIR, "openmeteo_batch.R"))
 source(file.path(SCRIPT_DIR, "grid_window.R"))
+source(file.path(SCRIPT_DIR, "map_labels.R"))
 
 suppressPackageStartupMessages({library(data.table); library(terra)})
 
@@ -782,20 +784,8 @@ load_bundled <- function(fname) {
 rivers <- if (isTRUE(SHOW_RIVERS)) load_bundled("australia_rivers.geojson") else NULL
 roads  <- if (isTRUE(SHOW_ROADS))  load_bundled("australia_roads.geojson") else NULL
 
-# Greedy label declutter, south to north so the order is deterministic. Labels
-# that would sit within LABEL_MIN_SEP_DEG of one already placed are dropped, and
-# labels near the eastern edge are placed to the left so they are not clipped.
-declutter_labels <- function(lon, lat, minsep) {
-  keep <- logical(length(lon))
-  px <- numeric(0); py <- numeric(0)
-  for (i in order(lat)) {
-    if (length(px) == 0L ||
-        all(sqrt((lon[i] - px)^2 + (lat[i] - py)^2) >= minsep)) {
-      keep[i] <- TRUE; px <- c(px, lon[i]); py <- c(py, lat[i])
-    }
-  }
-  keep
-}
+# Town labels are placed by place_labels() in map_labels.R: twelve candidate
+# positions per marker, tested against what the text actually covers.
 
 # Apply the colour stretch. The ANCHOR IS UNCHANGED: hmax is still the deepest
 # colour every week. Only the spacing changes, and the legend is labelled with
@@ -887,8 +877,15 @@ render_map <- function(pts, valcol, title, colours, hmax, stretch, legend, base,
   png(png_file, width = 1000, height = 900, res = 120)
   op <- par(mar = c(4.4, 4, 3, 5))
   ramp <- grDevices::colorRampPalette(colours)(200)
+  # The frame is drawn a little wider than the data on the east, so that labels
+  # for the coastal towns can sit over the sea. Without it Warwick, hemmed in by
+  # Dalby, Goondiwindi and Lismore, had no position left at all: its eastward
+  # label ended 0.45 degrees outside the plot.
+  east_pad <- if (exists("MAP_EAST_PAD_DEG")) MAP_EAST_PAD_DEG else 0
+  frame <- terra::ext(ext[1], ext[2] + east_pad, ext[3], ext[4])
   plotted <- tryCatch({
     terra::plot(rs, col = ramp, range = c(0, rmax), xlab = "Longitude", ylab = "Latitude",
+                ext = frame,
                 main = sprintf("%s  weather to %s", title, format(model_end)),
                 plg = list(title = legend, at = tk$at, labels = tk$labels))
     TRUE
@@ -916,7 +913,9 @@ render_map <- function(pts, valcol, title, colours, hmax, stretch, legend, base,
     foot <- paste0(foot, " | observed max ", sprintf(obs_fmt, obs_max))
   if (!is.null(sm))
     foot <- paste0(foot, sprintf(" | %d cells grey: not refreshed", nrow(stale_pts)))
-  mtext(foot, side = 1, line = 3.2, cex = 0.62, col = NSW_GREY_04)
+  # The footer is drawn at the very end, once it is known whether every town
+  # label found a place. That note used to be a second footer line, which the
+  # bottom edge of the image cut off, so it was never legible.
 
   if (isTRUE(SHOW_RIVERS) && !is.null(rivers)) try(terra::lines(rivers, col = COL_RIVER, lwd = 0.6), silent = TRUE)
   if (isTRUE(SHOW_ROADS)  && !is.null(roads))  try(terra::lines(roads,  col = COL_ROAD,  lwd = 0.5), silent = TRUE)
@@ -928,18 +927,41 @@ render_map <- function(pts, valcol, title, colours, hmax, stretch, legend, base,
   if (isTRUE(SHOW_TOWNS) && exists("MONITOR_TOWNS") && nrow(MONITOR_TOWNS) > 0) {
     tw <- as.data.frame(MONITOR_TOWNS)
     points(tw$lon, tw$lat, pch = 21, bg = "white", col = COL_TOWN, cex = 1.0, lwd = 1.3)
-    minsep <- if (exists("LABEL_MIN_SEP_DEG")) LABEL_MIN_SEP_DEG else 0.9
-    keep <- declutter_labels(tw$lon, tw$lat, minsep)
-    lab <- tw[keep, , drop = FALSE]
-    # Push labels left near the eastern edge so they are not clipped.
-    pos <- ifelse(lab$lon > (ext[2] - 6), 2, 4)
-    text(lab$lon, lab$lat, lab$name, pos = pos, offset = 0.35,
-         cex = if (exists("LABEL_CEX")) LABEL_CEX else 0.5, col = COL_TOWN)
-    if (sum(!keep) > 0)
-      mtext(sprintf("%d town label(s) suppressed to avoid overprinting; all %d towns are plotted.",
-                    sum(!keep), nrow(tw)),
-            side = 1, line = 3.9, cex = 0.55, col = NSW_GREY_04)
+    # Each label takes the first of twelve positions around its marker that stays
+    # on the plot, touches no other label and covers no town marker. The sizes are
+    # measured on the device, so the test is on what the text really covers: the
+    # old fixed-side labels put "Humpty Doo" through Jabiru and "Kununurra"
+    # through Timber Creek, 1.6 and 1.7 degrees away on the same latitude.
+    cexl <- if (exists("LABEL_CEX")) LABEL_CEX else 0.5
+    usr  <- par("usr")
+    lw   <- strwidth(tw$name, cex = cexl)
+    lh   <- 1.25 * strheight("M", cex = cexl)          # with room for descenders
+    mr   <- 0.055                                      # marker radius, inches
+    pl <- place_labels(tw$lon, tw$lat, lw, lh,
+                       offx = xinch(mr + 0.04), offy = yinch(mr + 0.03),
+                       xlim = usr[1:2], ylim = usr[3:4], mrx = xinch(mr), mry = yinch(mr))
+    shown <- which(!is.na(pl$where))
+    # A label moved off its neighbour often lands on the coast, a road or a river
+    # instead. A thin white halo keeps it readable there: the name is drawn eight
+    # times a pixel off centre in white, then once in place.
+    halo <- if (exists("LABEL_HALO_IN")) LABEL_HALO_IN else 0
+    ring <- if (halo > 0) seq(0, 2 * pi, length.out = 9L)[-9L] else numeric(0)
+    for (i in shown) {
+      for (a in ring)
+        text(pl$tx[i] + xinch(halo) * cos(a), pl$ty[i] + yinch(halo) * sin(a), tw$name[i],
+             adj = c(pl$adjx[i], pl$adjy[i]), cex = cexl, col = "white")
+      text(pl$tx[i], pl$ty[i], tw$name[i], adj = c(pl$adjx[i], pl$adjy[i]),
+           cex = cexl, col = COL_TOWN)
+    }
+    n_unplaced <- nrow(tw) - length(shown)
+    cat(sprintf("Town labels (%s): %d of %d placed%s.\n", base, length(shown), nrow(tw),
+                if (n_unplaced > 0L)
+                  paste0("; not placed: ", paste(tw$name[-shown], collapse = ", ")) else ""))
+    if (n_unplaced > 0L)
+      foot <- paste0(foot, sprintf(" | %d town label%s not placed (marker shown)",
+                                   n_unplaced, if (n_unplaced == 1L) "" else "s"))
   }
+  mtext(foot, side = 1, line = 3.2, cex = 0.62, col = NSW_GREY_04)
   par(op); dev.off()
   file.copy(png_file, file.path(OUT, sprintf("%s_latest.png", base)), overwrite = TRUE)
   cat("Heatmap:", png_file, "\n")

@@ -327,7 +327,7 @@ ok("the old seq() would have dropped it",
    max(seq(GRID_EXTENT[3], GRID_EXTENT[4], by = fin)) < GRID_EXTENT[4] ||
    isTRUE(all.equal((GRID_EXTENT[4] - GRID_EXTENT[3]) %% fin, 0)))
 
-cat("\n15. Overlay artefacts and label declutter (terra)\n")
+cat("\n15. Overlay artefacts (terra)\n")
 if (!requireNamespace("terra", quietly = TRUE)) {
   cat("  SKIP  terra not installed\n")
 } else {
@@ -353,21 +353,6 @@ if (!requireNamespace("terra", quietly = TRUE)) {
     ok("australia_roads.geojson present", FALSE)
   }
 
-  declutter_labels <- function(lon, lat, minsep) {
-    keep <- logical(length(lon)); px <- numeric(0); py <- numeric(0)
-    for (i in order(lat)) {
-      if (length(px) == 0L || all(sqrt((lon[i] - px)^2 + (lat[i] - py)^2) >= minsep)) {
-        keep[i] <- TRUE; px <- c(px, lon[i]); py <- c(py, lat[i])
-      }
-    }
-    keep
-  }
-  tw <- as.data.frame(MONITOR_TOWNS)
-  kp <- declutter_labels(tw$lon, tw$lat, LABEL_MIN_SEP_DEG)
-  ok("declutter drops overprinting town labels", sum(!kp) > 0 && sum(kp) > 20,
-     sprintf("(kept %d of %d)", sum(kp), nrow(tw)))
-  ok("declutter is deterministic",
-     identical(kp, declutter_labels(tw$lon, tw$lat, LABEL_MIN_SEP_DEG)))
 }
 
 cat("\n16. The data window follows the UTC date, not only the Sydney date\n")
@@ -939,6 +924,104 @@ cat("\n26. The run asks the archive what it has, rather than assuming\n")
   ok("and the weekly job's timeout allows for that wait",
      as.integer(sub(".*timeout-minutes: ([0-9]+).*", "\\1", wk)) >=
        ARCHIVE_EDGE_WAIT_MAX_MIN + GRID_MAX_MINUTES + GRID_RESERVE_MINUTES + TOWN_QUOTA_WAIT_MAX_MIN)
+}
+
+cat("\n27. Town labels do not overprint each other or another town's marker\n")
+# Regression: every label sat on one fixed side of its marker, and the only
+# collision test was marker to marker distance (drop a label within 0.9 degrees of
+# another). On the delivered maps "Humpty Doo" ran through Jabiru's marker and
+# name, "Kununurra" through Timber Creek and "Goondiwindi" through Warwick, while
+# five towns with room on another side had no label at all, and the footnote
+# saying so was cut off by the bottom edge of the image.
+source("map_labels.R")
+{
+  tw <- as.data.frame(MONITOR_TOWNS)
+  # Sizes as measured on the delivered 1000 x 900 map at LABEL_CEX 0.5: about 0.24
+  # degrees of longitude per character and 0.42 of latitude per line.
+  lw <- nchar(tw$name) * 0.24; lh <- 0.42
+  offx <- 0.60; offy <- 0.48; mrx <- 0.35; mry <- 0.31
+  xl <- c(GRID_EXTENT[1], GRID_EXTENT[2] + MAP_EAST_PAD_DEG); yl <- GRID_EXTENT[3:4]
+  pl <- place_labels(tw$lon, tw$lat, lw, lh, offx, offy, xl, yl, mrx, mry)
+  bx <- function(p, w) cbind(p$tx - p$adjx * w, p$tx + (1 - p$adjx) * w,
+                             p$ty - p$adjy * lh, p$ty + (1 - p$adjy) * lh)
+  hits <- function(a, b) a[1] < b[2] && b[1] < a[2] && a[3] < b[4] && b[3] < a[4]
+  overprints <- function(p, w, x, y) {
+    b <- bx(p, w); on <- which(!is.na(p$where)); n_lab <- 0L; n_mark <- 0L
+    for (i in on) {
+      for (j in on[on > i]) if (hits(b[i, ], b[j, ])) n_lab <- n_lab + 1L
+      for (j in setdiff(seq_along(x), i))
+        if (hits(b[i, ], c(x[j] - mrx, x[j] + mrx, y[j] - mry, y[j] + mry))) n_mark <- n_mark + 1L
+    }
+    c(labels = n_lab, markers = n_mark)
+  }
+  ov <- overprints(pl, lw, tw$lon, tw$lat)
+  ok("every town gets a label", !anyNA(pl$where),
+     sprintf("(not placed: %s)", paste(tw$name[is.na(pl$where)], collapse = ", ")))
+  ok("no label touches another label", ov[["labels"]] == 0L, sprintf("(%d collisions)", ov[["labels"]]))
+  ok("no label covers another town's marker", ov[["markers"]] == 0L, sprintf("(%d)", ov[["markers"]]))
+  ok("no label leaves the plot", {
+    b <- bx(pl, lw); all(b[, 1] >= xl[1] & b[, 2] <= xl[2] & b[, 3] >= yl[1] & b[, 4] <= yl[2]) })
+  # The bug itself: a label fixed to the right of Humpty Doo covers Jabiru's marker.
+  hd <- which(tw$name == "Humpty Doo"); jb <- which(tw$name == "Jabiru")
+  ok("a label fixed to the right of Humpty Doo does cover Jabiru (the old behaviour)",
+     hits(c(tw$lon[hd] + offx, tw$lon[hd] + offx + lw[hd], tw$lat[hd] - lh / 2, tw$lat[hd] + lh / 2),
+          c(tw$lon[jb] - mrx, tw$lon[jb] + mrx, tw$lat[jb] - mry, tw$lat[jb] + mry)))
+  ok("Humpty Doo and Jabiru, Kununurra and Timber Creek are all labelled",
+     !anyNA(pl$where[tw$name %in% c("Humpty Doo", "Jabiru", "Kununurra", "Timber Creek")]))
+  # The answer must not depend on the order the towns are listed in.
+  set.seed(7); sh <- sample(nrow(tw))
+  pl2 <- place_labels(tw$lon[sh], tw$lat[sh], lw[sh], lh, offx, offy, xl, yl, mrx, mry)
+  ok("the placement does not depend on the order of the towns",
+     identical(pl$where[sh], pl2$where) && isTRUE(all.equal(pl$tx[sh], pl2$tx)))
+  # Robust to the font. Warwick is 0.59 degrees of latitude from Lismore, almost
+  # exactly a label's half height plus a marker's radius: with only the eight
+  # compass positions it was labelled on one of two maps drawn in the same run and
+  # not on the other, and the Linux runner's fonts are not the ones measured here.
+  # The markers are a fixed size in inches; it is the text that varies.
+  for (sc in c(0.85, 1.15)) {
+    lh0 <- lh; lh <- lh0 * sc                       # bx() and overprints() read lh
+    ps <- place_labels(tw$lon, tw$lat, lw * sc, lh, offx, offy, xl, yl, mrx, mry)
+    os <- overprints(ps, lw * sc, tw$lon, tw$lat); lh <- lh0
+    ok(sprintf("at %d%% of the measured text size every town is still labelled, nothing overprinted",
+               as.integer(round(100 * sc))),
+       !anyNA(ps$where) && all(os == 0L),
+       sprintf("(not placed: %s; %d collisions)", paste(tw$name[is.na(ps$where)], collapse = ", "), sum(os)))
+  }
+  # With genuinely no room it must leave a label out, never overprint: three
+  # towns almost on top of each other with long names in a frame one line high.
+  cx <- c(0, 0.3, 0.6); cy <- c(0, 0.05, 0)
+  pc <- place_labels(cx, cy, w = 6, h = 1, offx = 0.5, offy = 0.5, xlim = c(-7, 7.6), ylim = c(-0.6, 0.65),
+                     mrx = 0.3, mry = 0.3)
+  bc <- cbind(pc$tx - pc$adjx * 6, pc$tx + (1 - pc$adjx) * 6, pc$ty - pc$adjy, pc$ty + (1 - pc$adjy))
+  onc <- which(!is.na(pc$where))
+  clash <- 0L; for (i in onc) for (j in onc[onc > i]) if (hits(bc[i, ], bc[j, ])) clash <- clash + 1L
+  ok("with genuinely no room it leaves a label out rather than overprinting",
+     anyNA(pc$where) && clash == 0L, sprintf("(%d placed, %d collisions)", length(onc), clash))
+  ok("the frame carries a strip of sea on the east for the coastal labels", MAP_EAST_PAD_DEG >= 1)
+  ok("the renderer uses it, and the old drop-by-distance pass is gone",
+     grepl("place_labels(", gsrc, fixed = TRUE) && grepl("MAP_EAST_PAD_DEG", gsrc, fixed = TRUE) &&
+     !grepl("declutter_labels", gsrc, fixed = TRUE))
+  ok("names carry a thin halo, so one moved onto the coast or a road stays readable",
+     LABEL_HALO_IN > 0 && LABEL_HALO_IN <= 0.02 && grepl("LABEL_HALO_IN", gsrc, fixed = TRUE))
+  ok("the label note is part of the one footer line, not a second line off the image",
+     lengths(regmatches(gsrc, gregexpr("mtext(", gsrc, fixed = TRUE))) == 1L)
+}
+
+cat("\n28. The colour scale does not start by getting cooler\n")
+# The ramp ran pale grey, light blue, yellow, orange, red: the first step up from
+# "nothing" was a cooler colour, so a patch of low risk read as LESS than the grey
+# around it. It now runs near white, pale green, then the same yellow, orange, red.
+{
+  rgbm <- grDevices::col2rgb(HEAT_COLOURS)
+  ok("nothing is drawn as a light neutral, not a colour",
+     diff(range(rgbm[, 1])) <= 12 && min(rgbm[, 1]) >= 235, sprintf("(%s)", HEAT_COLOURS[1]))
+  ok("the first step up is green, not blue",
+     rgbm["green", 2] > rgbm["red", 2] && rgbm["green", 2] - rgbm["blue", 2] >= 15,
+     sprintf("(%s)", HEAT_COLOURS[2]))
+  ok("no stop on the ramp is blue", all(rgbm["blue", ] <= pmax(rgbm["red", ], rgbm["green", ])))
+  ok("yellow, orange and red are where they were",
+     identical(toupper(HEAT_COLOURS[3:5]), toupper(c("#FFF6B0", COL_MODERATE, COL_HIGH))))
+  ok("both maps use the same ramp", identical(BLASTAM_HEAT_COLOURS, HEAT_COLOURS))
 }
 
 cat(sprintf("\n%d tests, %d failures\n", n, fails))
