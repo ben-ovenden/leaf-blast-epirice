@@ -74,9 +74,10 @@ requires in canopy loggers deployed alongside ERA5 driven model runs.
 | `run_blast_grid.R` | Continental heatmap runner: fill the cache, model, render maps |
 | `probe_archive_edge.R` | Asks the archive which day it can actually serve, waiting for the daily update if told to; the workflows pin its answer as `BLAST_DATA_END` |
 | `grid_window.R` | Window policy: which date the map is drawn at, which cells are drawn grey for not reaching it, and the fetch's own account of why |
+| `map_labels.R` | Where each town label goes: twelve candidate positions per marker, none allowed to touch another label or cover another town's marker |
 | `run_health.R` | The run's verdict: is this run degraded, and why. Written to `run_status.txt` for the subject line and the workflow's final step |
 | `send_email.py` | Python stdlib email sender; the subject carries the town window and a `[DEGRADED]` prefix when `run_status.txt` says so |
-| `test_offline.R` | Offline regression tests: 195 tests, no network, runs in seconds, in CI |
+| `test_offline.R` | Offline regression tests: 212 tests, no network, runs in seconds, in CI |
 | `australia_land.geojson` | Land polygon for masking ocean and clipping the map |
 | `australia_rivers.geojson` | River overlay |
 | `australia_roads.geojson` | Road overlay |
@@ -143,7 +144,7 @@ git cat-file blob FETCH_HEAD:weather_cache.csv.gz > blast_outputs/weather_cache.
 git cat-file blob FETCH_HEAD:cache_version.txt   > blast_outputs/cache_version.txt
 ```
 
-All 195 offline tests must pass before a run is meaningful. Each test guards a
+All 212 offline tests must pass before a run is meaningful. Each test guards a
 bug that was actually shipped.
 
 ---
@@ -290,6 +291,30 @@ fetched, cached and written to the GeoTIFF. Off by default.
 jumps 3.25 degrees from Victoria to Tasmania, which drew as a line across Bass
 Strait on every map. Line parts are split at jumps longer than
 `OVERLAY_MAX_SEGMENT_DEG` rather than editing the bundled data.
+
+**Colours.** The ramp runs near white (nothing), pale green (a little), then
+yellow, NSW warning orange and NSW error red; green is what the email's risk
+table already uses for "low". The bottom of the ramp used to be pale grey running
+into light blue, so the first step up from "nothing" was a *cooler* colour and a
+patch of low risk read as less than the grey around it. Cells that were not
+refreshed are a mid grey, clearly darker than zero.
+
+**Town labels.** Each label tries twelve positions around its marker (right, left,
+each of those nudged half a line up or down, the four diagonals, above, below)
+and takes the first that stays on the plot, touches no other label and covers no
+town marker; the label with the fewest
+positions left goes first, and one already placed may step aside for one that has
+nowhere to go (`map_labels.R`). Sizes are measured on the device, so the test is
+on what the text actually covers. Each name has a one pixel white halo
+(`LABEL_HALO_IN`) so it stays readable where it crosses the coast, a road or a
+river. The frame is drawn `MAP_EAST_PAD_DEG` (2)
+wider than the data on the east, all of it sea, so the coastal towns have room.
+All 31 towns are labelled. A label that could not be placed would be left out,
+with its marker still drawn and a note in the footer, never overprinted. The
+previous scheme fixed each label to one side and dropped any whose *marker* was
+within 0.9 degrees of another: "Humpty Doo" still ran through Jabiru and
+"Kununurra" through Timber Creek, five towns that had room elsewhere went
+unlabelled, and the footnote saying so was cut off by the edge of the image.
 
 ---
 
@@ -796,7 +821,7 @@ The Monday workflow runs:
 1. **Resolve run date and UTC date**, pinned once and exported as
    `BLAST_RUN_DATE` and `BLAST_UTC_DATE`, then **restore the weather cache** from
    the `cache-data` branch, failing the run if it cannot.
-2. **Offline tests**, `Rscript test_offline.R`. 195 tests, no network, preceded
+2. **Offline tests**, `Rscript test_offline.R`. 212 tests, no network, preceded
    by a step that makes sure `python3` exists, because the suite executes
    `send_email.py` in dry-run mode: the 2026-09-28 email was sent and the step
    then failed on a `NameError` in the line after the send, and nothing had ever

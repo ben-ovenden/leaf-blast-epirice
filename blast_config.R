@@ -485,11 +485,20 @@ SHOW_COAST  <- TRUE
 SHOW_TOWNS  <- TRUE
 SHOW_ROADS  <- TRUE
 SHOW_RIVERS <- TRUE
-# Town labels collided badly on the east coast (Gympie clipped to "Gym";
-# Warwick, Goondiwindi and Lismore overprinted). Labels are now placed by a
-# greedy declutter pass and any that still collide are dropped.
+# Town labels. Each one tries twelve positions around its marker and takes the
+# first that stays on the plot, touches no other label and covers no town marker
+# (map_labels.R). The earlier scheme fixed every label to one side and dropped any
+# whose MARKER was within 0.9 degrees of another: "Humpty Doo" still ran through
+# Jabiru and "Kununurra" through Timber Creek, 1.6 and 1.7 degrees away on the
+# same latitude, while five towns that had room on another side went unlabelled.
 LABEL_CEX          <- 0.5
-LABEL_MIN_SEP_DEG  <- 0.9
+# White halo behind each name, in inches (about one pixel at 120 dpi), so a label
+# stays readable where it crosses the coast, a road or a river. 0 turns it off.
+LABEL_HALO_IN      <- 0.010
+# Extra longitude drawn east of GRID_EXTENT, all of it sea, so that labels for
+# the east coast towns have somewhere to go. Display only: nothing is fetched or
+# modelled there.
+MAP_EAST_PAD_DEG   <- 2
 
 COL_COAST <- NSW_BRAND_DARK
 COL_ROAD  <- "#8A6D3B"
@@ -536,9 +545,17 @@ FAIL_LEDGER_MAX_STRIKES <- 4L
 LAND_ONLY <- TRUE
 WRITE_GEOTIFF <- TRUE
 
-# Heatmap colour ramps, low -> high. NSW light blues at the bottom, NSW warning
-# orange and error red at the top.
-HEAT_COLOURS         <- c("#EBF1F8", "#BFE0F5", "#FFF6B0", COL_MODERATE, COL_HIGH)
+# Heatmap colour ramps, low -> high: near white for nothing, pale green for a
+# little, then yellow, NSW warning orange and NSW error red. Green is what the
+# email's risk table already uses for "low".
+#
+# The bottom of the ramp used to be a pale grey running into light blue, so the
+# first step up from "nothing" was a COOLER colour, and a patch of low risk read
+# as less than the grey around it. The yellow, orange and red are unchanged. Two
+# alternatives were rendered on the 2026-09-28 data and rejected: white straight
+# to yellow (low values all but vanish) and blue as the zero colour (low values
+# become pale holes in a blue continent).
+HEAT_COLOURS         <- c("#F6F6F4", "#CFE8C8", "#FFF6B0", COL_MODERATE, COL_HIGH)
 BLASTAM_HEAT_COLOURS <- HEAT_COLOURS
 
 # Heatmap colour scale maxima. FIXED numbers make every week's colours directly
