@@ -77,7 +77,7 @@ requires in canopy loggers deployed alongside ERA5 driven model runs.
 | `map_labels.R` | Where each town label goes: twelve candidate positions per marker, none allowed to touch another label or cover another town's marker |
 | `run_health.R` | The run's verdict: is this run degraded, and why. Written to `run_status.txt` for the subject line and the workflow's final step |
 | `send_email.py` | Python stdlib email sender; the subject carries the town window and a `[DEGRADED]` prefix when `run_status.txt` says so |
-| `test_offline.R` | Offline regression tests: 212 tests, no network, runs in seconds, in CI |
+| `test_offline.R` | Offline regression tests: 218 tests, no network, runs in seconds, in CI |
 | `australia_land.geojson` | Land polygon for masking ocean and clipping the map |
 | `australia_rivers.geojson` | River overlay |
 | `australia_roads.geojson` | Road overlay |
@@ -144,7 +144,7 @@ git cat-file blob FETCH_HEAD:weather_cache.csv.gz > blast_outputs/weather_cache.
 git cat-file blob FETCH_HEAD:cache_version.txt   > blast_outputs/cache_version.txt
 ```
 
-All 212 offline tests must pass before a run is meaningful. Each test guards a
+All 218 offline tests must pass before a run is meaningful. Each test guards a
 bug that was actually shipped.
 
 ---
@@ -775,6 +775,15 @@ and in parentheses the count over the last 7. Semi favourable nights and unjudge
 nights are in `blast_results_latest.csv`, and unjudged nights are flagged in the
 email with an asterisk.
 
+Under the table the email says how to read the two numbers, then for each model
+what it measures and the thresholds it ran with, then the limits and the
+references. The thresholds are filled in from `blast_config.R` and from the
+temperature curve the model used, so they follow a change there; the EPIRICE
+constants that are literals in `predict_leaf_blast()` are checked against the
+model by test 29. The map and top-up lines stay on the email in full: fewer cells,
+an older window or a top-up that fetched little is how a reader sees that the
+weather retrieval is not keeping up.
+
 Both the town table and the map now compute this through `blastam_score()`, whose
 window is bounded at **both** ends. It used to test only `dates > (end_date −
 window)`, so the town table reported a 22 day count and an 8 day "7 day" count
@@ -821,7 +830,7 @@ The Monday workflow runs:
 1. **Resolve run date and UTC date**, pinned once and exported as
    `BLAST_RUN_DATE` and `BLAST_UTC_DATE`, then **restore the weather cache** from
    the `cache-data` branch, failing the run if it cannot.
-2. **Offline tests**, `Rscript test_offline.R`. 212 tests, no network, preceded
+2. **Offline tests**, `Rscript test_offline.R`. 218 tests, no network, preceded
    by a step that makes sure `python3` exists, because the suite executes
    `send_email.py` in dry-run mode: the 2026-09-28 email was sent and the step
    then failed on a `NameError` in the line after the send, and nothing had ever

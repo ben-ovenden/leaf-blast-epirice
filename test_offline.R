@@ -1024,5 +1024,43 @@ cat("\n28. The colour scale does not start by getting cooler\n")
   ok("both maps use the same ramp", identical(BLASTAM_HEAT_COLOURS, HEAT_COLOURS))
 }
 
+cat("\n29. The email says what each number is, with the thresholds the models ran with\n")
+# The opening said "fetched to 29 Sep and modelled to 28 Sep", which is the
+# pipeline talking to itself, and "how much disease the rolling 60 day window has
+# built up", which reads as disease that exists. The small print was one dense
+# paragraph that never said what BLASTAM's number is. Each model's block now opens
+# with what is measured and lists the thresholds, and those must be the values the
+# models ran with, not copies that can drift.
+{
+  raw <- paste(readLines("run_blast.R", warn = FALSE), collapse = "\n")
+  one <- gsub("\"\\s*,\\s*\n\\s*\"", "", raw)      # join the pieces paste0() is given
+  ok("the opening states the assumption, and no longer talks about fetching",
+     grepl("Both assume the host crop and the pathogen are present", one, fixed = TRUE) &&
+     !grepl("fetched to %s and modelled to", one, fixed = TRUE) &&
+     !grepl("has built up", one, fixed = TRUE))
+  ok("each model's block opens with what its number is",
+     grepl("measures potential disease, not observed disease", one, fixed = TRUE) &&
+     grepl("measures infection opportunity, not disease", one, fixed = TRUE))
+  ok("the BLASTAM limits in the email are the settings, not copies of them",
+     grepl("BLASTAM_TWET_MIN, BLASTAM_TWET_MAX, raised(BLASTAM_TWET_MAX)", raw, fixed = TRUE) &&
+     grepl("BLASTAM_PREV5_MIN, BLASTAM_PREV5_MAX, raised(BLASTAM_PREV5_MAX)", raw, fixed = TRUE) &&
+     grepl("BLASTAM_RH_WET, format(BLASTAM_RAIN_WET)", raw, fixed = TRUE) &&
+     grepl("BLASTAM_NIGHT_START, BLASTAM_NIGHT_END", raw, fixed = TRUE))
+  ok("the EPIRICE temperature figures are read off the curve the model ran with",
+     grepl("rct_tab <- epirice_rct()", raw, fixed = TRUE) &&
+     grepl("rct_at(EPIRICE_RCT_PEAK - 5L)", raw, fixed = TRUE))
+  # These six are literals in predict_leaf_blast(), so the email can only quote
+  # them. If the model call changes, this is what says the email is now wrong.
+  ok("the EPIRICE constants the email quotes are the ones the model is called with", {
+    m <- paste(readLines("epirice_model.R", warn = FALSE), collapse = "\n")
+    has <- function(keys, txt) all(vapply(keys, function(k) grepl(k, txt, fixed = TRUE), logical(1)))
+    has(c("onset = 15L", "rhlim = 90L", "rainlim = 5L", "RcOpt = 1.14", "p = 5L", "i = 20L"), m) &&
+      has(c("on day 15", "5 mm or more of rain", "90%% or more", "latent for 5 days",
+            "20 days, then removed", "1.14 new infections"), one) })
+  ok("the map and top-up lines stay on the email in full: they show when retrieval is not keeping up",
+     grepl("<b>Map:</b> %s</p>", raw, fixed = TRUE) && grepl("<b>Top-up:</b> %s</p>", raw, fixed = TRUE) &&
+     grepl("weighted API calls", raw, fixed = TRUE) && !grepl("mg_short", raw, fixed = TRUE))
+}
+
 cat(sprintf("\n%d tests, %d failures\n", n, fails))
 quit(status = if (fails > 0L) 1L else 0L)
