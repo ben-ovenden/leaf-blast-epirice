@@ -331,9 +331,14 @@ stale_days <- REFRESH_MIN_STALE_DAYS
 spend_ledger <- file.path(OUT, SPEND_LEDGER_FILE)
 already <- om_spend_read(spend_ledger)
 wt_cap <- max(0, min(wt_cap, DAILY_WEIGHTED_HARD_CAP - already))
+# The ledger is a REASON only when it actually lowered this run's cap. The archive
+# probe books its own single call before this script starts, and on 2026-10-05 a
+# perfectly healthy run carried the note "an earlier run today had already spent
+# 1 weighted calls, capping this one at 9000", which is the configured cap.
+ledger_binding <- wt_cap < DAILY_WEIGHTED_CAP
 if (already > 0)
-  cat(sprintf("Weighted ledger: %.0f already spent today, so this run is capped at %.0f.\n",
-              already, wt_cap))
+  cat(sprintf("Weighted ledger: %.0f already spent today; this run's cap is %.0f (%s).\n",
+              already, wt_cap, if (ledger_binding) "lowered by the ledger" else "not affected"))
 
 # Hold back a slice of the weighted budget so the retry pass has something to
 # spend. plan_cap is used for planning AND is handed to the fetch, so a charged
@@ -641,7 +646,7 @@ stale_note <- if (held_out > 0L)
 # or an earlier run's spend on the ledger.
 fetch_reason <- grid_fetch_reason(
   stops = phase_stops, n_left = nrow(left), left_cost = sum(left$cost), plan_cap = plan_cap,
-  already = already, wt_cap = wt_cap, spent = spent, waited_s = waited_total,
+  already = if (ledger_binding) already else 0, wt_cap = wt_cap, spent = spent, waited_s = waited_total,
   n_failed = if (nrow(led) > 0L) led[status %in% c("http", "transport", "empty"), .N] else 0L,
   max_minutes = GRID_MAX_MINUTES, held_out = held_out)
 # NOTE the >= . With `>` this yields CROP_AGE_DAYS rows starting one day after

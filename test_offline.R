@@ -572,6 +572,13 @@ cat("\n19. Stale cells are drawn grey, not dropped, and the banner says why\n")
      grepl("did not fit", grid_fetch_reason(n_left = 990, left_cost = 2050, plan_cap = 8550)))
   ok("a ledger cap from an earlier run is named",
      grepl("earlier run today", grid_fetch_reason(already = 8700, wt_cap = 800)))
+  # Regression: the archive probe books one call before the grid script starts, and
+  # the healthy 2026-10-05 run carried "an earlier run today had already spent 1
+  # weighted calls, capping this one at 9000" as a warning. 9000 is the configured
+  # cap: the ledger had constrained nothing.
+  ok("but only when the ledger actually lowered the cap",
+     grepl("ledger_binding <- wt_cap < DAILY_WEIGHTED_CAP", gsrc, fixed = TRUE) &&
+     grepl("already = if (ledger_binding) already else 0", gsrc, fixed = TRUE))
   ok("cells still behind with nothing recorded is said plainly",
      grepl("incomplete or empty", grid_fetch_reason(held_out = 5)))
   ok("nothing to explain gives an empty string", grid_fetch_reason() == "")
