@@ -6,7 +6,7 @@ The 2026-09-07, 09-14 and 09-21 emails all carried the map "weather to
 2026-08-29" (identical maxima, 0.058% and 10 days) beside a town table that was
 current; the 09-07 email had 31 towns of "no data". Diagnosed from
 `map_stats.txt`, `weighted_spend.csv`, `run_log.csv` and the committed cache. The
-offline suite went from 62 tests to 194; all pass.
+offline suite went from 62 tests to 195; all pass.
 
 | # | Item | Fix | Guarded by |
 | --- | --- | --- | --- |
