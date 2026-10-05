@@ -267,6 +267,26 @@ wet_rule <- if (isTRUE(BLASTAM_USE_BJ_THRESHOLD)) {
 } else {
   sprintf("reaches at least %d h (Koshimizu's fixed threshold)", BLASTAM_WET_HOURS_FIXED)
 }
+# The pieces of the email's "How the models work" list. Every number comes from
+# the setting or the curve the models actually ran with, so the email cannot
+# drift from the code. The EPIRICE constants (onset, the wet day gate, the
+# latent and infectious periods, RcOpt) are literals in predict_leaf_blast().
+wet_html <- if (isTRUE(BLASTAM_USE_BJ_THRESHOLD)) {
+  sprintf(paste0("a temperature dependent minimum, about %.0f h at 16&deg;C falling to ",
+                 "about %.0f h at 27&deg;C (Barksdale &amp; Jones 1965; Koshimizu used a ",
+                 "fixed 10 h)"),
+          blastam_bj_min_hours(16), blastam_bj_min_hours(27))
+} else {
+  sprintf("%d h (Koshimizu's fixed threshold)", BLASTAM_WET_HOURS_FIXED)
+}
+raised <- function(v) if (v > 25) " (upper limit raised from Koshimizu's 25&deg;C)" else ""
+heavy_html <- if (is.finite(BLASTAM_RAIN_HEAVY))
+  sprintf("; hours with %s mm or more are left out, as heavy rain washes spores off (Yoshino 1988)",
+          format(BLASTAM_RAIN_HEAVY)) else ""
+rct_tab <- epirice_rct()
+rct_at  <- function(t) 100 * rct_tab[rct_tab[, 1] == t, 2]
+band_lo <- sprintf("%g", INTENSITY_LOW_MAX * 100)
+band_hi <- sprintf("%g", INTENSITY_MODERATE_MAX * 100)
 
 # Read the grid's stats line (written by run_blast_grid.R).
 # Fields: mapped | mean_land_spacing | mapped_last_run | finest | fmt | kb |
@@ -398,8 +418,7 @@ summary_lines <- c(
   strrep("=", 60),
   paste0("Generated:   ", format(RUN_DATE, "%A %d %B %Y")),
   paste0("Models:      EPIRICE (Savary et al. 2012) + BLASTAM (Koshimizu 1988)"),
-  paste0("Weather:     Open-Meteo ERA5 archive, fetched to ", format(data_end, "%Y-%m-%d"),
-         ", modelled to ", format(end_date, "%Y-%m-%d")),
+  paste0("Weather:     Open-Meteo ERA5 archive, to ", format(end_date, "%Y-%m-%d")),
   sprintf("EPIRICE:     %d day window, RcT infection optimum %d C",
           CROP_AGE_DAYS, EPIRICE_RCT_PEAK),
   sprintf("Cache schema: version %d", CACHE_SCHEMA_VERSION),
@@ -562,13 +581,18 @@ html <- paste0(
 sprintf("<div style='font-size:13px;opacity:.9;'>%s</div>", format(RUN_DATE, "%A %d %B %Y")),
 "</div>",
 "<div style='padding:16px 20px;border:1px solid #E0E0E0;border-top:none;border-radius:0 0 6px 6px;'>",
-sprintf(paste0("<p style='margin:0 0 12px;'>Two models for %d monitoring towns, from ",
-        "Open-Meteo ERA5 weather fetched to %s and modelled to <b>%s</b>. ",
-        "<b>EPIRICE intensity</b> is how much disease the rolling %d day window has built up; ",
-        "<b>BLASTAM days</b> is how many of the last %d days favoured a new infection. ",
-        "Both are weather-driven potentials, not field measurements.</p>"),
-        nrow(results), format(data_end, "%d %b %Y"), format(end_date, "%d %b %Y"),
-        CROP_AGE_DAYS, BLASTAM_WINDOW_DAYS),
+# The opening used to say "fetched to 29 Sep and modelled to 28 Sep", which is the
+# pipeline talking to itself, and "how much disease the rolling 60 day window has
+# built up", which reads as disease that exists. It is a simulation on an assumed
+# crop with the pathogen assumed present, and the opening now says so.
+sprintf(paste0("<p style='margin:0 0 12px;'>Weather based leaf blast risk for %d towns, ",
+        "using weather to <b>%s</b>. ",
+        "<b>EPIRICE intensity</b> is the percentage of leaf tissue a simulated epidemic ",
+        "would have diseased by that date, on a susceptible rice crop that emerged %d days ",
+        "earlier. <b>BLASTAM days</b> is the number of nights in the most recent %d ",
+        "modelled that were wet and warm enough for a new infection. ",
+        "Both assume the host crop and the pathogen are present.</p>"),
+        nrow(results), format(end_date, "%d %b %Y"), CROP_AGE_DAYS, BLASTAM_WINDOW_DAYS),
 if (!is.null(mwarn)) sprintf(
   paste0("<p style='margin:0 0 12px;padding:10px 12px;background:#FDEBD9;",
          "border-left:4px solid %s;border-radius:3px;font-size:13px;'>",
@@ -593,29 +617,75 @@ if (n_unjudged > 0) sprintf(
   paste0("<p style='font-size:12px;color:%s;margin:10px 0 0;'>* %d night(s) could not be ",
          "judged this run, from missing hours or insufficient lead-in. These are NOT counted ",
          "as unfavourable.</p>"), COL_MODERATE, n_unjudged) else "",
-sprintf(paste0("<p style='font-size:12px;color:#6b7378;margin:14px 0 0;'><b>EPIRICE</b> ",
-       "mechanistically simulates the epidemic and reports the proportion of leaf tissue ",
-       "diseased. Its wetness gate needs a daily mean RH of 90%% or a daily rain total of ",
-       "5 mm; the humidity branch rarely opens, so in practice the signal is rain driven. ",
-       "<b>BLASTAM</b> counts the nights in the last %d that favoured a NEW infection: leaf ",
-       "wetness %s, mean temperature during wetness %d-%d&deg;C, and the preceding 5 day mean ",
-       "temperature %d-%d&deg;C (upper bounds raised from Japan's 25&deg;C for warm ",
-       "conditions). Wetness is estimated from hourly humidity (&ge;%d%%) and rain, over a ",
-       "model day starting at %02d:00 local solar. Both read low in cool, dry weather. ",
-       "Emergence moves with each run, so the trends CSVs are a rolling window rather than a ",
-       "season total; their columns are keyed on the data end date and run_log.csv records the ",
-       "method behind each one. Values are provisional.</p>"),
-       BLASTAM_WINDOW_DAYS, wet_rule, BLASTAM_TWET_MIN, BLASTAM_TWET_MAX,
-       BLASTAM_PREV5_MIN, BLASTAM_PREV5_MAX, BLASTAM_RH_WET, BLASTAM_DAY_CUT_HOUR),
-sprintf("<p style='font-size:12px;color:#6b7378;margin:10px 0 0;'>%s</p>", CAVEAT_CANOPY),
-paste0("<p style='font-size:11px;color:#9aa0a6;margin:10px 0 0;'>EPIRICE: Savary ",
-       "<em>et al.</em> 2012 (Crop Prot. 34:6-17); epicrop (A.H. Sparks); RcT infection ",
-       sprintf("optimum %d&deg;C. BLASTAM: Koshimizu 1988 (Bull. Tohoku Natl. Agric. Exp. ",
-               EPIRICE_RCT_PEAK),
-       "Stn. 78:67-121); Hayashi &amp; Koshimizu 1988; wetness threshold from Barksdale &amp; ",
-       "Jones 1965. Prior Australian modelling: Lanoiselet <em>et al.</em> 2002 (Australas. ",
-       "Plant Pathol. 31:1-7). Weather: Open-Meteo ERA5 (CC BY 4.0), non-commercial research ",
-       "use.</p>"),
+# The small print, in the order a reader needs it: how to read the two numbers,
+# the thresholds each model uses and where they come from, what the numbers
+# cannot say, the references, then the map and top-up lines. It used to be one
+# dense paragraph that also explained the trends CSV conventions, which are in
+# the plain-text part of the email and the README.
+sprintf(paste0("<p style='font-size:12px;color:#6b7378;margin:14px 0 0;'><b>Reading the ",
+       "table.</b> BLASTAM reacts within days: a rising count means recent nights have ",
+       "suited infection. EPIRICE moves slowly and mostly after rain, so it shows whether ",
+       "favourable weather has persisted. EPIRICE bands: low below %s%%, moderate %s to ",
+       "%s%%, high %s%% and above. Both read low in cool, dry weather.</p>"),
+       band_lo, band_lo, band_hi, band_hi),
+sprintf(paste0("<p style='font-size:12px;color:#6b7378;margin:10px 0 0;'><b>How the models work.</b> ",
+       "<b>EPIRICE</b> (Savary <em>et al.</em> 2012, run with code from the epicrop R ",
+       "package) measures potential disease, not observed disease: the percentage of leaf ",
+       "tissue that a blast epidemic would have diseased by the last modelled day, on a ",
+       "susceptible crop that emerged %d days earlier. The table shows that percentage, ",
+       "simulated day by day under these rules:</p>",
+       "<ul style='font-size:12px;color:#6b7378;margin:4px 0 0 18px;padding:0;'>",
+       "<li style='margin:0 0 2px;'>Inoculum: the pathogen is introduced on day 15 after emergence.</li>",
+       "<li style='margin:0 0 2px;'>Wet days: infection advances only on days with 5 mm or more of rain, ",
+       "or a mean relative humidity of 90%% or more. The humidity gate rarely opens, so in ",
+       "practice the signal is rain driven.</li>",
+       "<li style='margin:0 0 2px;'>Temperature: the infection rate peaks at a daily mean of %d&deg;C, ",
+       "falls to %.0f%% of that at %d&deg;C and %.0f%% at %d&deg;C, and is zero at ",
+       "10&deg;C and 45&deg;C (Savary <em>et al.</em> 2012, Table 2).</li>",
+       "<li style='margin:0 0 2px;'>Disease cycle: an infection is latent for 5 days, then infectious for ",
+       "20 days, then removed. Each infectious site causes at most 1.14 new infections a ",
+       "day, fewer as the crop ages.</li>",
+       "</ul>",
+       "<p style='font-size:12px;color:#6b7378;margin:4px 0 0;'>Rain, humidity and temperature are daily values over a day ",
+       "starting at %02d:00 local solar time, so a night's rain is counted in one ",
+       "day.</p>"),
+       CROP_AGE_DAYS, EPIRICE_RCT_PEAK, rct_at(EPIRICE_RCT_PEAK - 5L), EPIRICE_RCT_PEAK - 5L,
+       rct_at(EPIRICE_RCT_PEAK + 5L), EPIRICE_RCT_PEAK + 5L, BLASTAM_DAY_CUT_HOUR),
+sprintf(paste0("<p style='font-size:12px;color:#6b7378;margin:10px 0 0;'><b>BLASTAM</b> (Koshimizu 1988; Hayashi &amp; Koshimizu ",
+       "1988) measures infection opportunity, not disease: the number of nights, out of ",
+       "the most recent %d modelled, on which leaves stayed wet long enough at a suitable ",
+       "temperature for blast spores to infect. The table shows the count when all three ",
+       "criteria are met:</p>",
+       "<ul style='font-size:12px;color:#6b7378;margin:4px 0 0 18px;padding:0;'>",
+       "<li style='margin:0 0 2px;'>Leaf wetness lasts at least %s.</li>",
+       "<li style='margin:0 0 2px;'>Mean temperature during the wet period is %d to %d&deg;C%s.</li>",
+       "<li style='margin:0 0 2px;'>Mean temperature of the preceding 5 days is %d to %d&deg;C%s.</li>",
+       "</ul>",
+       "<p style='font-size:12px;color:#6b7378;margin:4px 0 0;'>Leaf wetness is not measured; it is ",
+       "estimated hour by hour over each night, %02d:00 to %02d:00 local solar time. An ",
+       "hour counts as wet when relative humidity is %d%% or more, or rain is %s mm or ",
+       "more%s.</p>"),
+       BLASTAM_WINDOW_DAYS, wet_html,
+       BLASTAM_TWET_MIN, BLASTAM_TWET_MAX, raised(BLASTAM_TWET_MAX),
+       BLASTAM_PREV5_MIN, BLASTAM_PREV5_MAX, raised(BLASTAM_PREV5_MAX),
+       BLASTAM_NIGHT_START, BLASTAM_NIGHT_END,
+       BLASTAM_RH_WET, format(BLASTAM_RAIN_WET), heavy_html),
+paste0("<p style='font-size:12px;color:#6b7378;margin:10px 0 0;'><b>Limits.</b> These are ",
+       "modelled values from gridded ERA5 weather (about 25 km), not paddock observations. ",
+       "Humidity inside an irrigated rice canopy runs well above the surrounding air (at ",
+       "least 20 points at Yanco; Lanoiselet <em>et al.</em> 2002), so read them as lower ",
+       "bounds. The bands are provisional and not yet calibrated against field ",
+       "observations.</p>"),
+paste0("<p style='font-size:11px;color:#9aa0a6;margin:10px 0 0;'><b>References.</b> ",
+       "Savary S, Nelson A, Willocquet L, Pangga I, Aunario J (2012) Crop Protection ",
+       "34:6-17. epicrop R package (A.H. Sparks and colleagues). Koshimizu Y (1988) Bull. ",
+       "Tohoku Natl. Agric. Exp. Stn. 78:67-121. Hayashi T, Koshimizu Y (1988) ibid. ",
+       "78:123-138. Barksdale TH, Jones MW (1965) Phytopathology 55:1037-1040. Lanoiselet ",
+       "V, Cother EJ, Ash GJ (2002) Australasian Plant Pathology 31:1-7. Weather: ",
+       "Open-Meteo ERA5 (CC BY 4.0).</p>"),
+# The map and top-up lines are how a reader sees that the weather retrieval is
+# not keeping up (fewer cells, an older window, a top-up that fetched little), so
+# they stay in full.
 if (!is.null(mg))
   sprintf(paste0("<p style='font-size:11px;color:#9aa0a6;margin:8px 0 0;'>",
                  "<b>Map:</b> %s</p>"), mg) else "",

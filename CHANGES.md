@@ -6,7 +6,7 @@ The 2026-09-07, 09-14 and 09-21 emails all carried the map "weather to
 2026-08-29" (identical maxima, 0.058% and 10 days) beside a town table that was
 current; the 09-07 email had 31 towns of "no data". Diagnosed from
 `map_stats.txt`, `weighted_spend.csv`, `run_log.csv` and the committed cache. The
-offline suite went from 62 tests to 212; all pass.
+offline suite went from 62 tests to 218; all pass.
 
 | # | Item | Fix | Guarded by |
 | --- | --- | --- | --- |
@@ -26,6 +26,7 @@ offline suite went from 62 tests to 212; all pass.
 | M | The first weekly run on the new schedule was healthy and still carried the note "an earlier run today had already spent 1 weighted calls, capping this one at 9000": the archive probe's own call, read back from the ledger, against the configured cap. | The ledger is a reason only when it actually lowered the run's cap. | test 19 |
 | N | **Town labels overprinted.** Each label sat on one fixed side of its marker and the only collision test was marker to marker distance, so "Humpty Doo" ran through Jabiru's marker and name, "Kununurra" through Timber Creek and "Goondiwindi" through Warwick, while five towns with room on another side had no label, and the footnote saying so was cut off by the bottom of the image. | `map_labels.R`: twelve candidate positions per marker, tested on what the text covers; most constrained label first, with one repair step, and checked at 85% to 115% of the measured text size because fonts differ between machines. The frame carries 2 degrees of sea on the east (`MAP_EAST_PAD_DEG`) so coastal labels have room. Each name has a one pixel white halo (`LABEL_HALO_IN`) so it stays readable across the coast, a road or a river. All 31 towns are labelled with nothing overprinted; the label note, if ever needed, is part of the single footer line. | test 27 |
 | O | **The colour scale started by getting cooler**: pale grey for nothing, light blue for a little, then yellow, orange, red, so a patch of low risk read as less than the grey around it. | Near white, pale green, then the same yellow, orange and red. Chosen on renders of the 28 September data against two alternatives: white straight to yellow lost the low values, and blue as the zero colour turned them into pale holes. | test 28 |
+| P | **The email did not say what its numbers are.** The opening read "fetched to 29 Sep and modelled to 28 Sep" and "how much disease the rolling 60 day window has built up", which reads as disease that exists; the small print was one dense paragraph of method and CSV conventions that never said what BLASTAM's number is. | The opening says what the two numbers are and that both assume the host crop and the pathogen are present. Under the table: how to read the two numbers and the EPIRICE bands; then, for each model, what it measures and the thresholds it ran with, with sources; the limits; full references. The thresholds are filled in from `blast_config.R` and the temperature curve the model used. The map and top-up lines stay in full, because they are how a reader sees that the weather retrieval is not keeping up. Wording agreed on renders of the 5 October email. | test 29 |
 
 **First live runs of the above (28 Sep and 1 Oct 2026).** Monday: map back on
 the current window (20 Sep) with 7,272 cells modelled and the last 449 of the 29
