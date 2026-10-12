@@ -1,12 +1,12 @@
-run_date=2026-10-05
-utc_date=2026-10-05
-town_window_end=2026-09-28
+run_date=2026-10-12
+utc_date=2026-10-12
+town_window_end=2026-10-05
 towns_modelled=31
 towns_total=31
-map_window_end=2026-09-28
+map_window_end=2026-10-05
 map_cells=7721
 map_cells_grey=0
 map_behind_days=0
 degraded=0
 reasons=
-warnings=grid fetch: an earlier run today had already spent 1 weighted calls, capping this one at 9000
+warnings=

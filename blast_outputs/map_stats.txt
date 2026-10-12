@@ -1,1 +1,1 @@
-7721|0.30|7272|0.30|gz|5098|gz|2026-09-28|0.30|7746|0.0180|12||epirice+blastam|0||an earlier run today had already spent 1 weighted calls, capping this one at 9000
+7721|0.30|7721|0.30|gz|5094|gz|2026-10-05|0.30|7746|0.0275|12||epirice+blastam|0||
