@@ -113,9 +113,9 @@ MIN_DAYS <- 16
 #
 # Since October 2026 the weekly run fires on SUNDAY UTC (06:17), so that the
 # email is delivered by 7 am Monday: the day a Monday-UTC run would model to is
-# not published until about 11:30 Sydney time on Monday. The Sydney run date is
-# Sunday on time and Monday when GitHub starts the job late; min() makes the
-# window the same either way, weather to the previous Sunday.
+# not published until about 11:30 Sydney time on Monday. The workflow dates a
+# scheduled run for the Monday the email is for, so the run date is a day ahead
+# of the UTC date; min() keeps the window at weather to the previous Sunday.
 ARCHIVE_LAG_DAYS <- 6L
 
 # WHEN THE NEW DAY APPEARS. "UTC date minus 6" is published at about 00:30 to
@@ -464,8 +464,8 @@ GRID_WINDOW_MAX_LAG_DAYS <- 7L
 # saves the cache and stops. Wednesday recovers from a bad weekly run and speeds
 # a cold fill; Saturday is the weekly run's insurance, leaving unreached cells
 # one day behind instead of three. run_blast.R reports the last top-up in the
-# email and complains when it is older than this: the weekly run's Sydney date
-# is Sunday or Monday, so two days means Saturday's did not run.
+# email and complains when it is older than this: the weekly run is dated for
+# Monday, so two days means Saturday's did not run.
 MIDWEEK_MAX_AGE_DAYS <- 2L
 
 # Rendering. The IDW search radius is derived from the achieved spacing.

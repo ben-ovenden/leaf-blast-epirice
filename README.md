@@ -77,7 +77,7 @@ requires in canopy loggers deployed alongside ERA5 driven model runs.
 | `map_labels.R` | Where each town label goes: twelve candidate positions per marker, none allowed to touch another label or cover another town's marker |
 | `run_health.R` | The run's verdict: is this run degraded, and why. Written to `run_status.txt` for the subject line and the workflow's final step |
 | `send_email.py` | Python stdlib email sender; the subject carries the town window and a `[DEGRADED]` prefix when `run_status.txt` says so |
-| `test_offline.R` | Offline regression tests: 220 tests, no network, runs in seconds, in CI |
+| `test_offline.R` | Offline regression tests: 221 tests, no network, runs in seconds, in CI |
 | `australia_land.geojson` | Land polygon for masking ocean and clipping the map |
 | `australia_rivers.geojson` | River overlay |
 | `australia_roads.geojson` | Road overlay |
@@ -144,7 +144,7 @@ git cat-file blob FETCH_HEAD:weather_cache.csv.gz > blast_outputs/weather_cache.
 git cat-file blob FETCH_HEAD:cache_version.txt   > blast_outputs/cache_version.txt
 ```
 
-All 220 offline tests must pass before a run is meaningful. Each test guards a
+All 221 offline tests must pass before a run is meaningful. Each test guards a
 bug that was actually shipped.
 
 ---
@@ -833,7 +833,7 @@ The weekly workflow runs:
 1. **Resolve run date and UTC date**, pinned once and exported as
    `BLAST_RUN_DATE` and `BLAST_UTC_DATE`, then **restore the weather cache** from
    the `cache-data` branch, failing the run if it cannot.
-2. **Offline tests**, `Rscript test_offline.R`. 220 tests, no network, preceded
+2. **Offline tests**, `Rscript test_offline.R`. 221 tests, no network, preceded
    by a step that makes sure `python3` exists, because the suite executes
    `send_email.py` in dry-run mode: the 2026-09-28 email was sent and the step
    then failed on a `NameError` in the line after the send, and nothing had ever
@@ -882,9 +882,11 @@ late: every scheduled run from 28 September to 12 October 2026 started 5 h 30 to
 7:30 pm Sydney time on Sunday when GitHub is on time and at about 2:30 am Monday
 on a bad day, and the cron can be nearly 12 h late before 7 am Monday is missed.
 Because the constraint is in UTC, daylight saving does not matter: one cron, no
-seasonal gate. The Sydney run date is Sunday or Monday depending on the lateness;
-the modelled window is the same either way. A `concurrency` group shared by both
-workflows prevents two runs from writing the cache at once.
+seasonal gate. A scheduled run is dated for the Monday it is delivered for, so the
+email, its subject and the output files all carry the Monday date whether GitHub
+started the job on Sunday evening or after midnight; the modelled window is the
+same either way. A `concurrency` group shared by both workflows prevents two runs
+from writing the cache at once.
 
 ---
 

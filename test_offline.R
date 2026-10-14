@@ -845,8 +845,15 @@ cat("\n24. The weekly run fires once, on Sunday UTC, so the email is in by 7 am 
   late <- blast_data_end(blast_run_date()) - DAY_CUT_LAG_DAYS
   ok("a Sunday-UTC run models to the previous Sunday",
      on_time == as.Date("2026-10-11"), sprintf("(got %s)", format(on_time)))
-  ok("and to the same day when GitHub starts it after Sydney midnight",
+  ok("and to the same day when the run is dated for Monday while the UTC date is Sunday",
      late == on_time, sprintf("(got %s)", format(late)))
+  # The maintainer wants the email dated for the Monday morning it is read,
+  # whenever GitHub happens to start the job. The workflow adds a day to a
+  # scheduled run's Sydney date when that date is a Sunday.
+  ok("the workflow dates a scheduled run for the Monday the email is for",
+     any(grepl("github.event_name }}\" = \"schedule\"", wl, fixed = TRUE)) &&
+     any(grepl("date +%u)\" = \"7\"", wl, fixed = TRUE)) &&
+     any(grepl("+ 1 day", wl, fixed = TRUE)))
   for (v in vars) if (is.na(old[[v]])) Sys.unsetenv(v) else do.call(Sys.setenv, as.list(setNames(old[[v]], v)))
 }
 
