@@ -1,25 +1,31 @@
-name: Weekly leaf blast risk (Monday afternoon AET email)
+name: Weekly leaf blast risk (email by 7am Monday AET)
 
-# ONE cron, in UTC, on MONDAY.
+# ONE cron, in UTC, on SUNDAY, so the email is in the inbox by 7 am Monday.
 #
-# The map can only be as new as the ERA5 archive, and the archive publishes one
-# more day at about 00:30 to 01:00 UTC (measured: not yet there at 00:08 and
-# 00:11 UTC on 2 October 2026; a run that began at 00:26 UTC on 25 August caught
-# it a few minutes in; every run from 05:09 UTC on had it). Running once that day
-# is out makes the map ONE DAY NEWER than the old Sunday-UTC schedule could:
-# weather to the previous Monday, seven days before the email, not eight.
+# The map can only be as new as the ERA5 archive, which publishes "UTC date
+# minus 6" at about 00:30 to 01:00 UTC. The day a Monday-UTC run would use
+# comes out at about 11:30 Sydney time on Monday, so a run that models to the
+# previous MONDAY cannot be delivered by 7 am: from 28 September to 12 October
+# 2026 the cron was 00:47 UTC Monday and the email arrived at about 7 pm
+# (GitHub started it 5 h 30 to 5 h 50 late, and the run takes about 1 h 55).
+# A SUNDAY-UTC run models to the previous Sunday, one day older, and can be
+# delivered the evening before.
 #
-# So this fires at 00:47 UTC Monday (10:47 AEST, 11:47 AEDT) and the "Resolve
-# archive edge" step then ASKS the archive what it has, waiting up to
-# ARCHIVE_EDGE_WAIT_MAX_MIN for the new day. The run takes about 2 h 05 and
-# GitHub fires schedules anything from minutes to hours late, so expect the email
-# early to mid afternoon. The price of the extra day is the morning delivery.
+# The hour is chosen for the lateness: GitHub started every scheduled run of
+# this repository 5 h 30 to 7 h 13 late through October 2026. Firing at 06:17
+# UTC Sunday (16:17 AEST, 17:17 AEDT), the run is done by about 08:15 UTC on
+# time and by about 15:30 UTC (02:30 AEDT Monday) on a bad day, with room for
+# nearly 12 h of lateness before 7 am Monday (20:00 UTC Sunday in AEDT, 21:00
+# in AEST) is missed. The archive day it needs came out five hours earlier, so
+# the "Resolve archive edge" wait is only a safety net now.
 #
-# The constraint is in UTC, so daylight saving no longer matters: the two
-# seasonal crons and the gate job that chose between them are gone.
+# The constraint is in UTC, so daylight saving does not matter: one cron, no
+# seasonal gate. The Sydney run date is Sunday on time and Monday after local
+# midnight; the modelled window is the same either way, because the lag is
+# counted from the earlier of the two dates (blast_data_end).
 on:
   schedule:
-    - cron: '47 0 * * 1'   # 00:47 UTC Monday = 10:47 AEST / 11:47 AEDT
+    - cron: '17 6 * * 0'   # 06:17 UTC Sunday = 16:17 AEST / 17:17 AEDT
   workflow_dispatch:
     inputs:
       run_date:
@@ -63,7 +69,8 @@ jobs:
       #
       # The UTC date is pinned alongside it: the archive's availability follows
       # the UTC clock, and blast_data_end() counts the lag from the earlier of the
-      # two dates. On the scheduled run they are now the same day.
+      # two dates. On the scheduled run the UTC date is Sunday; the Sydney date is
+      # Sunday on time and Monday when GitHub starts the job after local midnight.
       - name: Resolve run date
         run: |
           RD="${{ github.event.inputs.run_date }}"

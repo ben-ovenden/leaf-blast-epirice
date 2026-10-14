@@ -57,7 +57,7 @@
 #     count and age in the footer. map_stats.txt carries the count, the cohort
 #     summary and the fetch's own reason, so the email banner states what
 #     actually happened rather than a fixed sentence about the quota.
-#   * BLAST_MIDWEEK=1 (the Thursday top-up workflow) fetches, merges, saves the
+#   * BLAST_MIDWEEK=1 (the grid top-up workflow) fetches, merges, saves the
 #     cache and STOPS: no window, no models, no maps, no map_stats.txt. The old
 #     branch of that name ran the whole pipeline and nothing invoked it.
 #

@@ -706,7 +706,7 @@ cat("\n22. The midweek top-up: a second fetch day, no maps, no email\n")
 # BLAST_MIDWEEK branch existed in run_blast_grid.R but ran the whole pipeline,
 # nothing invoked it, and the email line assumed a daily job that never existed.
 {
-  ok("MIDWEEK_MAX_AGE_DAYS is set so that a missed Sunday top-up is reported on Monday",
+  ok("MIDWEEK_MAX_AGE_DAYS is set so that a missed Saturday top-up is reported by the weekly run",
      exists("MIDWEEK_MAX_AGE_DAYS") && MIDWEEK_MAX_AGE_DAYS >= 1L && MIDWEEK_MAX_AGE_DAYS <= 3L)
   ok("in midweek mode the grid runner saves the cache and stops before modelling",
      regexpr("quit(save = \"no\", status = 0)", gsrc, fixed = TRUE) > 0 &&
@@ -724,18 +724,18 @@ cat("\n22. The midweek top-up: a second fetch day, no maps, no email\n")
      !grepl("send_email.py", ymlm, fixed = TRUE) && !grepl("run_blast.R", ymlm, fixed = TRUE))
   ok("it saves the cache and commits the top-up status",
      grepl("weather_cache.csv.gz", ymlm, fixed = TRUE) && grepl("midweek_status.txt", ymlm, fixed = TRUE))
-  # Thursday recovers from a bad Monday; Sunday is Monday's insurance (cells the
-  # Monday fetch does not reach are then one day behind, not three). Neither may
-  # share the weekly run's UTC day, which is Monday, or its daily quota.
+  # Wednesday recovers from a bad weekly run; Saturday is its insurance (cells the
+  # Sunday fetch does not reach are then one day behind, not three). Neither may
+  # share the weekly run's UTC day, which is Sunday, or its daily quota.
   tl <- strsplit(ymlm, "\n")[[1]]
   tcr <- unlist(regmatches(tl, gregexpr("(?<=cron: ')[^']+", tl, perl = TRUE)))
   tday <- vapply(strsplit(tcr, " "), function(x) x[5], character(1))
   thr  <- vapply(strsplit(tcr, " "), function(x) as.integer(x[2]), integer(1))
-  ok("there are two top-ups a week, Thursday and Sunday UTC", setequal(tday, c("4", "0")),
+  ok("there are two top-ups a week, Wednesday and Saturday UTC", setequal(tday, c("3", "6")),
      sprintf("(crons: %s)", paste(tcr, collapse = " | ")))
-  ok("neither on the weekly run's UTC day", !"1" %in% tday)
+  ok("neither on the weekly run's UTC day", !"0" %in% tday)
   ok("both after the archive's daily update, so they fetch the newest day", all(thr >= 2L))
-  ok("the Monday email reports the top-up on a weekly cadence",
+  ok("the weekly email reports the top-up on a weekly cadence",
      grepl("MIDWEEK_MAX_AGE_DAYS", tsrc, fixed = TRUE) && !grepl("Daily top-up", tsrc, fixed = TRUE))
 }
 
@@ -811,31 +811,42 @@ cat("\n23. The email sender runs end to end, minus the SMTP conversation\n")
   }
 }
 
-cat("\n24. The weekly run fires once, on Monday UTC\n")
-# History. Two seasonal crons at 06:30 local, with a gate job choosing between
-# them by daylight-saving offset; GitHub fired them up to 2 h 40 late, so they
-# moved to 01:47. Both were SUNDAY in UTC, which capped the map at eight days old.
-# The archive publishes one more day at about 00:30 to 01:00 UTC, so a run on
-# MONDAY UTC models a day later. That constraint is in UTC: one cron, no gate.
+cat("\n24. The weekly run fires once, on Sunday UTC, so the email is in by 7 am Monday\n")
+# History. Two seasonal crons at 06:30 local with a gate job; then 01:47 UTC
+# Sunday; then, from 28 September 2026, 00:47 UTC MONDAY to model one day later.
+# That day is published at about 11:30 Sydney time, and with GitHub starting the
+# job 5 h 30 to 7 h 13 late the email arrived at about 7 pm. The maintainer asked
+# for delivery by 7 am Monday, which only a Sunday-UTC run can do: it models to
+# the previous Sunday, one day older, and is sent the evening before. The hour
+# leaves room for the lateness. One cron, in UTC, no gate.
 {
   wl <- readLines(".github/workflows/weekly_blast.yml", warn = FALSE)
   crons <- unlist(regmatches(wl, gregexpr("(?<=cron: ')[^']+", wl, perl = TRUE)))
   f <- function(s) strsplit(s, " ")[[1]]
   ok("there is exactly one weekly cron", length(crons) == 1L,
      sprintf("(found: %s)", paste(crons, collapse = " | ")))
-  ok("on Monday in UTC, so the UTC date equals the Sydney run date",
-     length(crons) == 1L && f(crons[1])[5] == "1")
-  ok("early in the UTC day, so the email is still Monday afternoon in Sydney",
-     length(crons) == 1L && as.integer(f(crons[1])[2]) <= 2L)
+  ok("on Sunday in UTC: the latest archive day that is out before 7 am Monday",
+     length(crons) == 1L && f(crons[1])[5] == "0")
+  hr <- if (length(crons) == 1L) as.integer(f(crons[1])[2]) else NA_integer_
+  ok("after the archive's daily update (00:30 to 01:00 UTC), with margin", isTRUE(hr >= 2L))
+  # 7 am Monday is 20:00 UTC Sunday in AEDT. The run takes about 2 h; GitHub has
+  # started it up to 7 h 13 late. hour + 7.25 + 2.5 must stay under 20.
+  ok("early enough that a run started 7 h late is still done before 7 am Monday", isTRUE(hr <= 10L),
+     sprintf("(hour %s)", hr))
   ok("off the hour and half hour, where the scheduler is busiest",
      length(crons) == 1L && !as.integer(f(crons[1])[1]) %in% c(0L, 30L))
   ok("no seasonal gate is left to disagree with it",
      !any(grepl("$SCHED\" = \"", wl, fixed = TRUE)) && !any(grepl("needs: gate", wl, fixed = TRUE)))
   vars <- c("BLAST_RUN_DATE", "BLAST_UTC_DATE", "BLAST_DATA_END"); old <- Sys.getenv(vars, unset = NA)
-  Sys.setenv(BLAST_RUN_DATE = "2026-10-05", BLAST_UTC_DATE = "2026-10-05"); Sys.unsetenv("BLAST_DATA_END")
-  ok("a Monday-UTC run models to the previous Monday, a day later than a Sunday-UTC one",
-     blast_data_end(blast_run_date()) - DAY_CUT_LAG_DAYS == as.Date("2026-09-28"),
-     sprintf("(got %s)", format(blast_data_end(blast_run_date()) - DAY_CUT_LAG_DAYS)))
+  Sys.unsetenv("BLAST_DATA_END")
+  Sys.setenv(BLAST_RUN_DATE = "2026-10-18", BLAST_UTC_DATE = "2026-10-18")
+  on_time <- blast_data_end(blast_run_date()) - DAY_CUT_LAG_DAYS
+  Sys.setenv(BLAST_RUN_DATE = "2026-10-19", BLAST_UTC_DATE = "2026-10-18")
+  late <- blast_data_end(blast_run_date()) - DAY_CUT_LAG_DAYS
+  ok("a Sunday-UTC run models to the previous Sunday",
+     on_time == as.Date("2026-10-11"), sprintf("(got %s)", format(on_time)))
+  ok("and to the same day when GitHub starts it after Sydney midnight",
+     late == on_time, sprintf("(got %s)", format(late)))
   for (v in vars) if (is.na(old[[v]])) Sys.unsetenv(v) else do.call(Sys.setenv, as.list(setNames(old[[v]], v)))
 }
 

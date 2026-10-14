@@ -1,22 +1,22 @@
-name: Grid top-up (Thursday and Sunday, no email)
+name: Grid top-up (Wednesday and Saturday, no email)
 
 # Two extra fetch days a week on the same cache: fetch, save, stop. No maps, no
 # town table, no email (BLAST_MIDWEEK=1 in run_blast_grid.R). The Monday email
 # reports when the last one ran.
 #
-# THURSDAY clears whatever a bad Monday left behind and halves the time the grid
-# takes to fill from cold. SUNDAY is insurance for Monday: if Monday's grid fetch
-# is cut short, the cells it did not reach are one day behind rather than three,
-# the map steps back a single day, complete, and is not flagged as degraded. It
-# is the latest day that can be, because the weekly run fires on Monday UTC and
-# the two must not share a daily quota.
+# WEDNESDAY clears whatever a bad weekly run left behind and halves the time the
+# grid takes to fill from cold. SATURDAY is insurance for the weekly run (Sunday
+# UTC since October 2026): if its grid fetch is cut short, the cells it did not
+# reach are one day behind rather than three, the map steps back a single day,
+# complete, and is not flagged as degraded. It is the latest day that can be,
+# because the two must not share a daily quota.
 on:
   schedule:
     # 03:17 UTC = 13:17 AEST / 14:17 AEDT. After the archive's daily update
-    # (about 00:30 to 01:00 UTC), so a top-up fetches the same newest day the
-    # Monday run will, and off the hour and half hour.
-    - cron: '17 3 * * 4'   # Thursday
-    - cron: '17 3 * * 0'   # Sunday
+    # (about 00:30 to 01:00 UTC), so a top-up fetches the newest day there is,
+    # and off the hour and half hour.
+    - cron: '17 3 * * 3'   # Wednesday
+    - cron: '17 3 * * 6'   # Saturday
   workflow_dispatch:
     inputs:
       run_date:
@@ -51,7 +51,7 @@ jobs:
         uses: actions/checkout@v4
 
       # Same pinning as the weekly run: one run date and one UTC date for the
-      # whole job. run_status.txt is the MONDAY run's verdict and is left alone.
+      # whole job. run_status.txt is the weekly run's verdict and is left alone.
       - name: Resolve run date
         run: |
           RD="${{ github.event.inputs.run_date }}"
