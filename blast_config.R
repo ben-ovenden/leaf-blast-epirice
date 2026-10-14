@@ -110,6 +110,12 @@ MIN_DAYS <- 16
 # were more than a tail behind and cost a full refetch each. Counting the lag
 # from the UTC date costs one day of freshness on the Monday email and removes
 # the whole chain. Manual runs after 10:00 Sydney are unaffected.
+#
+# Since October 2026 the weekly run fires on SUNDAY UTC (06:17), so that the
+# email is delivered by 7 am Monday: the day a Monday-UTC run would model to is
+# not published until about 11:30 Sydney time on Monday. The Sydney run date is
+# Sunday on time and Monday when GitHub starts the job late; min() makes the
+# window the same either way, weather to the previous Sunday.
 ARCHIVE_LAG_DAYS <- 6L
 
 # WHEN THE NEW DAY APPEARS. "UTC date minus 6" is published at about 00:30 to
@@ -118,8 +124,9 @@ ARCHIVE_LAG_DAYS <- 6L
 # minutes in (38 western cells a day short, 649 not), and every run that started
 # at 05:09 UTC or later had it. So the workflows ask (probe_archive_edge.R). The
 # probe requests one far-western point, because that is where the last day's
-# hours are needed, and the weekly run waits for the update because the extra day
-# is the reason it runs on Monday UTC at all.
+# hours are needed. The weekly run can wait for the update; on the Sunday 06:17
+# UTC schedule the day it needs is normally five hours old, so this is a safety
+# net for a late archive.
 ARCHIVE_EDGE_PROBE_LON    <- 114.0
 ARCHIVE_EDGE_PROBE_LAT    <- -26.0
 ARCHIVE_EDGE_WAIT_MAX_MIN <- 90    # weekly run: wait at most this long for the new day
@@ -453,12 +460,12 @@ COL_STALE <- COL_NODATA        # cells not refreshed to the window are drawn in 
 GRID_WINDOW_MAX_LAG_DAYS <- 7L
 
 # Grid top-ups (.github/workflows/midweek_topup.yml): two extra fetch days a
-# week, Thursday and Sunday UTC, run with BLAST_MIDWEEK=1, which fetches, saves
-# the cache and stops. Thursday recovers from a bad Monday and speeds a cold
-# fill; Sunday is Monday's insurance, leaving unreached cells one day behind
-# instead of three. run_blast.R reports the last top-up in the Monday email and
-# complains when it is older than this, which on a Monday means Sunday's did not
-# run.
+# week, Wednesday and Saturday UTC, run with BLAST_MIDWEEK=1, which fetches,
+# saves the cache and stops. Wednesday recovers from a bad weekly run and speeds
+# a cold fill; Saturday is the weekly run's insurance, leaving unreached cells
+# one day behind instead of three. run_blast.R reports the last top-up in the
+# email and complains when it is older than this: the weekly run's Sydney date
+# is Sunday or Monday, so two days means Saturday's did not run.
 MIDWEEK_MAX_AGE_DAYS <- 2L
 
 # Rendering. The IDW search radius is derived from the achieved spacing.

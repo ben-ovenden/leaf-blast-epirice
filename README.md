@@ -6,13 +6,13 @@
 > `RHUM` and `RAIN` value changes; the preceding 5 day mean is lagged so it
 > genuinely precedes, so `infect` and `semi` change; and night completeness now
 > requires a minimum number of observed hours. Expect about twelve fetch days
-> before the 0.3 degree grid is full again: about four weeks with the Monday run
-> and the Thursday and Sunday top-ups together.
+> before the 0.3 degree grid is full again: about four weeks with the weekly run
+> and the Wednesday and Saturday top-ups together.
 
 A self contained pipeline that runs two complementary leaf blast models each week
 from GitHub Actions, using free Open-Meteo ERA5 weather. Two risk maps, a 31 town
-table and an HTML summary are emailed every Monday afternoon, modelled to the
-previous Monday.
+table and an HTML summary are emailed by 7 am every Monday, modelled to the
+previous Sunday.
 
 ---
 
@@ -77,12 +77,12 @@ requires in canopy loggers deployed alongside ERA5 driven model runs.
 | `map_labels.R` | Where each town label goes: twelve candidate positions per marker, none allowed to touch another label or cover another town's marker |
 | `run_health.R` | The run's verdict: is this run degraded, and why. Written to `run_status.txt` for the subject line and the workflow's final step |
 | `send_email.py` | Python stdlib email sender; the subject carries the town window and a `[DEGRADED]` prefix when `run_status.txt` says so |
-| `test_offline.R` | Offline regression tests: 218 tests, no network, runs in seconds, in CI |
+| `test_offline.R` | Offline regression tests: 220 tests, no network, runs in seconds, in CI |
 | `australia_land.geojson` | Land polygon for masking ocean and clipping the map |
 | `australia_rivers.geojson` | River overlay |
 | `australia_roads.geojson` | Road overlay |
-| `.github/workflows/weekly_blast.yml` | Monday workflow (00:47 UTC): pin the dates, restore the cache, test, probe the archive, fetch, save the cache, model, commit, email, verdict |
-| `.github/workflows/midweek_topup.yml` | Thursday and Sunday top-ups (03:17 UTC): restore the cache, probe, fetch, save the cache, stop. No maps, no email |
+| `.github/workflows/weekly_blast.yml` | Weekly workflow (06:17 UTC Sunday): pin the dates, restore the cache, test, probe the archive, fetch, save the cache, model, commit, email, verdict |
+| `.github/workflows/midweek_topup.yml` | Wednesday and Saturday top-ups (03:17 UTC): restore the cache, probe, fetch, save the cache, stop. No maps, no email |
 
 ---
 
@@ -144,7 +144,7 @@ git cat-file blob FETCH_HEAD:weather_cache.csv.gz > blast_outputs/weather_cache.
 git cat-file blob FETCH_HEAD:cache_version.txt   > blast_outputs/cache_version.txt
 ```
 
-All 218 offline tests must pass before a run is meaningful. Each test guards a
+All 220 offline tests must pass before a run is meaningful. Each test guards a
 bug that was actually shipped.
 
 ---
@@ -189,11 +189,14 @@ day), and prints it; the workflows export that as `BLAST_DATA_END`, and
 `blast_data_end()` uses it when it is earlier than the arithmetic. A run can no
 longer ask for a day that is not there, whenever GitHub happens to fire it.
 
-**Which is why the weekly run is on Monday in UTC.** It fires at 00:47 UTC and
-waits, up to `ARCHIVE_EDGE_WAIT_MAX_MIN` (90), for that day to be published, so
-the map is modelled to the previous Monday: seven days before the email, where
-the old Sunday-UTC schedule could only reach eight. The price is the delivery
-time: the email arrives on Monday afternoon rather than Monday morning.
+**Which day the weekly run is on is a choice between freshness and delivery
+time.** A Monday-UTC run (00:47 UTC, 28 September to 12 October 2026) waited for
+that day and modelled to the previous Monday, but the day is not published until
+about 11:30 Sydney time and GitHub started the job 5 h 30 to 5 h 50 late, so the
+email arrived at about 7 pm. Since 14 October 2026 the run fires at 06:17 UTC
+**Sunday** so that the email is in the inbox by 7 am Monday; it models to the
+previous Sunday, one day older. The wait (`ARCHIVE_EDGE_WAIT_MAX_MIN`, 90) is
+now a safety net: the day it needs is normally five hours old when it starts.
 
 ---
 
@@ -461,24 +464,24 @@ anything. Working the recursion through, adds per run are
 | 11 | ~7,710 | |
 | 12 | 7,721 | 0.3 deg complete |
 
-Each row is one **fetch day**. There are three a week: the Monday run and two
-top-ups, Thursday and Sunday (`.github/workflows/midweek_topup.yml`, which runs
+Each row is one **fetch day**. There are three a week: the Sunday run and two
+top-ups, Wednesday and Saturday (`.github/workflows/midweek_topup.yml`, which runs
 `run_blast_grid.R` with `BLAST_MIDWEEK=1`), so a cold fill takes about four
 weeks. A top-up fetches, merges and saves the cache, and stops: no window, no
 models, no maps, no town table, no email. It shares the weekly workflow's
 concurrency group so two runs can never write the cache at once, and fires at
 03:17 UTC, after the archive's daily update and on a different UTC day from the
-Monday run, so they never share a daily quota.
+weekly run, so they never share a daily quota.
 
-The two top-ups do different jobs. In a healthy week neither changes Monday's
-output, because Monday refreshes every cell itself at 1.00 whether it is one day
-behind or seven. **Thursday** clears whatever a bad Monday left behind. **Sunday**
-is Monday's insurance: if Monday's grid fetch is cut short, the cells it did not
-reach are one day behind rather than three, so the map steps back a single day,
-complete, and is not flagged as degraded. It is the latest day that can be, since
-the weekly run now fires on Monday UTC. `midweek_status.txt` records each top-up
-and the Monday email reports the last one, complaining if it is more than
-`MIDWEEK_MAX_AGE_DAYS` (2) old, which on a Monday means Sunday's did not run.
+The two top-ups do different jobs. In a healthy week neither changes the weekly
+output, because the weekly run refreshes every cell itself at 1.00 whether it is
+one day behind or seven. **Wednesday** clears whatever a bad weekly run left
+behind. **Saturday** is its insurance: if Sunday's grid fetch is cut short, the
+cells it did not reach are one day behind rather than three, so the map steps
+back a single day, complete, and is not flagged as degraded. It is the latest day
+that can be, since the weekly run fires on Sunday UTC. `midweek_status.txt`
+records each top-up and the weekly email reports the last one, complaining if it
+is more than `MIDWEEK_MAX_AGE_DAYS` (2) old, which means Saturday's did not run.
 Earlier versions of this table claimed four to
 nine "daily runs", which was wrong twice over: the arithmetic was optimistic and,
 until September 2026, the only scheduled workflow was the weekly one.
@@ -825,12 +828,12 @@ by default, so the delivered maps still include them.
 
 ## Workflow
 
-The Monday workflow runs:
+The weekly workflow runs:
 
 1. **Resolve run date and UTC date**, pinned once and exported as
    `BLAST_RUN_DATE` and `BLAST_UTC_DATE`, then **restore the weather cache** from
    the `cache-data` branch, failing the run if it cannot.
-2. **Offline tests**, `Rscript test_offline.R`. 218 tests, no network, preceded
+2. **Offline tests**, `Rscript test_offline.R`. 220 tests, no network, preceded
    by a step that makes sure `python3` exists, because the suite executes
    `send_email.py` in dry-run mode: the 2026-09-28 email was sent and the step
    then failed on a `NameError` in the line after the send, and nothing had ever
@@ -856,31 +859,32 @@ The Monday workflow runs:
    email and the upload on purpose: the R scripts exit 0 on a degraded run so
    that it *is* reported, and the loud failure comes once nothing can be lost.
 
-The **top-ups** (`midweek_topup.yml`, 03:17 UTC Thursday and Sunday) are the same
+The **top-ups** (`midweek_topup.yml`, 03:17 UTC Wednesday and Saturday) are the same
 job cut short: pin the dates, restore the cache, test, probe the archive once
 without waiting, run `run_blast_grid.R` with `BLAST_MIDWEEK=1` (fetch, save the
 cache file, stop), push the cache to `cache-data`, commit `midweek_status.txt`
 and the ledgers, upload the artifact, and fail if the status file is missing or
-from another run. They leave `run_status.txt` alone; that is the Monday run's
+from another run. They leave `run_status.txt` alone; that is the weekly run's
 verdict. A manual dispatch takes a `weighted_cap`, so a change to the workflows
 can be proved end to end in three minutes and thirty API calls.
 
 The schedule, all in UTC:
 
 ```
-weekly_blast.yml    - cron: '47 0 * * 1'   # Monday    10:47 AEST / 11:47 AEDT
-midweek_topup.yml   - cron: '17 3 * * 4'   # Thursday  13:17 AEST / 14:17 AEDT
-                    - cron: '17 3 * * 0'   # Sunday
+weekly_blast.yml    - cron: '17 6 * * 0'   # Sunday     16:17 AEST / 17:17 AEDT
+midweek_topup.yml   - cron: '17 3 * * 3'   # Wednesday  13:17 AEST / 14:17 AEDT
+                    - cron: '17 3 * * 6'   # Saturday
 ```
 
-The weekly run fires just after the archive's daily update is due and waits for
-it; the run takes about 2 h 05, and GitHub fires schedules anything from minutes
-to hours late (the old 20:30 UTC entry started 14 minutes to 2 h 40 late through
-August and September 2026, and a 00:30 UTC entry once started 5 h 50 late), so
-expect the email early to mid afternoon on Monday, later on a bad day. Because the
-constraint is in UTC, daylight saving no longer matters: the two seasonal crons
-and the gate job that chose between them are gone. A `concurrency` group shared
-by both workflows prevents two runs from writing the cache at once.
+The weekly run takes about 1 h 55, and GitHub fires this repository's schedules
+late: every scheduled run from 28 September to 12 October 2026 started 5 h 30 to
+7 h 13 after its cron. Firing at 06:17 UTC Sunday, the email arrives at about
+7:30 pm Sydney time on Sunday when GitHub is on time and at about 2:30 am Monday
+on a bad day, and the cron can be nearly 12 h late before 7 am Monday is missed.
+Because the constraint is in UTC, daylight saving does not matter: one cron, no
+seasonal gate. The Sydney run date is Sunday or Monday depending on the lateness;
+the modelled window is the same either way. A `concurrency` group shared by both
+workflows prevents two runs from writing the cache at once.
 
 ---
 

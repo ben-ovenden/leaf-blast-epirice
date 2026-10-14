@@ -52,7 +52,7 @@
 #   * A rerun over the same data window cannot make the record worse: trends
 #     blanks are filled from the earlier run's column, and the run log keeps the
 #     row that modelled the most towns.
-#   * The Monday email reports the Thursday top-up run on a weekly cadence.
+#   * The weekly email reports the last grid top-up run on a weekly cadence.
 ################################################################################
 
 SCRIPT_DIR <- tryCatch(
@@ -388,7 +388,7 @@ if (any(grepl("towns modelled", verdict$reasons, fixed = TRUE)))
   mwarn <- paste(c(sprintf("Only %d of %d towns could be modelled this run; the rest show as no data.",
                            towns_ok, nrow(results)), mwarn), collapse = " ")
 
-# The Thursday top-up (.github/workflows/midweek_topup.yml) writes
+# The grid top-up (.github/workflows/midweek_topup.yml) writes
 # midweek_status.txt: date | cells after | cells before | added | fmt | KB |
 # cells fetched. It is a weekly job, so "none in the last MIDWEEK_MAX_AGE_DAYS"
 # is the complaint; the line used to assume a DAILY job that never existed and
