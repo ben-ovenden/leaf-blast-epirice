@@ -20,9 +20,10 @@ name: Weekly leaf blast risk (email by 7am Monday AET)
 # the "Resolve archive edge" wait is only a safety net now.
 #
 # The constraint is in UTC, so daylight saving does not matter: one cron, no
-# seasonal gate. The Sydney run date is Sunday on time and Monday after local
-# midnight; the modelled window is the same either way, because the lag is
-# counted from the earlier of the two dates (blast_data_end).
+# seasonal gate. A scheduled run is dated for the Monday it is delivered for,
+# whether GitHub starts it on Sunday evening or after local midnight (see
+# "Resolve run date"); the modelled window is the same either way, because the
+# lag is counted from the earlier of that date and the UTC date.
 on:
   schedule:
     - cron: '17 6 * * 0'   # 06:17 UTC Sunday = 16:17 AEST / 17:17 AEDT
@@ -69,17 +70,26 @@ jobs:
       #
       # The UTC date is pinned alongside it: the archive's availability follows
       # the UTC clock, and blast_data_end() counts the lag from the earlier of the
-      # two dates. On the scheduled run the UTC date is Sunday; the Sydney date is
-      # Sunday on time and Monday when GitHub starts the job after local midnight.
+      # two dates. On the scheduled run the UTC date is Sunday and the run date is
+      # the Monday the email is for.
       - name: Resolve run date
         run: |
           RD="${{ github.event.inputs.run_date }}"
-          [ -z "$RD" ] && RD=$(TZ=Australia/Sydney date +%F)
+          if [ -z "$RD" ]; then
+            RD=$(TZ=Australia/Sydney date +%F)
+            # A scheduled run is the Monday morning email whenever GitHub starts
+            # it: Sunday evening on time, after local midnight on a bad day. Date
+            # it, and everything named after it, for that Monday. A manual run
+            # keeps today's date unless run_date is given.
+            if [ "${{ github.event_name }}" = "schedule" ] && [ "$(TZ=Australia/Sydney date +%u)" = "7" ]; then
+              RD=$(date -u -d "$RD + 1 day" +%F)
+            fi
+          fi
           UD=$(date -u +%F)
           echo "BLAST_RUN_DATE=$RD" >> "$GITHUB_ENV"
           echo "RUN_DATE=$RD" >> "$GITHUB_ENV"
           echo "BLAST_UTC_DATE=$UD" >> "$GITHUB_ENV"
-          echo "Run date pinned to $RD (Australia/Sydney); UTC date $UD"
+          echo "Run date pinned to $RD (the Monday the email is for, or today in Australia/Sydney); UTC date $UD"
           # The previous run's verdict is committed; clear it so the Verdict
           # step below cannot mistake last week's health for this week's.
           rm -f blast_outputs/run_status.txt
