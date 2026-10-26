@@ -150,12 +150,13 @@ def main():
     # points sitting in the repository. The R side writes a "Degraded run"
     # banner into the body naming exactly what is missing and why.
     #
-    # run_log.csv records the schema version and model parameters behind each
-    # trends column. Optional: an older cache will not have one yet.
+    # run_log.csv (the schema version and model parameters behind each trends
+    # column) used to be attached as well. The maintainer dropped it from the
+    # email on 2026-10-26; it is still committed to the repository and in the
+    # run's artifact.
     optional = [
         os.path.join(OUT, f"epirice_heatmap_{run_date}.png"),
         os.path.join(OUT, f"blastam_heatmap_{run_date}.png"),
-        os.path.join(OUT, "run_log.csv"),
     ]
 
     n = 0

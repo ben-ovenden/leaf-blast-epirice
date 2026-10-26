@@ -6,7 +6,7 @@ The 2026-09-07, 09-14 and 09-21 emails all carried the map "weather to
 2026-08-29" (identical maxima, 0.058% and 10 days) beside a town table that was
 current; the 09-07 email had 31 towns of "no data". Diagnosed from
 `map_stats.txt`, `weighted_spend.csv`, `run_log.csv` and the committed cache. The
-offline suite went from 62 tests to 221; all pass.
+offline suite went from 62 tests to 222; all pass.
 
 | # | Item | Fix | Guarded by |
 | --- | --- | --- | --- |
@@ -28,6 +28,7 @@ offline suite went from 62 tests to 221; all pass.
 | O | **The colour scale started by getting cooler**: pale grey for nothing, light blue for a little, then yellow, orange, red, so a patch of low risk read as less than the grey around it. | Near white, pale green, then the same yellow, orange and red. Chosen on renders of the 28 September data against two alternatives: white straight to yellow lost the low values, and blue as the zero colour turned them into pale holes. | test 28 |
 | P | **The email did not say what its numbers are.** The opening read "fetched to 29 Sep and modelled to 28 Sep" and "how much disease the rolling 60 day window has built up", which reads as disease that exists; the small print was one dense paragraph of method and CSV conventions that never said what BLASTAM's number is. | The opening says what the two numbers are and that both assume the host crop and the pathogen are present. Under the table: how to read the two numbers and the EPIRICE bands; then, for each model, what it measures and the thresholds it ran with, with sources; the limits; full references. The thresholds are filled in from `blast_config.R` and the temperature curve the model used. The map and top-up lines stay in full, because they are how a reader sees that the weather retrieval is not keeping up. Wording agreed on renders of the 5 October email. | test 29 |
 | Q | **The email arrived at 7 pm Monday.** The Monday-UTC cron (00:47) modelled one day later than a Sunday-UTC one could, but that day is not published until about 11:30 Sydney time, and GitHub started every scheduled run of this repository 5 h 30 to 7 h 13 late through October 2026. The maintainer asked for delivery by 7 am Monday. | The weekly run fires at 06:17 UTC **Sunday** and models to the previous Sunday, one day older than before; on time the email arrives about 7:30 pm Sunday, on a bad day about 2:30 am Monday, and the cron can be nearly 12 h late before 7 am is missed. The top-ups move with it, to Wednesday and Saturday, so Saturday remains the day-before insurance and neither shares the weekly run's UTC day. A scheduled run is dated for the Monday the email is for, whenever GitHub starts it; the window is the same either way. | tests 24, 22 |
+| R | `run_log.csv` was attached to every email. | Dropped from the email at the maintainer's request (2026-10-26). The file is still committed to the repository on every run and included in the run's artifact; the email carries the two trends CSVs and the two maps. | test 23 |
 
 **First live runs of the above (28 Sep and 1 Oct 2026).** Monday: map back on
 the current window (20 Sep) with 7,272 cells modelled and the last 449 of the 29
