@@ -77,7 +77,7 @@ requires in canopy loggers deployed alongside ERA5 driven model runs.
 | `map_labels.R` | Where each town label goes: twelve candidate positions per marker, none allowed to touch another label or cover another town's marker |
 | `run_health.R` | The run's verdict: is this run degraded, and why. Written to `run_status.txt` for the subject line and the workflow's final step |
 | `send_email.py` | Python stdlib email sender; the subject carries the town window and a `[DEGRADED]` prefix when `run_status.txt` says so |
-| `test_offline.R` | Offline regression tests: 221 tests, no network, runs in seconds, in CI |
+| `test_offline.R` | Offline regression tests: 222 tests, no network, runs in seconds, in CI |
 | `australia_land.geojson` | Land polygon for masking ocean and clipping the map |
 | `australia_rivers.geojson` | River overlay |
 | `australia_roads.geojson` | Road overlay |
@@ -144,7 +144,7 @@ git cat-file blob FETCH_HEAD:weather_cache.csv.gz > blast_outputs/weather_cache.
 git cat-file blob FETCH_HEAD:cache_version.txt   > blast_outputs/cache_version.txt
 ```
 
-All 221 offline tests must pass before a run is meaningful. Each test guards a
+All 222 offline tests must pass before a run is meaningful. Each test guards a
 bug that was actually shipped.
 
 ---
@@ -833,7 +833,7 @@ The weekly workflow runs:
 1. **Resolve run date and UTC date**, pinned once and exported as
    `BLAST_RUN_DATE` and `BLAST_UTC_DATE`, then **restore the weather cache** from
    the `cache-data` branch, failing the run if it cannot.
-2. **Offline tests**, `Rscript test_offline.R`. 221 tests, no network, preceded
+2. **Offline tests**, `Rscript test_offline.R`. 222 tests, no network, preceded
    by a step that makes sure `python3` exists, because the suite executes
    `send_email.py` in dry-run mode: the 2026-09-28 email was sent and the step
    then failed on a `NameError` in the line after the send, and nothing had ever
@@ -850,7 +850,7 @@ The weekly workflow runs:
 5. **Commit** the trends, run log, spend ledger, failure ledger, map stats and
    run status to `main`, before the email so a failed send loses nothing.
 6. **Email**, `python3 send_email.py`, with the two heatmaps, the two trends CSVs
-   and the run log attached, and `[DEGRADED]` in the subject when the verdict
+   attached, and `[DEGRADED]` in the subject when the verdict
    says so.
 7. **Upload artifact**, all of `blast_outputs/` kept 90 days as a fallback.
 8. **Verdict**, last and `if: always()`: exits non-zero when `run_status.txt` is

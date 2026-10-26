@@ -799,6 +799,11 @@ cat("\n23. The email sender runs end to end, minus the SMTP conversation\n")
        grepl("[DEGRADED] Blast risk summary 2026-09-21 (weather to 2026-09-14; maps to 2026-08-29)",
              r$out, fixed = TRUE))
     ok("and the attachments counted", grepl("with 2 attachments", r$out, fixed = TRUE))
+    # Dropped from the email on 2026-10-26 at the maintainer's request; the file
+    # is still committed and in the artifact.
+    ok("run_log.csv is not attached",
+       !any(grepl("run_log.csv", grep("^\\s*#", readLines("send_email.py", warn = FALSE),
+                                      value = TRUE, invert = TRUE), fixed = TRUE)))
     r <- run_dry(c("town_window_end=2026-08-29", "degraded=0", "reasons="))
     ok("a healthy dry run has a plain subject carrying one window",
        r$status == 0L && grepl("subject 'Blast risk summary 2026-09-21 (weather to 2026-08-29)'",
