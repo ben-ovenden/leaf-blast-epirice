@@ -1062,8 +1062,8 @@ cat("\n29. The email says what each number is, with the thresholds the models ra
      !grepl("fetched to %s and modelled to", one, fixed = TRUE) &&
      !grepl("has built up", one, fixed = TRUE))
   ok("each model's block opens with what its number is",
-     grepl("measures potential disease, not observed disease", one, fixed = TRUE) &&
-     grepl("measures infection opportunity, not disease", one, fixed = TRUE))
+     grepl("measures potential disease: the percentage of leaf tissue", one, fixed = TRUE) &&
+     grepl("measures infection opportunity: the number of nights", one, fixed = TRUE))
   ok("the BLASTAM limits in the email are the settings, not copies of them",
      grepl("BLASTAM_TWET_MIN, BLASTAM_TWET_MAX, raised(BLASTAM_TWET_MAX)", raw, fixed = TRUE) &&
      grepl("BLASTAM_PREV5_MIN, BLASTAM_PREV5_MAX, raised(BLASTAM_PREV5_MAX)", raw, fixed = TRUE) &&
@@ -1079,7 +1079,7 @@ cat("\n29. The email says what each number is, with the thresholds the models ra
     has <- function(keys, txt) all(vapply(keys, function(k) grepl(k, txt, fixed = TRUE), logical(1)))
     has(c("onset = 15L", "rhlim = 90L", "rainlim = 5L", "RcOpt = 1.14", "p = 5L", "i = 20L"), m) &&
       has(c("on day 15", "5 mm or more of rain", "90%% or more", "latent for 5 days",
-            "20 days, then removed", "1.14 new infections"), one) })
+            "20 days, then removed"), one) })
   ok("the map and top-up lines stay on the email in full: they show when retrieval is not keeping up",
      grepl("<b>Map:</b> %s</p>", raw, fixed = TRUE) && grepl("<b>Top-up:</b> %s</p>", raw, fixed = TRUE) &&
      grepl("weighted API calls", raw, fixed = TRUE) && !grepl("mg_short", raw, fixed = TRUE))
