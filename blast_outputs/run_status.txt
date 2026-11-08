@@ -1,9 +1,9 @@
-run_date=2026-11-02
-utc_date=2026-11-01
-town_window_end=2026-10-25
+run_date=2026-11-09
+utc_date=2026-11-08
+town_window_end=2026-11-01
 towns_modelled=31
 towns_total=31
-map_window_end=2026-10-25
+map_window_end=2026-11-01
 map_cells=7721
 map_cells_grey=0
 map_behind_days=0
