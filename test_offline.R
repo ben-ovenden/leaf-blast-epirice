@@ -1085,5 +1085,36 @@ cat("\n29. The email says what each number is, with the thresholds the models ra
      grepl("weighted API calls", raw, fixed = TRUE) && !grepl("mg_short", raw, fixed = TRUE))
 }
 
+cat("\n30. The BLASTAM cell can be read on every shade\n")
+# Regression, reported on the 9 November 2026 email: the "(7d n)" figure beside
+# the count was one fixed grey on every shade of the blue ramp. On the 11-15
+# shade that is 1.15:1, so the recent count could not be read in exactly the
+# cells where it matters most. The text colours now come from the shade.
+{
+  lum <- function(hex) {
+    v <- grDevices::col2rgb(hex)[, 1] / 255
+    v <- ifelse(v <= 0.03928, v / 12.92, ((v + 0.055) / 1.055)^2.4)
+    sum(c(0.2126, 0.7152, 0.0722) * v)
+  }
+  contrast <- function(a, b) { l <- sort(c(lum(a), lum(b))); (l[2] + 0.05) / (l[1] + 0.05) }
+  on_shades <- function(fg) mapply(contrast, fg, BLASTAM_CELL_BG)
+  ok("there is one colour per shade for the count and for the 7 day figure",
+     length(BLASTAM_CELL_FG) == length(BLASTAM_CELL_BG) &&
+     length(BLASTAM_CELL_SUB) == length(BLASTAM_CELL_BG))
+  ok("the count reaches 4.5:1 on every shade", all(on_shades(BLASTAM_CELL_FG) >= 4.5),
+     sprintf("(lowest %.2f)", min(on_shades(BLASTAM_CELL_FG))))
+  ok("and so does the 7 day figure", all(on_shades(BLASTAM_CELL_SUB) >= 4.5),
+     sprintf("(lowest %.2f)", min(on_shades(BLASTAM_CELL_SUB))))
+  ok("the old fixed grey did not: under 2:1 on the darker shades",
+     min(on_shades(rep("#6b7378", length(BLASTAM_CELL_BG)))) < 2)
+  raw <- paste(readLines("run_blast.R", warn = FALSE), collapse = "\n")
+  ok("the cell takes both colours from its shade, with no fixed colour left in it",
+     grepl("r$blast_events, bl_sub(r$blast_events), BLASTAM_RECENT_DAYS", raw, fixed = TRUE) &&
+     grepl("r$blast_unjudged, bl_fg(r$blast_events))", raw, fixed = TRUE) &&
+     !grepl("color:#6b7378;font-size:11px", raw, fixed = TRUE))
+  ok("the legend chips use the same text colours as the cells",
+     grepl("BLASTAM_CELL_BG,\n    BLASTAM_CELL_FG)", gsub("\r", "", raw), fixed = TRUE))
+}
+
 cat(sprintf("\n%d tests, %d failures\n", n, fails))
 quit(status = if (fails > 0L) 1L else 0L)
