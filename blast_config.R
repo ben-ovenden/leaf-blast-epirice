@@ -168,8 +168,19 @@ BAND_STYLE <- list(
   high       = list(bg = "#FBE3E9", fg = "#8B0E29",      dot = COL_HIGH),
   `no data`  = list(bg = "#EBEDEF", fg = NSW_GREY_04,    dot = COL_NODATA)
 )
-# Single hue blue ramp for the BLASTAM day count column, low to high.
-BLASTAM_CELL_BG <- c("#F4F7F9", "#EBF1F8", "#C7DBEF", "#93B8DE", "#4B7EBD", NSW_BRAND_BLUE)
+# Single hue blue ramp for the BLASTAM day count column, low to high, with the
+# text colours that go on each shade: FG for the count, SUB for the smaller
+# "(7d n)" figure beside it.
+#
+# The 7 day figure used to be one fixed grey (#6b7378) on every shade. That is
+# 2.3:1 on the 6-10 shade and 1.15:1 on the 11-15 one, where it could not be
+# read at all: exactly the cells where the recent count matters most. Every
+# pair below reaches 4.5:1, the same standard as the risk bands above. The
+# 11-15 shade was #4B7EBD, on which even white only reaches 4.2:1, so it is a
+# touch darker.
+BLASTAM_CELL_BG  <- c("#F4F7F9", "#EBF1F8", "#C7DBEF", "#93B8DE", "#4676B2", NSW_BRAND_BLUE)
+BLASTAM_CELL_FG  <- c(rep(NSW_BRAND_DARK, 4), "#FFFFFF", "#FFFFFF")
+BLASTAM_CELL_SUB <- c(rep(NSW_GREY_04, 3), NSW_BRAND_DARK, "#FFFFFF", "#FFFFFF")
 
 CONTACT_NAME  <- "Ben Ovenden"
 CONTACT_EMAIL <- "ben.ovenden@dpird.nsw.gov.au"

@@ -6,7 +6,7 @@ The 2026-09-07, 09-14 and 09-21 emails all carried the map "weather to
 2026-08-29" (identical maxima, 0.058% and 10 days) beside a town table that was
 current; the 09-07 email had 31 towns of "no data". Diagnosed from
 `map_stats.txt`, `weighted_spend.csv`, `run_log.csv` and the committed cache. The
-offline suite went from 62 tests to 222; all pass.
+offline suite went from 62 tests to 228; all pass.
 
 | # | Item | Fix | Guarded by |
 | --- | --- | --- | --- |
@@ -30,6 +30,7 @@ offline suite went from 62 tests to 222; all pass.
 | Q | **The email arrived at 7 pm Monday.** The Monday-UTC cron (00:47) modelled one day later than a Sunday-UTC one could, but that day is not published until about 11:30 Sydney time, and GitHub started every scheduled run of this repository 5 h 30 to 7 h 13 late through October 2026. The maintainer asked for delivery by 7 am Monday. | The weekly run fires at 06:17 UTC **Sunday** and models to the previous Sunday, one day older than before; on time the email arrives about 7:30 pm Sunday, on a bad day about 2:30 am Monday, and the cron can be nearly 12 h late before 7 am is missed. The top-ups move with it, to Wednesday and Saturday, so Saturday remains the day-before insurance and neither shares the weekly run's UTC day. A scheduled run is dated for the Monday the email is for, whenever GitHub starts it; the window is the same either way. | tests 24, 22 |
 | R | `run_log.csv` was attached to every email. | Dropped from the email at the maintainer's request (2026-10-26). The file is still committed to the repository on every run and included in the run's artifact; the email carries the two trends CSVs and the two maps. | test 23 |
 | S | The small print under the table, as the maintainer wanted it worded. | Edited 2026-10-26 after a line-by-line accuracy check against the model code: headings take colons, the EPIRICE bands are called arbitrary, the rain-driven note and the 1.14 infections-per-site figure are dropped, the canopy humidity caveat cites Lanoiselet et al. without the Yanco figure and reads as "best read as lower bounds". Every number still comes from `blast_config.R` or the model's own curve. | test 29 |
+| T | **The 7 day figure in the BLASTAM column could not be read on the darker cells.** "(7d n)" was one fixed grey on every shade of the blue ramp: 2.3:1 on the 6-10 shade and 1.15:1 on the 11-15 one, exactly where the recent count matters most. The unjudged-night asterisk, a fixed orange, had the same problem. | The cell takes its text colours from its shade (`BLASTAM_CELL_FG`, `BLASTAM_CELL_SUB`): dark on the four lighter shades, white on the two darker ones. The 11-15 shade is a touch darker (#4676B2, was #4B7EBD) so that white reaches 4.5:1 on it. Every count and every 7 day figure now reaches 4.5:1. | test 30 |
 
 **First live runs of the above (28 Sep and 1 Oct 2026).** Monday: map back on
 the current window (20 Sep) with 7,272 cells modelled and the last 449 of the 29

@@ -528,12 +528,15 @@ pill <- function(l, n) {
                  "background:%s;margin-right:6px;'></span>%s %d</span>"),
           s$bg, s$fg, s$dot, tools::toTitleCase(l), n)
 }
-bl_bg <- function(n) {
-  if (is.na(n)) return(BLASTAM_CELL_BG[1])
-  i <- findInterval(n, c(0, 1, 3, 6, 11, 16)) 
-  BLASTAM_CELL_BG[max(1L, min(length(BLASTAM_CELL_BG), i))]
+# Which shade a count falls in, then the background, the colour of the count and
+# the colour of the smaller "(7d n)" figure for that shade (blast_config.R).
+bl_idx <- function(n) {
+  if (is.na(n)) return(1L)
+  max(1L, min(length(BLASTAM_CELL_BG), findInterval(n, c(0, 1, 3, 6, 11, 16))))
 }
-bl_fg <- function(n) if (!is.na(n) && n >= 11) "#FFFFFF" else NSW_BRAND_DARK
+bl_bg  <- function(n) BLASTAM_CELL_BG[bl_idx(n)]
+bl_fg  <- function(n) BLASTAM_CELL_FG[bl_idx(n)]
+bl_sub <- function(n) BLASTAM_CELL_SUB[bl_idx(n)]
 
 row_html <- character(0); cur <- ""
 for (k in seq_len(nrow(results))) {
@@ -545,12 +548,15 @@ for (k in seq_len(nrow(results))) {
              "padding:6px 8px;border-top:1px solid %s;'>%s</td></tr>"),
       NSW_GREY_01, NSW_GREY_02, cur))
   }
+  # The 7 day figure and the unjudged-night asterisk take their colour from the
+  # shade they sit on. Both used to be fixed (grey, orange) and vanished on the
+  # darker cells.
   blv <- if (is.na(r$blast_events)) "-" else
-    sprintf("%d<span style='color:#6b7378;font-size:11px;'> (%dd %d)</span>%s",
-            r$blast_events, BLASTAM_RECENT_DAYS, r$blast_recent,
+    sprintf("%d<span style='color:%s;font-size:11px;'> (%dd %d)</span>%s",
+            r$blast_events, bl_sub(r$blast_events), BLASTAM_RECENT_DAYS, r$blast_recent,
             if (!is.na(r$blast_unjudged) && r$blast_unjudged > 0)
-              sprintf("<span title='%d night(s) could not be judged' style='color:%s;'>&nbsp;*</span>",
-                      r$blast_unjudged, COL_MODERATE) else "")
+              sprintf("<span title='%d night(s) could not be judged' style='color:%s;font-weight:bold;'>&nbsp;*</span>",
+                      r$blast_unjudged, bl_fg(r$blast_events)) else "")
   row_html <- c(row_html, sprintf(
     paste0("<tr><td style='padding:5px 8px;border-top:1px solid #EEE;'>%s</td>",
            "<td style='padding:5px 8px;border-top:1px solid #EEE;text-align:right;",
@@ -571,7 +577,7 @@ bl_legend <- paste0(
            "border-radius:3px;margin-right:4px;font-size:12px;'>%s</span>"), bg, fg, lab),
     c("0", "1-2", "3-5", "6-10", "11-15", "16-21"),
     BLASTAM_CELL_BG,
-    c(rep(NSW_BRAND_DARK, 4), "#FFFFFF", "#FFFFFF")), collapse = ""))
+    BLASTAM_CELL_FG), collapse = ""))
 
 html <- paste0(
 "<div style='font-family:Arial,Helvetica,sans-serif;color:", NSW_BRAND_DARK,
