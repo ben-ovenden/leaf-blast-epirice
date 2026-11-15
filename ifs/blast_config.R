@@ -765,6 +765,48 @@ blast_data_end <- function(run_date = blast_run_date()) {
   if (!is.na(d) && d <= ceiling_day) d else ceiling_day - IFS_UNPROBED_LAG_DAYS
 }
 
+# WHICH EMAIL IS THE MAIN ONE (IFS_ROLE). The maintainer will choose between the
+# two sources, and wants the choice easy to make and easy to take back. So the
+# switch is not a file: it is whether the PRODUCT'S WEEKLY WORKFLOW is switched
+# on in GitHub (Actions, the workflow, "Disable workflow" / "Enable workflow").
+# Each Sunday ifs_weekly.yml asks GitHub (main_email_role.R) and sets IFS_ROLE:
+#
+#   trial   the product's weekly workflow is on. This email is sent beside it,
+#           marked as a trial; Sunday's API allowance is the product's, so only
+#           the towns are fetched and the map comes from Friday's cache.
+#   main    the product's weekly workflow is off (or gone). This is THE email:
+#           no trial marking, and Sunday's allowance is free, so the run fetches
+#           its own grid and the maps reach Saturday like the town table. That
+#           is the newest map a 7 am Monday email can carry: the model's Sunday
+#           does not end until mid-morning on Monday.
+#
+# Switching back is the same click. Nothing is deleted either way, and while the
+# other source's top-up workflow is left on its cache stays warm, so it has a
+# full map again on its first Sunday. See README.md, "Switching the main email".
+#
+# If GitHub cannot be asked the answer is "trial": assuming the product is
+# running costs a week of older maps; assuming it is not could spend two grids'
+# worth of calls on one day. For the same reason "main" is refused on a day the
+# product has already spent more than a town fetch.
+IFS_PRODUCT_WEEKLY_WORKFLOW <- "weekly_blast.yml"
+IFS_MAIN_MAX_PRODUCT_SPEND  <- 500      # weighted calls the product may have spent today
+ifs_role_from_state <- function(status, state, product_spent = 0) {
+  status <- suppressWarnings(as.integer(status))[1]
+  state  <- as.character(state)[1]
+  off <- if (identical(status, 404L)) TRUE                      # the workflow no longer exists
+         else if (!identical(status, 200L) || is.na(state)) FALSE   # could not ask
+         else state %in% c("disabled_manually", "disabled_inactivity", "deleted")
+  spent <- suppressWarnings(as.numeric(product_spent))[1]
+  if (isTRUE(off) && !isTRUE(spent > IFS_MAIN_MAX_PRODUCT_SPEND)) "main" else "trial"
+}
+IFS_ROLE <- tolower(trimws(Sys.getenv("IFS_ROLE", "")))
+if (!IFS_ROLE %in% c("main", "trial")) IFS_ROLE <- "trial"
+if (identical(IFS_ROLE, "main")) {
+  SOURCE_TAG  <- ""                  # no "(IFS trial)" in the header, no "IFS:" on the maps
+  SOURCE_NOTE <- ""                  # no trial banner
+  HEALTH_MAX_MAP_BEHIND_DAYS <- 1L   # the map is fetched in the same run as the towns
+}
+
 ################################################################################
 # 7. Citation (added to the summary and to the heatmap footer)
 ################################################################################

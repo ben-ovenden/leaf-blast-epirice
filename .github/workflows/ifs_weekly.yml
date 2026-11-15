@@ -29,6 +29,13 @@ name: IFS trial weekly run (second email, by 7am Monday AET)
 # Its 270 calls fit beside the regular run on any day: that run's own ceiling is
 # 9,500.
 #
+# MAIN OR TRIAL. The run asks GitHub whether the regular email's weekly workflow
+# is switched on. On: this is the trial beside it, as described above. Off: this
+# IS the email; Sunday's allowance is then free, so the run fetches its own grid
+# (maps to Saturday, like the towns) and drops the trial marking. Switching the
+# regular workflow off and on is the whole switch, either way; see ifs/README.md,
+# "Switching the main email".
+#
 # TO END THE TRIAL keeping ERA5: delete this workflow, ifs_topup.yml and ifs/.
 on:
   schedule:
@@ -43,9 +50,14 @@ on:
         description: 'Minutes to wait for the day''s first IFS run to reach the archive. Leave blank for the default (90); 0 for a quick test.'
         required: false
         default: ''
+      test_role:
+        description: 'TEST ONLY. Run as "main" or "trial" whatever the regular workflow''s state. The grid fetch is capped at 30 calls and no email is sent. Leave blank for a real run.'
+        required: false
+        default: ''
 
 permissions:
   contents: write
+  actions: read     # to ask whether the regular email's workflow is switched on
 
 # Two runs must never write the weather cache at once.
 concurrency:
@@ -212,12 +224,52 @@ jobs:
               echo "::warning title=Archive edge not probed::probe returned '$DE'; the scripts fall back to the arithmetic edge" ;;
           esac
 
-      # THE MAP IS DRAWN FROM THE CACHE, NOT FETCHED (see WHAT IT FETCHES at the
-      # top). map_window_edge.R names the newest day the cached grid supports, and
-      # the grid step is given that day and a budget of nothing, so it draws a
-      # complete map at the day the last top-up reached. If Friday's top-up did not
-      # run the map is older, and run_blast.R's health check says so.
+      # WHICH EMAIL IS THE MAIN ONE THIS WEEK (see MAIN OR TRIAL at the top and
+      # section 6b of ifs/blast_config.R). main_email_role.R asks GitHub about the
+      # regular email's weekly workflow; anything it cannot find out reads as
+      # "trial". The product's spend ledger is handed over as main has it now, so
+      # "main" is refused on a day the product has already fetched.
+      #   trial: IFS_GRID_CAP=0, the map comes from the cache.
+      #   main:  no cap, the grid is fetched in this run.
+      - name: Main or trial
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TEST_ROLE: ${{ github.event.inputs.test_role }}
+        run: |
+          L="${RUNNER_TEMP:-/tmp}/product_spend.csv"
+          if git fetch -q --no-tags --depth 1 origin "${GITHUB_REF_NAME}" 2>/dev/null \
+             && git show FETCH_HEAD:blast_outputs/weighted_spend.csv > "$L" 2>/dev/null; then
+            export IFS_PRODUCT_LEDGER="$L"
+          fi
+          ROLE=$(Rscript main_email_role.R | sed -n 's/^ROLE=//p' | tail -n 1)
+          case "$ROLE" in main|trial) ;; *) ROLE=trial ;; esac
+          CAP=""; [ "$ROLE" = trial ] && CAP=0
+          if [ -n "$TEST_ROLE" ]; then
+            case "$TEST_ROLE" in
+              main)  ROLE=main;  CAP=30 ;;
+              trial) ROLE=trial; CAP=0 ;;
+              *) echo "::error title=Role test::test_role must be 'main' or 'trial', not '$TEST_ROLE'"; exit 1 ;;
+            esac
+            echo "IFS_ROLE_TEST=1" >> "$GITHUB_ENV"
+            echo "::notice title=Role test::running as '$ROLE' whatever the regular workflow's state; grid capped at $CAP calls, no email"
+          fi
+          echo "IFS_ROLE=$ROLE" >> "$GITHUB_ENV"
+          echo "IFS_GRID_CAP=$CAP" >> "$GITHUB_ENV"
+          if [ "$ROLE" = main ]; then
+            echo "::notice title=Main email::the regular email's workflow is off, so this run is the main email and fetches its own map"
+          else
+            echo "::notice title=Trial email::the regular email's workflow is on, so this run is the trial beside it; map from the cache"
+          fi
+
+      # AS THE TRIAL, THE MAP IS DRAWN FROM THE CACHE, NOT FETCHED (see WHAT IT
+      # FETCHES at the top). map_window_edge.R names the newest day the cached grid
+      # supports, and the grid step is given that day and a budget of nothing, so it
+      # draws a complete map at the day the last top-up reached. If Friday's top-up
+      # did not run the map is older, and run_blast.R's health check says so.
+      # AS THE MAIN EMAIL this step is skipped: the grid step fetches to the probed
+      # edge with the full budget.
       - name: Map window from the cache
+        if: env.IFS_ROLE != 'main'
         run: |
           ME=$(Rscript map_window_edge.R | sed -n 's/^EDGE=//p' | tail -n 1)
           case "$ME" in
@@ -230,13 +282,14 @@ jobs:
 
       - name: Continental heatmaps
         env:
-          BLAST_WEIGHTED_CAP: "0"
-          BLAST_DATA_END: ${{ env.BLAST_MAP_DATA_END }}
+          BLAST_WEIGHTED_CAP: ${{ env.IFS_GRID_CAP }}
+          BLAST_DATA_END: ${{ env.BLAST_MAP_DATA_END || env.BLAST_DATA_END }}
         run: Rscript run_blast_grid.R
 
-      # Nothing was fetched, but the grid step trims rows older than the cache
-      # keeps, so the cache is saved as usual. One parentless commit, force-pushed
-      # to cache-data-ifs and nowhere else.
+      # As the trial nothing was fetched, but the grid step trims rows older than
+      # the cache keeps; as the main email this is the week's fetch. Either way the
+      # cache is saved here, before the town table. One parentless commit,
+      # force-pushed to cache-data-ifs and nowhere else.
       - name: Save weather cache
         run: |
           f=blast_outputs_ifs/weather_cache.csv.gz; v=blast_outputs_ifs/cache_version.txt
@@ -289,7 +342,10 @@ jobs:
           want=$(Rscript -e 'source("blast_config.R"); cat(sprintf("%.2f", GRID_RES_FINEST))')
           have=$(cut -d'|' -f9 blast_outputs_ifs/map_stats.txt 2>/dev/null | tr -d '[:space:]' || true)
           healthy=0; grep -q '^degraded=0' blast_outputs_ifs/run_status.txt 2>/dev/null && healthy=1
-          if [ -f "$latch" ]; then
+          if [ "${IFS_ROLE_TEST:-0}" = 1 ]; then
+            echo "SEND_IFS_EMAIL=0" >> "$GITHUB_ENV"
+            echo "::notice title=Role test::a role test never emails and never starts the email"
+          elif [ -f "$latch" ]; then
             echo "SEND_IFS_EMAIL=1" >> "$GITHUB_ENV"
             echo "The second email started on $(cat "$latch"); sending."
           elif [ -n "$have" ] && [ "$have" = "$want" ] && [ "$healthy" = 1 ]; then
@@ -299,6 +355,9 @@ jobs:
           else
             echo "SEND_IFS_EMAIL=0" >> "$GITHUB_ENV"
             echo "::notice title=IFS trial::map complete to '${have:-nothing yet}' of $want deg, healthy run: $healthy; still accumulating, no email this run"
+            if [ "${IFS_ROLE:-trial}" = main ]; then
+              echo "::warning title=No email this week::the regular email's workflow is off and the IFS email has not started yet (its grid is not complete or the run is not healthy). Switch the regular workflow back on until it has."
+            fi
           fi
 
       # Never let a missing optional file abort the step. `run:` uses bash -e, so
