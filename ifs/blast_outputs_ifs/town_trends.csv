@@ -1,32 +1,32 @@
-town,2026-11-12
-"Deniliquin",0
-"Dubbo",0.0026
-"Griffith",0.0022
-"Lismore",0.0397
-"Moree",0.0292
-"Borroloola",0
-"Humpty Doo",0.0129
-"Jabiru",0
-"Katherine",0.0023
-"Timber Creek",0.0023
-"Archer River",0
-"Bamaga",0
-"Biloela",0.03
-"Burketown",0.0267
-"Clermont",0.0487
-"Croydon",0.0083
-"Dalby",0.0239
-"Emerald",0.0273
-"Goondiwindi",0.0372
-"Gympie",0.0456
-"Home Hill",0.0185
-"Lakeland",0
-"Malanda",0.0105
-"Marian",0.018
-"Proserpine",0.0291
-"Rolleston",0.0684
-"Roma",0.0184
-"Theodore",0.0339
-"Warwick",0.0409
-"Fitzroy Crossing",0
-"Kununurra",0
+town,2026-11-12,2026-11-13
+"Deniliquin",0,0
+"Dubbo",0.0026,0.0044
+"Griffith",0.0022,0.0036
+"Lismore",0.0397,0.0389
+"Moree",0.0292,0.0311
+"Borroloola",0,0
+"Humpty Doo",0.0129,0.0164
+"Jabiru",0,0
+"Katherine",0.0023,0.0024
+"Timber Creek",0.0023,0.0025
+"Archer River",0,0
+"Bamaga",0,0
+"Biloela",0.03,0.0349
+"Burketown",0.0267,0.0291
+"Clermont",0.0487,0.0516
+"Croydon",0.0083,0.0087
+"Dalby",0.0239,0.0293
+"Emerald",0.0273,0.0314
+"Goondiwindi",0.0372,0.039
+"Gympie",0.0456,0.0616
+"Home Hill",0.0185,0.0194
+"Lakeland",0,0
+"Malanda",0.0105,0.0126
+"Marian",0.018,0.0188
+"Proserpine",0.0291,0.0305
+"Rolleston",0.0684,0.0751
+"Roma",0.0184,0.0194
+"Theodore",0.0339,0.0358
+"Warwick",0.0409,0.0533
+"Fitzroy Crossing",0,0
+"Kununurra",0,0
