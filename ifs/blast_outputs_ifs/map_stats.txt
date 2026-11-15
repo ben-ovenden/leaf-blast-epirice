@@ -1,1 +1,1 @@
-25|5.27|20|0.30|gz|13|gz|2026-11-12||0|0.0494|3||epirice+blastam|0||
+30|4.81|25|0.30|gz|16|gz|2026-11-12||28|0.0494|4|window fell back 1 day to 2026-11-12 (only 30% of cached cells reached 2026-11-13)|epirice+blastam|0||21 cached cell(s) did not fit the 28 weighted budget (about 21 more needed)
