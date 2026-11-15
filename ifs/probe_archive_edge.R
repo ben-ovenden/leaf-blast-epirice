@@ -50,15 +50,33 @@ poll <- ARCHIVE_EDGE_POLL_MIN
 # model day: the day cut in local solar time, less the longitude in hours.
 need <- as.integer(ceiling(BLASTAM_DAY_CUT_HOUR - GRID_EXTENT[1] / 15))
 
+# IFS TRIAL: WHAT HAS HAPPENED, NOT WHAT IS FORECAST. The IFS archive holds
+# forecast hours for days ahead, so the hourly probe below finds "data" for
+# today whatever the time is. What makes today usable is that a forecast run
+# started today has landed (see section 6b of blast_config.R); the archive's
+# metadata names the newest run it holds. One small static file, not an API call.
+# Returns that run's start in seconds since 1970, or NA.
+ifs_newest_run <- function() {
+  tryCatch({
+    r <- curl::curl_fetch_memory(IFS_META_URL, handle = curl::new_handle(timeout = 30, connecttimeout = 20))
+    if (!identical(as.integer(r$status_code), 200L)) return(NA_real_)
+    as.numeric(jsonlite::fromJSON(rawToChar(r$content))$last_run_initialisation_time)
+  }, error = function(e) NA_real_)
+}
+
 t0 <- Sys.time(); n_probe <- 0L; found <- as.Date(NA)
 repeat {
   n_probe <- n_probe + 1L
   p <- om_probe_archive_edge(edge, ARCHIVE_EDGE_PROBE_LON, ARCHIVE_EDGE_PROBE_LAT, need)
   waited <- as.numeric(difftime(Sys.time(), t0, units = "mins"))
   if (identical(p$status, "ok") && !is.na(p$date)) {
-    found <- p$date
-    say(sprintf("Archive probe %d at %s UTC: newest usable day %s (wanted %s).",
-                n_probe, format(Sys.time(), "%H:%M", tz = "UTC"), format(found), format(edge)))
+    run_day <- ifs_settled_day(ifs_newest_run())
+    # No word on the newest run: yesterday, whose first hours are always settled.
+    settled <- if (is.na(run_day)) edge - IFS_UNPROBED_LAG_DAYS else run_day
+    found <- min(p$date, settled)
+    say(sprintf("Archive probe %d at %s UTC: data to %s, newest forecast run in the archive started %s, so the newest usable day is %s (wanted %s).",
+                n_probe, format(Sys.time(), "%H:%M", tz = "UTC"), format(p$date),
+                if (is.na(run_day)) "unknown" else format(run_day), format(found), format(edge)))
     if (found >= edge) break
   } else {
     say(sprintf("Archive probe %d at %s UTC got no answer (%s %s).",
@@ -66,17 +84,17 @@ repeat {
     if (identical(p$status, "quota")) break     # waiting on a spent quota helps nobody
   }
   if (waited + poll > wait_max) break
-  say(sprintf("  waiting %d min for the archive's daily update (%.0f of at most %.0f min used).",
+  say(sprintf("  waiting %d min for today's first forecast run to reach the archive (%.0f of at most %.0f min used).",
               as.integer(poll), waited, wait_max))
   Sys.sleep(poll * 60)
 }
 
-out <- if (is.na(found)) edge else min(found, edge)
+out <- if (is.na(found)) edge - IFS_UNPROBED_LAG_DAYS else min(found, edge)
 if (is.na(found)) {
-  say(sprintf("No usable answer from the archive; falling back to the arithmetic edge %s.", format(edge)))
+  say(sprintf("No usable answer from the archive; falling back to %s, yesterday, whose first hours are always settled.", format(out)))
 } else if (out < edge) {
-  say(sprintf("The archive is %d day(s) behind the arithmetic edge; fetching to %s so that every longitude gets a complete last day.",
-              as.integer(edge - out), format(out)))
+  say(sprintf("No forecast run started today has reached the archive yet; fetching to %s, so that no hour modelled is a forecast.",
+              format(out)))
 }
 # A probe is one weighted call (seven days, three variables). Keep the ledger honest.
 tryCatch(om_spend_add(file.path(SCRIPT_DIR, OUTPUT_DIR, SPEND_LEDGER_FILE), n_probe, "probe"),

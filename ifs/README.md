@@ -12,25 +12,93 @@ directory is shared with it, and nothing in the root was changed for it.**
 | | Product (repository root) | Trial (this directory) |
 | --- | --- | --- |
 | Scripts, config, tests | the root's own files | its own copy of every one, here |
-| Weather | ERA5, 0.25 degrees, 6 days behind | ECMWF IFS, 9 km, held back 2 days |
+| Weather | ERA5, 0.25 degrees, 6 days behind | ECMWF IFS, 9 km, to the newest settled day |
 | Outputs | `blast_outputs/` | `ifs/blast_outputs_ifs/` |
 | Cache branch | `cache-data` | `cache-data-ifs` |
 | Workflows | `weekly_blast.yml`, `midweek_topup.yml` | `ifs_weekly.yml`, `ifs_topup.yml` |
-| UTC days | Sunday; Wednesday, Saturday | Monday; Tuesday, Thursday, Friday |
+| Grid fetched (UTC days) | Sunday; Wednesday, Saturday | Monday, Tuesday, Thursday, Friday |
+| Weekly email run | Sunday UTC | Sunday UTC (towns only; map from the cache) |
 | Concurrency group | `blast-grid` | `blast-grid-ifs` |
-| Email | Monday by 7 am, weather to the previous Sunday | Monday evening, weather to Friday, subject `[IFS trial] ...` |
+| Email | Monday by 7 am, towns and maps to the previous Sunday | Monday by 7 am, towns to Saturday, maps to Thursday, subject `[IFS trial] ...` |
 
 The two workflows run every step with `working-directory: ifs`. The root scripts
 contain no switch and no mention of the trial; test 31 here fails if that
 changes. What the two still share is the repository itself, its `main` branch
-(each commits its own run state there, in its own directory) and the mail
-secrets.
+(each commits its own run state there, in its own directory), the mail secrets,
+and the weather API's free daily allowance (see the next section).
 
 The first version of the trial (15 November 2026, PR 15) was a
 `BLAST_SOURCE=ifs` switch inside the product's scripts. The maintainer asked the
 same day for it to be completely separate, so the product's files were put back
 exactly as they were at the tag `era5-stable-2026-11-15` and the trial became
-this directory.
+this directory (PR 16).
+
+## The schedule, and why the map is two days older than the town table
+
+The free weather API allows 10,000 weighted calls a day. Refreshing the whole map
+grid (7,721 cells) costs about 7,700, and the product does that on Sunday,
+Wednesday and Saturday UTC. So the trial cannot refresh its own grid on those
+days without the two together going over the allowance.
+
+- **Monday, Tuesday, Thursday, Friday UTC** (`ifs_topup.yml`, 07:07): the trial
+  fetches its grid, a whole day's budget each time.
+- **Sunday UTC** (`ifs_weekly.yml`, 06:47): the email run. It fetches only the 31
+  towns (150 to 270 calls, which fit beside the product's run even at the
+  product's own ceiling of 9,500) and draws the map from the cache as Friday's
+  top-up left it. `map_window_edge.R` names that day for the grid step.
+
+GitHub starts this repository's schedules five to seven hours late, so the
+Sunday run starts at about midday to 2 pm UTC and the email arrives at about
+midnight to 2 am on Monday, Sydney time.
+
+The result, in the Monday email: **town table to Saturday, maps to Thursday**.
+The health check allows the map to be two days behind the table
+(`HEALTH_MAX_MAP_BEHIND_DAYS`); three means Friday's top-up did not run, and the
+email says so. The subject carries both dates.
+
+To have the maps to Saturday as well, the trial's grid would have to be fetched
+on Sunday, which needs either the product's Sunday allowance (if IFS is kept and
+ERA5 switched off) or a paid API plan.
+
+## The latest weather that has happened
+
+The IFS archive is stitched from forecast runs started at 00, 06, 12 and 18 UTC.
+Each reaches the archive about six hours after it starts, and the archive then
+runs on for days into the future, so "has data" does not mean "has happened".
+
+A UTC day may be the last day fetched once a forecast run started on that day
+has landed: the only hours of it the models use are its first three, and those
+are then a same-day run's own first hours. The archive publishes which run it
+holds, and `probe_archive_edge.R` asks. If it cannot tell, or the day's first
+run has not landed after the wait, the window ends a day earlier. A run that
+has not asked at all (a local run) never uses today.
+
+So a Sunday run models to Saturday, where the product, six days behind, models
+to the Sunday before.
+
+## Filling the grid, and when the second email starts
+
+From an empty cache every cell costs 4.86 weighted calls. While any cell remains
+to be added the grid runner spends its budget on new cells first
+(`IFS_ADD_FIRST`) and refreshes cached ones only with what is left; the
+product's order, refresh first, is right for a full grid and takes about twelve
+fetch days to fill an empty one. Add-first takes about five, then one more to
+bring every cell to the same day.
+
+**The second email starts only when the data is sufficient**: the map complete
+at 0.30 degrees AND the run healthy (every town modelled, the map current,
+almost no cell grey). The run that first qualifies writes
+`blast_outputs_ifs/email_started.txt`, and every weekly run after that emails,
+as the product does. Until then the weekly run still models the towns, draws
+what map it can and keeps the results as a workflow artifact, and an incomplete
+map is reported as a notice, not a failed run.
+
+From the first scheduled top-up on Monday 16 November 2026: grid full on about
+Monday 23 November, every cell on one day by Tuesday 24, and the first email on
+**Monday 30 November**, after the first Friday top-up of a full grid.
+
+It goes to the `MAIL_TO` recipients unless a `MAIL_TO_IFS` secret names a
+different list.
 
 ## What differs from the product's code
 
@@ -42,17 +110,18 @@ only that while the models are the same.
 
 The rest differ only as follows.
 
-- `blast_config.R`, section 6b: the IFS archive (`ecmwf_ifs`), a two day lag,
-  the output directory, the top-up age limit, and the wording that names the
-  source (`WEATHER_NAME`, the "Trial version" banner).
-- `run_blast.R`, `run_blast_grid.R`: print that wording (email header and
-  banner, "IFS:" in map titles).
+- `blast_config.R`, section 6b: the IFS archive (`ecmwf_ifs`), the window rule
+  above, the output directory, add-first, the map and top-up age limits, and the
+  wording that names the source (`WEATHER_NAME`, the "Trial version" banner).
+- `run_blast_grid.R`: add-first while the grid is filling; "IFS:" in map titles.
+- `run_blast.R`: prints the trial's wording (email header and banner).
+- `probe_archive_edge.R`: asks the archive which forecast run it holds.
+- `map_window_edge.R`: new, the trial's only; the day the weekly map is drawn at.
 - `send_email.py`: subject starts `[IFS trial]`, attachments are named `ifs_...`.
-- `run_blast.R`, `run_blast_grid.R`, `probe_archive_edge.R`: stop unless the
-  config they loaded is the trial's, so they cannot be run against the
-  product's directory by mistake.
+- Every entry script stops unless the config it loaded is the trial's, so none
+  can be run against the product's directory by mistake.
 - `test_offline.R`: the product's suite with the expectations that differ for
-  IFS changed, plus test 31 (the separation).
+  IFS changed, plus test 31 (the separation, the schedule, the fill).
 
 ## Running it
 
@@ -66,30 +135,8 @@ Rscript test_offline.R
 The weather cache is not on `main`. To get it into a local checkout, see the
 comment in `.gitignore` here.
 
-## Why the days differ
-
-Each grid run spends most of a day's free API allowance, so the two must not run
-on the same UTC day. The product keeps its days; the trial takes the other four
-and fires early in the UTC day (00:17) so that a late start cannot spill into a
-product day. That is why the trial's email arrives on Monday evening. If IFS is
-kept, it takes over the Sunday slot and the 7 am delivery.
-
-## Why IFS is held back two days
-
-Its archive is updated every six hours and runs to the end of today, so its
-newest hours are forecast (on 14 November 2026 at 02:41 UTC it returned every
-hour of that day). Two UTC days keeps every modelled hour on settled data.
-
-## Accumulation, and when the second email starts
-
-The trial started with an empty cache and fills it coarse to fine, about twelve
-fetch days: at four a week, about three weeks. Its weekly run models the towns
-and draws whatever map it can from the first week, and keeps the results as a
-workflow artifact, but **the second email starts only when the map is complete
-at 0.30 degrees**. The run that first reaches it writes
-`blast_outputs_ifs/email_started.txt`, and every weekly run after that emails.
-It goes to the `MAIL_TO` recipients unless a `MAIL_TO_IFS` secret names a
-different list.
+A capped top-up proves the workflow in about three minutes and thirty calls:
+`gh workflow run ifs_topup.yml --ref main -f weighted_cap=30`.
 
 ## The two are not interchangeable
 
@@ -105,5 +152,6 @@ separate record and must not be joined to the product's.
 - **Keep ERA5:** delete this directory and the two `ifs_*.yml` workflows; the
   `cache-data-ifs` branch can then be deleted too. Nothing in the root needs
   changing.
-- **Keep IFS:** disable the two ERA5 workflows and move `ifs_weekly.yml` to the
-  Sunday slot (06:17 UTC), so its email arrives by 7 am Monday.
+- **Keep IFS:** disable the two ERA5 workflows. Sunday's allowance is then free,
+  so the weekly run can fetch its own grid again (remove the map-window step and
+  the zero budget from `ifs_weekly.yml`) and the maps reach Saturday too.

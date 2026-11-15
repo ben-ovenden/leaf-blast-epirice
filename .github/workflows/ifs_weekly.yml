@@ -1,4 +1,4 @@
-name: IFS trial weekly run (second email)
+name: IFS trial weekly run (second email, by 7am Monday AET)
 
 # THE IFS TRIAL. A second, separate weekly run on ECMWF IFS weather, sent beside
 # the regular (ERA5) email so the maintainer can compare the two and keep one.
@@ -15,25 +15,28 @@ name: IFS trial weekly run (second email)
 #   * an email that starts only once the map is complete at full resolution
 #     (about twelve fetch days from an empty cache), and then every week.
 #
-# WHEN. Monday in UTC. The ERA5 workflows own Sunday (weekly), Wednesday and
-# Saturday (top-ups) and spend most of a day's free API allowance each time; the
-# IFS workflows use the other four days, so the two never share an allowance.
-# It fires at 00:17 UTC so that even a start twelve hours late stays inside
-# Monday UTC. GitHub starts this repository's schedules five to seven hours late,
-# so expect the email on Monday evening, Sydney time, with weather to Friday.
+# WHEN. Sunday in UTC, like the regular email, so that it is in by 7 am Monday,
+# Sydney time. GitHub starts this repository's schedules five to seven hours
+# late, so 06:47 UTC means a start at about midday to 2 pm UTC and an email at
+# about midnight to 2 am on Monday.
+#
+# WHAT IT FETCHES. The 31 towns, to the newest day the IFS archive has settled
+# (Saturday, on a Sunday run): about 270 weighted calls. It does NOT fetch the
+# map grid. A full map refresh costs about 7,700 calls, and on Sunday the regular
+# run uses about 8,000 of the free 10,000 a day. So the grid is refreshed by
+# ifs_topup.yml on the four UTC days the regular workflows do not run, and this
+# run draws the map from the cache as Friday's top-up left it (to Thursday).
+# Its 270 calls fit beside the regular run on any day: that run's own ceiling is
+# 9,500.
 #
 # TO END THE TRIAL keeping ERA5: delete this workflow, ifs_topup.yml and ifs/.
 on:
   schedule:
-    - cron: '17 0 * * 1'   # 00:17 UTC Monday = 10:17 AEST / 11:17 AEDT
+    - cron: '47 6 * * 0'   # 06:47 UTC Sunday = 16:47 AEST / 17:47 AEDT
   workflow_dispatch:
     inputs:
       run_date:
         description: 'Override the run date (YYYY-MM-DD). Leave blank for today in Sydney.'
-        required: false
-        default: ''
-      weighted_cap:
-        description: 'Cap the grid fetch at N weighted API calls (e.g. 30 for a smoke test). Leave blank for the full budget.'
         required: false
         default: ''
 
@@ -186,9 +189,12 @@ jobs:
       # one western point, waits for the daily update if it has not landed, and
       # prints the newest day that is really there; both R scripts then use it.
       # If the probe cannot answer, they fall back to the arithmetic.
+      #
+      # FOR IFS the question is which forecast run the archive holds: today is
+      # usable once a run started today has landed, about 06:00 UTC (see section
+      # 6b of blast_config.R). The probe waits for it, up to
+      # ARCHIVE_EDGE_WAIT_MAX_MIN, and otherwise answers yesterday.
       - name: Resolve archive edge
-        env:
-          BLAST_EDGE_WAIT_MIN: "0"   # IFS has no daily update to wait for
         run: |
           DE=$(Rscript probe_archive_edge.R | sed -n 's/^EDGE=//p' | tail -n 1)
           case "$DE" in
@@ -199,14 +205,31 @@ jobs:
               echo "::warning title=Archive edge not probed::probe returned '$DE'; the scripts fall back to the arithmetic edge" ;;
           esac
 
+      # THE MAP IS DRAWN FROM THE CACHE, NOT FETCHED (see WHAT IT FETCHES at the
+      # top). map_window_edge.R names the newest day the cached grid supports, and
+      # the grid step is given that day and a budget of nothing, so it draws a
+      # complete map at the day the last top-up reached. If Friday's top-up did not
+      # run the map is older, and run_blast.R's health check says so.
+      - name: Map window from the cache
+        run: |
+          ME=$(Rscript map_window_edge.R | sed -n 's/^EDGE=//p' | tail -n 1)
+          case "$ME" in
+            20[0-9][0-9]-[01][0-9]-[0-3][0-9])
+              echo "BLAST_MAP_DATA_END=$ME" >> "$GITHUB_ENV"
+              echo "Map window pinned: the grid as last refreshed, fetched to $ME" ;;
+            *)
+              echo "::warning title=Map window not found::map_window_edge.R returned '$ME'; the map step uses its default window" ;;
+          esac
+
       - name: Continental heatmaps
         env:
-          BLAST_WEIGHTED_CAP: ${{ github.event.inputs.weighted_cap }}
+          BLAST_WEIGHTED_CAP: "0"
+          BLAST_DATA_END: ${{ env.BLAST_MAP_DATA_END }}
         run: Rscript run_blast_grid.R
 
-      # Saved straight after the fetch, before the town table, so a failure further
-      # down no longer costs the two hours of weather just fetched. One parentless
-      # commit, force-pushed to cache-data-ifs and nowhere else.
+      # Nothing was fetched, but the grid step trims rows older than the cache
+      # keeps, so the cache is saved as usual. One parentless commit, force-pushed
+      # to cache-data-ifs and nowhere else.
       - name: Save weather cache
         run: |
           f=blast_outputs_ifs/weather_cache.csv.gz; v=blast_outputs_ifs/cache_version.txt
@@ -243,26 +266,32 @@ jobs:
       - name: Site table and summary
         run: Rscript run_blast.R
 
-      # THE SECOND EMAIL STARTS WHEN THE MAP IS COMPLETE, and not before: a map of a
-      # half-filled grid beside the ERA5 one would compare coverage, not weather.
-      # map_stats.txt field 9 is the finest lattice that is complete. The first run
-      # to reach full resolution writes email_started.txt, which is committed, and
-      # from then on every run emails, degraded or not, exactly as the product does.
+      # THE SECOND EMAIL STARTS WHEN THE DATA IS SUFFICIENT, and not before: a map of
+      # a half-filled grid beside the ERA5 one would compare coverage, not weather.
+      # Sufficient means both: the map is complete at full resolution
+      # (map_stats.txt field 9 is the finest lattice that is complete), AND the run
+      # is healthy (run_status.txt: every town modelled, the map current, almost no
+      # cell grey). The grid fills over about a week and its cells then need one
+      # refresh to share a window, so the first email follows the first Friday
+      # top-up of a full grid. The first run to qualify writes email_started.txt,
+      # which is committed, and from then on every run emails, degraded or not,
+      # exactly as the product does.
       - name: Decide whether to email
         run: |
           latch=blast_outputs_ifs/email_started.txt
           want=$(Rscript -e 'source("blast_config.R"); cat(sprintf("%.2f", GRID_RES_FINEST))')
           have=$(cut -d'|' -f9 blast_outputs_ifs/map_stats.txt 2>/dev/null | tr -d '[:space:]' || true)
+          healthy=0; grep -q '^degraded=0' blast_outputs_ifs/run_status.txt 2>/dev/null && healthy=1
           if [ -f "$latch" ]; then
             echo "SEND_IFS_EMAIL=1" >> "$GITHUB_ENV"
             echo "The second email started on $(cat "$latch"); sending."
-          elif [ -n "$have" ] && [ "$have" = "$want" ]; then
+          elif [ -n "$have" ] && [ "$have" = "$want" ] && [ "$healthy" = 1 ]; then
             echo "$BLAST_RUN_DATE" > "$latch"
             echo "SEND_IFS_EMAIL=1" >> "$GITHUB_ENV"
-            echo "::notice title=IFS trial::the map is complete to $want deg; the second email starts with this run"
+            echo "::notice title=IFS trial::the map is complete to $want deg and the run is healthy; the second email starts with this run"
           else
             echo "SEND_IFS_EMAIL=0" >> "$GITHUB_ENV"
-            echo "::notice title=IFS trial::map complete to '${have:-nothing yet}' of $want deg; still accumulating, no email this run"
+            echo "::notice title=IFS trial::map complete to '${have:-nothing yet}' of $want deg, healthy run: $healthy; still accumulating, no email this run"
           fi
 
       # Never let a missing optional file abort the step. `run:` uses bash -e, so
@@ -330,6 +359,12 @@ jobs:
             exit 1
           fi
           if grep -q '^degraded=1' "$f"; then
+            if [ "${SEND_IFS_EMAIL:-0}" != "1" ]; then
+              # Still filling the grid: an incomplete or old map is expected and
+              # nothing has been sent. Say so; do not turn the run red.
+              echo "::notice title=IFS trial still accumulating::$(grep '^reasons=' "$f" | cut -d= -f2-)"
+              exit 0
+            fi
             echo "::error title=Degraded blast run::$(grep '^reasons=' "$f" | cut -d= -f2-)"
             exit 1
           fi
