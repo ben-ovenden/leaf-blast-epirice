@@ -255,7 +255,9 @@ jobs:
           fi
           echo "IFS_ROLE=$ROLE" >> "$GITHUB_ENV"
           echo "IFS_GRID_CAP=$CAP" >> "$GITHUB_ENV"
-          if [ "$ROLE" = main ]; then
+          if [ -n "$TEST_ROLE" ]; then
+            :   # the role-test notice above has already said what this run is
+          elif [ "$ROLE" = main ]; then
             echo "::notice title=Main email::the regular email's workflow is off, so this run is the main email and fetches its own map"
           else
             echo "::notice title=Trial email::the regular email's workflow is on, so this run is the trial beside it; map from the cache"
