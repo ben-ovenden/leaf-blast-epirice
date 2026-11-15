@@ -1,32 +1,32 @@
-town,2026-11-12,2026-11-13
-"Deniliquin",0,0
-"Dubbo",1,1
-"Griffith",0,0
-"Lismore",4,5
-"Moree",1,1
-"Borroloola",0,0
-"Humpty Doo",8,7
-"Jabiru",0,0
-"Katherine",1,1
-"Timber Creek",0,0
-"Archer River",0,0
-"Bamaga",0,0
-"Biloela",7,6
-"Burketown",1,1
-"Clermont",3,2
-"Croydon",1,1
-"Dalby",4,5
-"Emerald",3,2
-"Goondiwindi",2,2
-"Gympie",9,9
-"Home Hill",9,9
-"Lakeland",4,4
-"Malanda",20,20
-"Marian",14,13
-"Proserpine",12,12
-"Rolleston",5,4
-"Roma",2,3
-"Theodore",4,3
-"Warwick",1,2
-"Fitzroy Crossing",0,0
-"Kununurra",0,0
+town,2026-11-12,2026-11-13,2026-11-14
+"Deniliquin",0,0,0
+"Dubbo",1,1,2
+"Griffith",0,0,0
+"Lismore",4,5,5
+"Moree",1,1,1
+"Borroloola",0,0,0
+"Humpty Doo",8,7,6
+"Jabiru",0,0,0
+"Katherine",1,1,1
+"Timber Creek",0,0,0
+"Archer River",0,0,0
+"Bamaga",0,0,0
+"Biloela",7,6,5
+"Burketown",1,1,1
+"Clermont",3,2,1
+"Croydon",1,1,1
+"Dalby",4,5,5
+"Emerald",3,2,1
+"Goondiwindi",2,2,2
+"Gympie",9,9,10
+"Home Hill",9,9,9
+"Lakeland",4,4,4
+"Malanda",20,20,19
+"Marian",14,13,12
+"Proserpine",12,12,11
+"Rolleston",5,4,3
+"Roma",2,3,2
+"Theodore",4,3,2
+"Warwick",1,2,2
+"Fitzroy Crossing",0,0,0
+"Kununurra",0,0,0

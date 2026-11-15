@@ -1,12 +1,12 @@
-run_date=2026-11-15
+run_date=2026-11-16
 utc_date=2026-11-15
-town_window_end=2026-11-13
+town_window_end=2026-11-14
 towns_modelled=31
 towns_total=31
 map_window_end=2026-11-12
 map_cells=30
 map_cells_grey=0
-map_behind_days=1
+map_behind_days=2
 degraded=0
 reasons=
-warnings=grid fetch: 21 cached cell(s) did not fit the 28 weighted budget (about 21 more needed)
+warnings=
