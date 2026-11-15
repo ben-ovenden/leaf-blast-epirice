@@ -364,9 +364,22 @@ plan_cap <- wt_cap * (1 - retry_wfrac)
 # full crop-window refetch at ~4.86 for anything older. One interrupted run left
 # 42% of the grid older than a week, and at 4.86 each the weekly budget recovered
 # about 800 of them per run: three weeks on the same 29 August map.
+#
+# IFS TRIAL, WHILE THE GRID IS STILL FILLING (IFS_ADD_FIRST): new cells first.
+# Refresh-first is right for a full grid and slow for an empty one. Every cached
+# cell costs 1.00 a run to bring up to date, so by the time half the cells exist
+# half of each day's budget goes on that and the fill takes about twelve fetch
+# days. While any cell remains to be added, the budget goes to new cells and the
+# cached ones are refreshed only with what is left over; a cell that waits a week
+# still costs 1.00. Once nothing remains to add, this is the product's planner.
+to_add <- targets[!pid %in% cached_pids & !pid %in% benched]
+ADD_FIRST <- isTRUE(get0("IFS_ADD_FIRST")) && nrow(to_add) > 0L
+n_add_first <- if (ADD_FIRST) max(0L, min(nrow(to_add), max_fetch, floor(plan_cap / cost_new))) else 0L
 plan <- om_plan_refresh(last_by, end_date, data_end, add_keep_from,
                         lead = lead, n_vars = length(OM_HOURLY_VARS),
-                        stale_days = stale_days, budget = plan_cap, max_n = max_fetch)
+                        stale_days = stale_days,
+                        budget = max(0, plan_cap - n_add_first * cost_new),
+                        max_n = max_fetch - n_add_first)
 taken <- plan[take == TRUE]
 left  <- plan[take == FALSE]
 refresh_cost <- sum(taken$cost)
@@ -384,10 +397,10 @@ cohorts <- if (nrow(taken) > 0L) {
              behind = character(), total = numeric())
 }
 
-to_add <- targets[!pid %in% cached_pids & !pid %in% benched]
-n_add <- max(0L, min(nrow(to_add),
-                     max_fetch - nrow(taken),
-                     floor(max(0, plan_cap - refresh_cost) / cost_new)))
+n_add <- if (ADD_FIRST) n_add_first else
+  max(0L, min(nrow(to_add),
+              max_fetch - nrow(taken),
+              floor(max(0, plan_cap - refresh_cost) / cost_new)))
 add <- if (n_add > 0) to_add[seq_len(n_add)] else to_add[0]
 
 skipped_fresh <- length(cached_pids) - nrow(plan)
@@ -401,6 +414,9 @@ for (k in seq_len(nrow(cohorts)))
   cat(sprintf("  cohort %d: %5d cell(s) %s day(s) behind; fetch %s to %s (%d days) @ %.2f = %.0f weighted\n",
               k, cohorts$n[k], cohorts$behind[k], format(cohorts$fetch_from[k]),
               format(data_end), cohorts$n_days[k], cohorts$cost[k], cohorts$total[k]))
+if (ADD_FIRST)
+  cat(sprintf("  Filling the grid: %d cell(s) still to add, so new cells go first; cached cells are refreshed with what is left, and all of them once the grid is full.\n",
+              nrow(to_add)))
 if (nrow(left) > 0L)
   cat(sprintf("  %d cached cell(s) (%d to %d days behind, ~%.0f weighted at today's prices) do not fit this run's budget and wait for the next one; each costs %.2f more per week it waits.\n",
               nrow(left), min(left$missing), max(left$missing), sum(left$cost), 7 / 14))
@@ -462,11 +478,13 @@ run_phase <- function(tab, fetch_from, keep_from, deadline, label, cap) {
 cohort_pids  <- function(k, pool) pool[keep_from == cohorts$keep_from[k], pid]
 cohort_label <- function(k, suffix = "")
   sprintf("refresh[%s d behind @%.2f]%s", cohorts$behind[k], cohorts$cost[k], suffix)
+if (ADD_FIRST) run_phase(add, add_fetch_from, add_keep_from, add_deadline, "add", plan_cap)
 for (k in seq_len(nrow(cohorts)))
   run_phase(targets[pid %in% cohort_pids(k, taken)],
-            cohorts$fetch_from[k], cohorts$keep_from[k], refresh_deadline,
+            cohorts$fetch_from[k], cohorts$keep_from[k],
+            if (ADD_FIRST) add_deadline else refresh_deadline,
             cohort_label(k), plan_cap)
-run_phase(add, add_fetch_from, add_keep_from, add_deadline, "add", plan_cap)
+if (!ADD_FIRST) run_phase(add, add_fetch_from, add_keep_from, add_deadline, "add", plan_cap)
 
 # ---- Retry -----------------------------------------------------------------
 # Only points that were ATTEMPTED and failed with a transport or HTTP error.

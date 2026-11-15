@@ -375,14 +375,14 @@ cat("\n16. The data window follows the UTC date, not only the Sydney date\n")
   old <- Sys.getenv(c("BLAST_RUN_DATE", "BLAST_UTC_DATE"), unset = NA)
   Sys.setenv(BLAST_RUN_DATE = "2026-09-21", BLAST_UTC_DATE = "2026-09-20")
   ok("the Monday run (fired while it is still Sunday UTC) counts the lag from the UTC date",
-     blast_data_end(blast_run_date()) == as.Date("2026-09-20") - ARCHIVE_LAG_DAYS,
+     blast_data_end(blast_run_date()) == as.Date("2026-09-20") - ARCHIVE_LAG_DAYS - IFS_UNPROBED_LAG_DAYS,
      sprintf("(got %s)", format(blast_data_end(blast_run_date()))))
   Sys.setenv(BLAST_UTC_DATE = "2026-09-21")
   ok("a run after 10:00 Sydney (same UTC date) is unchanged",
-     blast_data_end(blast_run_date()) == as.Date("2026-09-21") - ARCHIVE_LAG_DAYS)
+     blast_data_end(blast_run_date()) == as.Date("2026-09-21") - ARCHIVE_LAG_DAYS - IFS_UNPROBED_LAG_DAYS)
   Sys.setenv(BLAST_UTC_DATE = "2026-09-25")
   ok("a manual re-run of an earlier run date keeps that date's window",
-     blast_data_end(blast_run_date()) == as.Date("2026-09-21") - ARCHIVE_LAG_DAYS)
+     blast_data_end(blast_run_date()) == as.Date("2026-09-21") - ARCHIVE_LAG_DAYS - IFS_UNPROBED_LAG_DAYS)
   for (v in names(old))
     if (is.na(old[[v]])) Sys.unsetenv(v) else do.call(Sys.setenv, as.list(setNames(old[[v]], v)))
   ok("both runners take the window from blast_data_end()",
@@ -732,17 +732,18 @@ cat("\n22. The midweek top-up: a second fetch day, no maps, no email\n")
      !grepl("send_email.py", ymlm, fixed = TRUE) && !grepl("run_blast.R", ymlm, fixed = TRUE))
   ok("it saves the cache and commits the top-up status",
      grepl("weather_cache.csv.gz", ymlm, fixed = TRUE) && grepl("midweek_status.txt", ymlm, fixed = TRUE))
-  # The trial's top-ups are Tuesday, Thursday and Friday UTC: with Monday's weekly
-  # run, the four days the product's workflows leave free. None may share the
-  # trial's own weekly day, Monday, or its daily quota.
+  # The trial's top-ups are Monday, Tuesday, Thursday and Friday UTC: every day
+  # the product's workflows leave free. They are where the trial's map comes
+  # from; its weekly run, on the product's Sunday, fetches only the towns.
   tl <- strsplit(ymlm, "\n")[[1]]
   tcr <- unlist(regmatches(tl, gregexpr("(?<=cron: ')[^']+", tl, perl = TRUE)))
   tday <- vapply(strsplit(tcr, " "), function(x) x[5], character(1))
   thr  <- vapply(strsplit(tcr, " "), function(x) as.integer(x[2]), integer(1))
-  ok("there are three top-ups a week, Tuesday, Thursday and Friday UTC", setequal(tday, c("2", "4", "5")),
+  ok("there are four top-ups a week, Monday, Tuesday, Thursday and Friday UTC", setequal(tday, c("1", "2", "4", "5")),
      sprintf("(crons: %s)", paste(tcr, collapse = " | ")))
-  ok("none on the weekly run's UTC day", !"1" %in% tday)
-  ok("all early in the UTC day, so a late start stays on its own day", all(thr <= 6L))
+  ok("none on a day the product fetches its grid: Sunday, Wednesday, Saturday", !any(c("0", "3", "6") %in% tday))
+  ok("after the day's first IFS run has landed, and early enough to finish on their own UTC day",
+     all(thr >= 7L & thr <= 9L))
   ok("the weekly email reports the top-up on a weekly cadence",
      grepl("MIDWEEK_MAX_AGE_DAYS", tsrc, fixed = TRUE) && !grepl("Daily top-up", tsrc, fixed = TRUE))
 }
@@ -824,45 +825,44 @@ cat("\n23. The email sender runs end to end, minus the SMTP conversation\n")
   }
 }
 
-cat("\n24. The trial's weekly run fires once, on Monday UTC, a day no product run uses\n")
-# The product's weekly run owns Sunday UTC (email by 7 am Monday) and its top-ups
-# Wednesday and Saturday. Each grid run spends most of a day's free API
-# allowance, so the trial must not run on those days: its weekly run is Monday
-# UTC, early, and its email arrives on Monday evening, Sydney time, with weather
-# to the Friday before. One cron, in UTC, no gate.
+cat("\n24. The trial's weekly run fires once, on Sunday UTC, so the email is in by 7 am Monday\n")
+# It first ran on Monday UTC, a day no product run uses, and its email arrived on
+# Monday evening. The maintainer asked for 7 am Monday, like the regular email,
+# with the latest weather available. A Sunday-UTC run can do that beside the
+# product's because it fetches only the 31 towns (about 270 weighted calls) and
+# draws the map from the cache the top-ups keep. One cron, in UTC, no gate.
 {
   wl <- readLines("../.github/workflows/ifs_weekly.yml", warn = FALSE)
   crons <- unlist(regmatches(wl, gregexpr("(?<=cron: ')[^']+", wl, perl = TRUE)))
   f <- function(s) strsplit(s, " ")[[1]]
   ok("there is exactly one weekly cron", length(crons) == 1L,
      sprintf("(found: %s)", paste(crons, collapse = " | ")))
-  ok("on Monday in UTC: Sunday, Wednesday and Saturday are the product's",
-     length(crons) == 1L && f(crons[1])[5] == "1")
+  ok("on Sunday in UTC, like the regular email",
+     length(crons) == 1L && f(crons[1])[5] == "0")
   hr <- if (length(crons) == 1L) as.integer(f(crons[1])[2]) else NA_integer_
-  # GitHub has started this repository's schedules up to 7 h 13 late, and the run
-  # takes about 2 h. Early in the UTC day keeps the whole run inside Monday UTC,
-  # so it cannot spend the allowance of a day the product runs on.
-  ok("early in the UTC day, so a start twelve hours late is still Monday UTC", isTRUE(hr <= 6L),
-     sprintf("(hour %s)", hr))
+  # 7 am Monday is 20:00 UTC Sunday in AEDT. With no grid to fetch the run takes
+  # about twenty minutes; GitHub has started schedules here up to 7 h 13 late.
+  # The day's first IFS run reaches the archive at about 06:00 UTC.
+  ok("after the day's first IFS run has landed, and early enough that a start 7 h late is done before 7 am Monday",
+     isTRUE(hr >= 6L && hr <= 10L), sprintf("(hour %s)", hr))
   ok("off the hour and half hour, where the scheduler is busiest",
      length(crons) == 1L && !as.integer(f(crons[1])[1]) %in% c(0L, 30L))
   ok("no seasonal gate is left to disagree with it",
      !any(grepl("$SCHED\" = \"", wl, fixed = TRUE)) && !any(grepl("needs: gate", wl, fixed = TRUE)))
   vars <- c("BLAST_RUN_DATE", "BLAST_UTC_DATE", "BLAST_DATA_END"); old <- Sys.getenv(vars, unset = NA)
   Sys.unsetenv("BLAST_DATA_END")
-  Sys.setenv(BLAST_RUN_DATE = "2026-10-19", BLAST_UTC_DATE = "2026-10-19")
-  on_time <- blast_data_end(blast_run_date()) - DAY_CUT_LAG_DAYS
-  Sys.setenv(BLAST_RUN_DATE = "2026-10-20", BLAST_UTC_DATE = "2026-10-19")
-  late <- blast_data_end(blast_run_date()) - DAY_CUT_LAG_DAYS
-  ok("a Monday-UTC run models to the Friday before",
-     on_time == as.Date("2026-10-16"), sprintf("(got %s)", format(on_time)))
-  ok("and to the same day when it starts so late that it is already Tuesday in Sydney",
-     late == on_time, sprintf("(got %s)", format(late)))
-  # Carried over from the product's workflow: a scheduled run whose Sydney date
-  # is a Sunday is dated for the Monday. A Monday-UTC run is never on a Sydney
-  # Sunday, so it does nothing here now; it is what the trial needs if it is
-  # kept and takes over the Sunday slot.
-  ok("the workflow would date a Sunday-evening run for the Monday the email is for",
+  Sys.setenv(BLAST_RUN_DATE = "2026-10-19", BLAST_UTC_DATE = "2026-10-18", BLAST_DATA_END = "2026-10-18")
+  probed <- blast_data_end(blast_run_date()) - DAY_CUT_LAG_DAYS
+  Sys.unsetenv("BLAST_DATA_END")
+  unprobed <- blast_data_end(blast_run_date()) - DAY_CUT_LAG_DAYS
+  ok("a Sunday-UTC run, dated for Monday, models to Saturday once the archive holds a run started that Sunday",
+     probed == as.Date("2026-10-17"), sprintf("(got %s)", format(probed)))
+  ok("and to Friday when the archive could not be asked",
+     unprobed == as.Date("2026-10-16"), sprintf("(got %s)", format(unprobed)))
+  # The email is dated for the Monday morning it is read, whenever GitHub happens
+  # to start the job: the workflow adds a day to a scheduled run's Sydney date
+  # when that date is a Sunday.
+  ok("the workflow dates a scheduled run for the Monday the email is for",
      any(grepl("github.event_name }}\" = \"schedule\"", wl, fixed = TRUE)) &&
      any(grepl("date +%u)\" = \"7\"", wl, fixed = TRUE)) &&
      any(grepl("+ 1 day", wl, fixed = TRUE)))
@@ -936,13 +936,33 @@ cat("\n26. The run asks the archive what it has, rather than assuming\n")
   ok("the hours needed follow from the day cut and the western edge of the grid",
      ceiling(BLASTAM_DAY_CUT_HOUR - GRID_EXTENT[1] / 15) == 3)
   vars <- c("BLAST_RUN_DATE", "BLAST_UTC_DATE", "BLAST_DATA_END"); old <- Sys.getenv(vars, unset = NA)
-  Sys.setenv(BLAST_RUN_DATE = "2026-10-05", BLAST_UTC_DATE = "2026-10-05")   # arithmetic edge 2026-10-03
-  Sys.setenv(BLAST_DATA_END = "2026-10-02")
-  ok("a probed edge behind the arithmetic one is used", blast_data_end(blast_run_date()) == as.Date("2026-10-02"))
-  Sys.setenv(BLAST_DATA_END = "2026-10-04")
-  ok("a probed edge ahead of it is ignored", blast_data_end(blast_run_date()) == as.Date("2026-10-03"))
+  Sys.setenv(BLAST_RUN_DATE = "2026-10-05", BLAST_UTC_DATE = "2026-10-05")   # the ceiling is today
+  Sys.setenv(BLAST_DATA_END = "2026-10-03")
+  ok("a probed edge behind today is used", blast_data_end(blast_run_date()) == as.Date("2026-10-03"))
+  Sys.setenv(BLAST_DATA_END = "2026-10-05")
+  ok("and so is today itself, which only the probe can grant", blast_data_end(blast_run_date()) == as.Date("2026-10-05"))
+  Sys.setenv(BLAST_DATA_END = "2026-10-06")
+  ok("a probed edge in the future is ignored: yesterday", blast_data_end(blast_run_date()) == as.Date("2026-10-04"))
   Sys.setenv(BLAST_DATA_END = "rubbish")
-  ok("and so is one that is not a date", blast_data_end(blast_run_date()) == as.Date("2026-10-03"))
+  ok("and so is one that is not a date", blast_data_end(blast_run_date()) == as.Date("2026-10-04"))
+  Sys.unsetenv("BLAST_DATA_END")
+  ok("with no probe at all the window ends yesterday, never today",
+     blast_data_end(blast_run_date()) == as.Date("2026-10-04"))
+  # The IFS archive holds forecast hours for days ahead, so "has data" is not
+  # "has happened". Today is usable once a forecast run started today has landed.
+  epoch <- function(x) as.numeric(as.POSIXct(x, tz = "UTC"))
+  ok("the archive's newest run names the usable day: an 18 UTC run is still yesterday's",
+     ifs_settled_day(epoch("2026-11-14 18:00")) == as.Date("2026-11-14") &&
+     ifs_settled_day(1794679200) == as.Date("2026-11-14"))
+  ok("and a run started at 00 UTC makes today usable",
+     ifs_settled_day(epoch("2026-11-15 00:00")) == as.Date("2026-11-15"))
+  ok("a missing or unreadable value gives NA, not an error",
+     is.na(ifs_settled_day(NA)) && is.na(ifs_settled_day(NULL)) && is.na(ifs_settled_day("x")))
+  psrc <- paste(readLines("probe_archive_edge.R", warn = FALSE), collapse = "\n")
+  ok("the probe asks the archive which run it holds, and answers yesterday when it cannot tell",
+     grepl("ifs_settled_day(ifs_newest_run())", psrc, fixed = TRUE) && grepl("IFS_META_URL", psrc, fixed = TRUE) &&
+     grepl("settled <- if (is.na(run_day)) edge - IFS_UNPROBED_LAG_DAYS else run_day", psrc, fixed = TRUE) &&
+     grepl("out <- if (is.na(found)) edge - IFS_UNPROBED_LAG_DAYS else min(found, edge)", psrc, fixed = TRUE))
   for (v in vars) if (is.na(old[[v]])) Sys.unsetenv(v) else do.call(Sys.setenv, as.list(setNames(old[[v]], v)))
   wk <- paste(readLines("../.github/workflows/ifs_weekly.yml", warn = FALSE), collapse = "\n")
   tu <- paste(readLines("../.github/workflows/ifs_topup.yml", warn = FALSE), collapse = "\n")
@@ -950,8 +970,8 @@ cat("\n26. The run asks the archive what it has, rather than assuming\n")
     ok("the workflow probes after the tests and before the grid script",
        regexpr("name: Offline tests", y, fixed = TRUE) < regexpr("name: Resolve archive edge", y, fixed = TRUE) &&
        regexpr("name: Resolve archive edge", y, fixed = TRUE) < regexpr("run: Rscript run_blast_grid.R", y, fixed = TRUE))
-  ok("neither run waits at the archive edge: IFS has no daily update to wait for",
-     grepl("BLAST_EDGE_WAIT_MIN: \"0\"", wk, fixed = TRUE) && grepl("BLAST_EDGE_WAIT_MIN: \"0\"", tu, fixed = TRUE))
+  ok("the weekly run waits for today's first forecast run; a top-up waits an hour at most",
+     !grepl("BLAST_EDGE_WAIT_MIN", wk, fixed = TRUE) && grepl("BLAST_EDGE_WAIT_MIN: \"60\"", tu, fixed = TRUE))
   ok("and the weekly job's timeout allows for that wait",
      as.integer(sub(".*timeout-minutes: ([0-9]+).*", "\\1", wk)) >=
        ARCHIVE_EDGE_WAIT_MAX_MIN + GRID_MAX_MINUTES + GRID_RESERVE_MINUTES + TOWN_QUOTA_WAIT_MAX_MIN)
@@ -1133,10 +1153,12 @@ cat("\n31. The IFS trial is a separate copy: no code, directory, cache branch or
 # own copy of every script and its settings written into its own config, and the
 # product's files are exactly what they were before the trial.
 {
-  ok("this directory's config is the trial's: IFS archive, two days back, its own output directory",
-     isTRUE(get0("IFS_TRIAL")) && OPENMETEO_MODEL == "ecmwf_ifs" && ARCHIVE_LAG_DAYS == 2L &&
-     OUTPUT_DIR == "blast_outputs_ifs" && MIDWEEK_MAX_AGE_DAYS == 3L && WEATHER_NAME == "ECMWF IFS")
-  mine <- c("blast_config.R", "run_blast.R", "run_blast_grid.R", "probe_archive_edge.R", "send_email.py")
+  ok("this directory's config is the trial's: IFS archive, to the newest settled day, its own output directory",
+     isTRUE(get0("IFS_TRIAL")) && OPENMETEO_MODEL == "ecmwf_ifs" && ARCHIVE_LAG_DAYS == 0L &&
+     IFS_UNPROBED_LAG_DAYS == 1L && OUTPUT_DIR == "blast_outputs_ifs" && MIDWEEK_MAX_AGE_DAYS == 3L &&
+     WEATHER_NAME == "ECMWF IFS")
+  mine <- c("blast_config.R", "run_blast.R", "run_blast_grid.R", "probe_archive_edge.R", "map_window_edge.R",
+            "send_email.py")
   ok("the source is written in, not chosen by a switch",
      !any(grepl("BLAST_SOURCE", unlist(lapply(mine, readLines, warn = FALSE)), fixed = TRUE)))
   ok("the email, the summary and the maps name the source and say it is a trial",
@@ -1146,7 +1168,7 @@ cat("\n31. The IFS trial is a separate copy: no code, directory, cache branch or
   # Rscript takes SCRIPT_DIR from the working directory, so `Rscript ifs/run_blast.R`
   # from the repository root would load the PRODUCT's config and write into the
   # product's directory. Each entry script stops unless the config is the trial's.
-  for (f in c("run_blast.R", "run_blast_grid.R", "probe_archive_edge.R")) {
+  for (f in c("run_blast.R", "run_blast_grid.R", "probe_archive_edge.R", "map_window_edge.R")) {
     l <- readLines(f, warn = FALSE)
     i <- grep("source(file.path(SCRIPT_DIR, \"blast_config.R\"))", l, fixed = TRUE)
     g <- grep("if (!isTRUE(get0(\"IFS_TRIAL\")))", l, fixed = TRUE)
@@ -1173,14 +1195,61 @@ cat("\n31. The IFS trial is a separate copy: no code, directory, cache branch or
   ok("and keep their artifacts and their concurrency group to themselves",
      sum(grepl("path: ifs/blast_outputs_ifs/", c(iw, it), fixed = TRUE)) == 2L &&
      sum(grepl("^\\s*group: blast-grid-ifs\\s*$", c(iw, it))) == 2L)
-  ifs_cr <- crons_of(c(iw, it))
-  ok("they run on Monday, Tuesday, Thursday and Friday UTC; Sunday, Wednesday and Saturday are the product's",
-     setequal(dow(ifs_cr), c("1", "2", "4", "5")), sprintf("(crons: %s)", paste(ifs_cr, collapse = " | ")))
-  ok("early in the UTC day, so a start twelve hours late still lands on its own day",
-     length(ifs_cr) >= 2L && all(hr(ifs_cr) <= 6L))
-  ok("the second email waits for a map complete at full resolution, then goes every week",
+  # THE GRID is fetched by the top-ups, on the four UTC days the product leaves
+  # free, a whole day's budget each. THE WEEKLY RUN shares the product's Sunday so
+  # that its email is in by 7 am Monday, and for that reason fetches no grid: the
+  # 31 towns only, and the map from the cache.
+  top_cr <- crons_of(it); wk_cr <- crons_of(iw)
+  ok("the grid is fetched on Monday, Tuesday, Thursday and Friday UTC; Sunday, Wednesday and Saturday are the product's",
+     setequal(dow(top_cr), c("1", "2", "4", "5")), sprintf("(crons: %s)", paste(top_cr, collapse = " | ")))
+  ok("at an hour that finishes on its own UTC day even twelve hours late",
+     length(top_cr) == 4L && all(hr(top_cr) <= 9L))
+  hs <- paste(iw, collapse = "\n")
+  heat <- sub("\n      - name:.*$", "", sub("^.*\n      - name: Continental heatmaps", "", hs))
+  ok("the weekly run, on the product's Sunday, fetches no grid: its map step has a budget of nothing",
+     identical(dow(wk_cr), "0") && grepl("BLAST_WEIGHTED_CAP: \"0\"", heat, fixed = TRUE) &&
+     !grepl("weighted_cap", hs, fixed = TRUE))
+  ok("and draws the map at the day the cached grid supports",
+     regexpr("name: Map window from the cache", hs, fixed = TRUE) > 0 &&
+     regexpr("name: Map window from the cache", hs, fixed = TRUE) < regexpr("name: Continental heatmaps", hs, fixed = TRUE) &&
+     grepl("BLAST_DATA_END: ${{ env.BLAST_MAP_DATA_END }}", heat, fixed = TRUE))
+  mw_env <- new.env(parent = globalenv()); sys.source("map_window_edge.R", envir = mw_env)
+  pt <- data.table(pid = as.character(1:100), mx = as.Date("2026-11-26"))
+  ok("that day is the one the last refresh reached: Friday's top-up gives Thursday",
+     mw_env$map_window_data_end(pt, as.Date("2026-11-28"), 0.98, 1L) == as.Date("2026-11-27"))
+  pt[1:10, mx := as.Date("2026-11-25")]
+  ok("or the older day, when a tenth of the cells missed that refresh",
+     mw_env$map_window_data_end(pt, as.Date("2026-11-28"), 0.98, 1L) == as.Date("2026-11-26"))
+  pt[, mx := as.Date("2026-11-30")]
+  ok("never later than the run's own window, and NA with no cache",
+     mw_env$map_window_data_end(pt, as.Date("2026-11-28"), 0.98, 1L) == as.Date("2026-11-29") &&
+     is.na(mw_env$map_window_data_end(pt[0], as.Date("2026-11-28"), 0.98, 1L)))
+  hv <- function(b) health_verdict(31L, 31L, map_behind_days = b, map_cells = 7721L, map_cells_prev = 7721L)
+  ok("a map two days behind the town table is the design; three is a missed Friday top-up",
+     HEALTH_MAX_MAP_BEHIND_DAYS == 2L && !hv(2L)$degraded && hv(3L)$degraded)
+  ok("the banner says which day each part runs to",
+     grepl("town table here runs to the Saturday", SOURCE_NOTE, fixed = TRUE) &&
+     grepl("maps are refreshed on Fridays and run to the Thursday", SOURCE_NOTE, fixed = TRUE))
+
+  # FILLING THE GRID. Refresh-first is right for a full grid and slow for an empty
+  # one: with 3,000 cells cached, a day's plan buys 1,142 new cells after the
+  # refresh and 1,760 before it.
+  cn <- om_weight_per_location(68L, length(OM_HOURLY_VARS)); cap <- DAILY_WEIGHTED_CAP * (1 - GRID_RETRY_WEIGHT_FRAC)
+  ok("while the grid is filling, new cells are fetched before cached ones are refreshed",
+     isTRUE(IFS_ADD_FIRST) && floor(cap / cn) > 1.4 * floor((cap - 3000) / cn) &&
+     grepl("ADD_FIRST <- isTRUE(get0(\"IFS_ADD_FIRST\")) && nrow(to_add) > 0L", gsrc, fixed = TRUE) &&
+     grepl("budget = max(0, plan_cap - n_add_first * cost_new)", gsrc, fixed = TRUE) &&
+     regexpr("if (ADD_FIRST) run_phase(add,", gsrc, fixed = TRUE) > 0 &&
+     regexpr("if (ADD_FIRST) run_phase(add,", gsrc, fixed = TRUE) < regexpr("cohort_label(k), plan_cap)", gsrc, fixed = TRUE) &&
+     grepl("if (!ADD_FIRST) run_phase(add,", gsrc, fixed = TRUE))
+
+  ok("the second email waits for a complete map AND a healthy run, then goes every week",
      any(grepl("env.SEND_IFS_EMAIL == '1'", iw, fixed = TRUE)) && any(grepl("GRID_RES_FINEST", iw, fixed = TRUE)) &&
+     any(grepl("grep -q '^degraded=0' blast_outputs_ifs/run_status.txt", iw, fixed = TRUE)) &&
+     any(grepl("[ \"$have\" = \"$want\" ] && [ \"$healthy\" = 1 ]", iw, fixed = TRUE)) &&
      sum(grepl("email_started.txt", iw, fixed = TRUE)) >= 2L && !any(grepl("send_email.py", it, fixed = TRUE)))
+  ok("until then an incomplete map is reported, not failed: nothing has been sent",
+     any(grepl("IFS trial still accumulating", iw, fixed = TRUE)))
   ok("the first run may start from no cache, but no run overwrites a cache it did not read",
      sum(grepl("git ls-remote --exit-code --heads origin cache-data-ifs", c(iw, it), fixed = TRUE)) == 4L &&
      sum(grepl("appeared during a cold-start run", c(iw, it), fixed = TRUE)) == 2L)
@@ -1205,9 +1274,16 @@ cat("\n31. The IFS trial is a separate copy: no code, directory, cache branch or
     ok("nor do the product's workflows, which keep their own concurrency group",
        length(pwl) > 0L && !any(grepl(marks, pwl)) && sum(grepl("^\\s*group: blast-grid\\s*$", pwl)) == 2L)
     era_days <- dow(crons_of(pwl))
-    ok("no trial run shares a UTC day, and so a day's API allowance, with a product run",
-       length(era_days) >= 3L && !any(dow(ifs_cr) %in% era_days),
-       sprintf("(product days %s; trial crons %s)", paste(era_days, collapse = ","), paste(ifs_cr, collapse = " | ")))
+    ok("no trial GRID fetch shares a UTC day, and so a day's API allowance, with a product run",
+       length(era_days) >= 3L && !any(dow(top_cr) %in% era_days),
+       sprintf("(product days %s; trial top-ups %s)", paste(era_days, collapse = ","), paste(top_cr, collapse = " | ")))
+    # The one run that does share a day, Sunday's, fetches the towns: 151 to 272
+    # weighted calls in every run so far, plus a probe.
+    pc <- readLines("../blast_config.R", warn = FALSE)
+    hard <- suppressWarnings(as.numeric(sub("^DAILY_WEIGHTED_HARD_CAP\\s*<-\\s*([0-9]+).*$", "\\1",
+                                            grep("^DAILY_WEIGHTED_HARD_CAP\\s*<-", pc, value = TRUE)[1])))
+    ok("and the weekly run's town fetch fits beside the product's Sunday run even at the product's own ceiling",
+       isTRUE(hard + 300 <= FREE_DAILY_CALLS), sprintf("(product ceiling %s)", hard))
     ok("the product's directory holds nothing of the trial's, and the trial's ignore file is its own",
        !dir.exists("../blast_outputs_ifs") && file.exists(".gitignore") &&
        !any(grepl("ifs", readLines("../.gitignore", warn = FALSE), fixed = TRUE)))

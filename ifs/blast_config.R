@@ -680,11 +680,43 @@ RUN_STATUS_FILE <- "run_status.txt"
 # difference can be read in one place and the rest of this file compares
 # cleanly against the root copy.
 #
-# WHY IFS IS HELD BACK TWO DAYS. Its archive is updated every six hours and runs
-# to the end of TODAY, so its newest hours are forecast. On 14 November 2026 at
-# 02:41 UTC it returned every hour of 14 November. Two UTC days keeps every
-# modelled hour on settled data; the archive-edge probe cannot tell the
-# difference, so this arithmetic is the guard.
+# THE LATEST WEATHER THAT HAS HAPPENED. The IFS archive is stitched from forecast
+# runs started at 00, 06, 12 and 18 UTC. Each lands about six hours after it
+# starts (the 18 UTC run of 14 November 2026 landed at 23:57), and the archive
+# then runs on for days into the FUTURE, so "has data" does not mean "has
+# happened". A UTC day D may be the last day fetched once a run started ON day D
+# has landed: the only hours of D the models use are its first three (00 to 02
+# UTC, which complete model day D-1 at the western edge of the grid), and those
+# are then a same-day run's own first hours. The archive says which run it holds
+# (IFS_META_URL) and probe_archive_edge.R asks it.
+#
+#   ARCHIVE_LAG_DAYS = 0     the CEILING: today, UTC. Never beyond it.
+#   IFS_UNPROBED_LAG_DAYS    what a run uses when nobody has asked the archive
+#                            (a local run, a probe that failed): yesterday,
+#                            whose first hours are always settled.
+#
+# So the weekly run, on Sunday UTC, models the towns to SATURDAY for an email
+# read on Monday morning; the product, six days behind, models to the Sunday
+# before. Until 15 November 2026 the trial was held back two whole days and ran
+# on Monday; the maintainer asked for delivery by 7 am Monday with the latest
+# weather available.
+#
+# THE MAP IS TWO DAYS OLDER THAN THE TOWN TABLE, BY DESIGN. Refreshing all 7,721
+# map cells costs about 7,700 weighted calls, and on Sunday the product's own run
+# uses about 8,000 of the free 10,000. So the trial refreshes its map on the days
+# the product does not run (Monday, Tuesday, Thursday, Friday; Friday's is the
+# one the email shows, to Thursday), and on Sunday fetches only the 31 towns
+# (about 270 calls) and draws the map from the cache as it stands.
+# HEALTH_MAX_MAP_BEHIND_DAYS says so: two days is normal here, three means
+# Friday's refresh did not happen.
+#
+# FILLING THE GRID. From an empty cache every cell costs 4.86 weighted calls. The
+# product's planner refreshes cached cells first and adds with what is left,
+# which is right for a full grid and slow for an empty one: by the time half the
+# cells exist, half of each day's budget goes on bringing them up to date, and
+# the fill takes about twelve fetch days. With IFS_ADD_FIRST the grid runner adds
+# new cells first while any remain, and refreshes them all once the grid is
+# full: about five fetch days.
 #
 # THE TWO ARE NOT INTERCHANGEABLE. Same 31 towns, same 60 days to 7 November
 # 2026: IFS had 190 days of 5 mm or more against ERA5's 144, and 163 infection
@@ -693,17 +725,45 @@ RUN_STATUS_FILE <- "run_status.txt"
 # known, which is what the trial is for.
 IFS_TRIAL            <- TRUE          # the entry scripts refuse to run without it
 OPENMETEO_MODEL      <- "ecmwf_ifs"
-ARCHIVE_LAG_DAYS     <- 2L
+ARCHIVE_LAG_DAYS     <- 0L            # the ceiling is today; see blast_data_end() below
+IFS_UNPROBED_LAG_DAYS <- 1L           # yesterday, when the archive has not been asked
+IFS_META_URL         <- "https://archive-api.open-meteo.com/data/ecmwf_ifs/static/meta.json"
+IFS_ADD_FIRST        <- TRUE          # while the grid is filling, new cells before refreshes
 OUTPUT_DIR           <- "blast_outputs_ifs"   # inside ifs/; never the product's name
-MIDWEEK_MAX_AGE_DAYS <- 3L            # weekly run on Monday UTC, last top-up on Friday
+MIDWEEK_MAX_AGE_DAYS <- 3L            # the email is dated Monday; the last top-up is Friday's
+HEALTH_MAX_MAP_BEHIND_DAYS <- 2L      # map refreshed Friday (to Thursday), towns to Saturday
 WEATHER_NAME         <- "ECMWF IFS"   # as printed in the email, the summary and the citations
 WEATHER_GRID_KM      <- 9L
 SOURCE_TAG           <- "IFS trial"   # shown in the email header
 SOURCE_NOTE          <- paste0(       # the banner at the top of the email
-  "Trial version. This email is built on ECMWF IFS weather (about 9 km grid, held ",
-  "back 2 days) instead of ERA5 (about 25 km, 6 days). It is sent beside the ",
-  "regular email so the two can be compared. The two weather models differ, so its ",
-  "numbers will not match the regular email's.")
+  "Trial version. This email is built on ECMWF IFS weather (about 9 km grid) instead ",
+  "of ERA5 (about 25 km), and is sent beside the regular email so the two can be ",
+  "compared. IFS is ready within a day and ERA5 after six, so the town table here ",
+  "runs to the Saturday before the email; the maps are refreshed on Fridays and run ",
+  "to the Thursday. The two weather models differ, so its numbers will not match ",
+  "the regular email's.")
+
+# The UTC day of the newest forecast run the archive holds, from the
+# last_run_initialisation_time in its metadata (seconds since 1970). NA when the
+# value is missing or not a time.
+ifs_settled_day <- function(init_epoch) {
+  x <- suppressWarnings(as.numeric(init_epoch))
+  if (length(x) != 1L || !isTRUE(is.finite(x)) || x <= 0) return(as.Date(NA))
+  as.Date(format(as.POSIXct(x, origin = "1970-01-01", tz = "UTC"), "%Y-%m-%d", tz = "UTC"))
+}
+
+# The last day FETCHED, for the trial. It replaces the product's rule defined
+# near the top of this file ("the arithmetic edge, which a probe may only pull
+# back"), because for IFS the arithmetic edge is TODAY and today is only usable
+# once the archive has said so:
+#   * BLAST_DATA_END set (the probe's answer) and not after today: use it;
+#   * anything else (unset, not a date, in the future): yesterday.
+blast_data_end <- function(run_date = blast_run_date()) {
+  ceiling_day <- blast_archive_edge(run_date)
+  v <- Sys.getenv("BLAST_DATA_END", "")
+  d <- if (nzchar(v)) tryCatch(suppressWarnings(as.Date(v)), error = function(e) as.Date(NA)) else as.Date(NA)
+  if (!is.na(d) && d <= ceiling_day) d else ceiling_day - IFS_UNPROBED_LAG_DAYS
+}
 
 ################################################################################
 # 7. Citation (added to the summary and to the heatmap footer)
