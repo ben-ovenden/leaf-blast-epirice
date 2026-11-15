@@ -34,8 +34,13 @@ from email.message import EmailMessage
 # is, so the two emails cannot be confused in an inbox or a downloads folder.
 # The regular email's sender is a separate file, in the repository root.
 OUT = os.environ.get("BLAST_OUT_DIR", "").strip() or "blast_outputs_ifs"
-SUBJECT_TAG = "[IFS trial] "
-ATTACH_PREFIX = "ifs_"
+#
+# IFS_ROLE=main (set by ifs_weekly.yml when the regular email's workflow is
+# switched off, see section 6b of blast_config.R) means this IS the email, and
+# it is sent without the trial marking. Anything else is the trial.
+IS_MAIN = os.environ.get("IFS_ROLE", "").strip().lower() == "main"
+SUBJECT_TAG = "" if IS_MAIN else "[IFS trial] "
+ATTACH_PREFIX = "" if IS_MAIN else "ifs_"
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 465
 FROM_NAME = "WWAI Cereal Pathology: blast models"

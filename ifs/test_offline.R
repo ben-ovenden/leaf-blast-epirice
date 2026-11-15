@@ -20,6 +20,10 @@
 ################################################################################
 suppressPackageStartupMessages({library(data.table); library(methods)})
 SCRIPT_DIR <- normalizePath(".", winslash = "/")
+# IFS_ROLE (main or trial) is set by the weekly workflow from the state of the
+# product's workflow. This suite tests the default, the trial, whatever its
+# caller exported; test 31 loads the config both ways.
+Sys.unsetenv("IFS_ROLE")
 source("blast_config.R"); source("epirice_model.R"); source("blastam_model.R")
 
 fails <- 0L; n <- 0L
@@ -1170,7 +1174,8 @@ cat("\n31. The IFS trial is a separate copy: no code, directory, cache branch or
   # Rscript takes SCRIPT_DIR from the working directory, so `Rscript ifs/run_blast.R`
   # from the repository root would load the PRODUCT's config and write into the
   # product's directory. Each entry script stops unless the config is the trial's.
-  for (f in c("run_blast.R", "run_blast_grid.R", "probe_archive_edge.R", "map_window_edge.R")) {
+  for (f in c("run_blast.R", "run_blast_grid.R", "probe_archive_edge.R", "map_window_edge.R",
+              "main_email_role.R")) {
     l <- readLines(f, warn = FALSE)
     i <- grep("source(file.path(SCRIPT_DIR, \"blast_config.R\"))", l, fixed = TRUE)
     g <- grep("if (!isTRUE(get0(\"IFS_TRIAL\")))", l, fixed = TRUE)
@@ -1179,7 +1184,7 @@ cat("\n31. The IFS trial is a separate copy: no code, directory, cache branch or
   }
   sp <- readLines("send_email.py", warn = FALSE)
   ok("the sender reads the trial's directory and renames the attachments",
-     any(grepl("or \"blast_outputs_ifs\"", sp, fixed = TRUE)) && any(sp == "ATTACH_PREFIX = \"ifs_\"") &&
+     any(grepl("or \"blast_outputs_ifs\"", sp, fixed = TRUE)) && any(sp == "ATTACH_PREFIX = \"\" if IS_MAIN else \"ifs_\"") &&
      any(grepl("filename=ATTACH_PREFIX + os.path.basename(path)", sp, fixed = TRUE)))
 
   rd <- function(f) { p <- file.path("../.github/workflows", f); if (file.exists(p)) readLines(p, warn = FALSE) else character(0) }
@@ -1191,9 +1196,15 @@ cat("\n31. The IFS trial is a separate copy: no code, directory, cache branch or
   both <- paste(c(iw, it), collapse = "\n")
   ok("every step of both runs in this directory",
      sum(grepl("^\\s*working-directory: ifs\\s*$", c(iw, it))) == 2L)
-  ok("they name only the trial's directory and cache branch, and set no source switch",
-     !grepl("blast_outputs(?!_ifs)", both, perl = TRUE) && !grepl("cache-data(?!-ifs)", both, perl = TRUE) &&
-     !grepl("BLAST_SOURCE", both, fixed = TRUE))
+  # The one thing READ from the product is its spend ledger, from git and not from
+  # the working tree, so that the weekly run is never the main email on a day the
+  # product has fetched. Nothing of the product's is written, here or anywhere.
+  led_read <- "git show FETCH_HEAD:blast_outputs/weighted_spend.csv"
+  both_own <- gsub(led_read, "", both, fixed = TRUE)
+  ok("they write only to the trial's directory and cache branch, and set no source switch",
+     !grepl("blast_outputs(?!_ifs)", both_own, perl = TRUE) && !grepl("cache-data(?!-ifs)", both, perl = TRUE) &&
+     !grepl("BLAST_SOURCE", both, fixed = TRUE) &&
+     lengths(regmatches(both, gregexpr(led_read, both, fixed = TRUE))) == 1L)
   ok("and keep their artifacts and their concurrency group to themselves",
      sum(grepl("path: ifs/blast_outputs_ifs/", c(iw, it), fixed = TRUE)) == 2L &&
      sum(grepl("^\\s*group: blast-grid-ifs\\s*$", c(iw, it))) == 2L)
@@ -1208,13 +1219,14 @@ cat("\n31. The IFS trial is a separate copy: no code, directory, cache branch or
      length(top_cr) == 4L && all(hr(top_cr) <= 9L))
   hs <- paste(iw, collapse = "\n")
   heat <- sub("\n      - name:.*$", "", sub("^.*\n      - name: Continental heatmaps", "", hs))
-  ok("the weekly run, on the product's Sunday, fetches no grid: its map step has a budget of nothing",
-     identical(dow(wk_cr), "0") && grepl("BLAST_WEIGHTED_CAP: \"0\"", heat, fixed = TRUE) &&
+  ok("the weekly run, while the product's weekly workflow is on, fetches no grid: its map step has a budget of nothing",
+     identical(dow(wk_cr), "0") && grepl("CAP=\"\"; [ \"$ROLE\" = trial ] && CAP=0", hs, fixed = TRUE) &&
+     grepl("BLAST_WEIGHTED_CAP: ${{ env.IFS_GRID_CAP }}", heat, fixed = TRUE) &&
      !grepl("weighted_cap", hs, fixed = TRUE))
   ok("and draws the map at the day the cached grid supports",
      regexpr("name: Map window from the cache", hs, fixed = TRUE) > 0 &&
      regexpr("name: Map window from the cache", hs, fixed = TRUE) < regexpr("name: Continental heatmaps", hs, fixed = TRUE) &&
-     grepl("BLAST_DATA_END: ${{ env.BLAST_MAP_DATA_END }}", heat, fixed = TRUE))
+     grepl("BLAST_DATA_END: ${{ env.BLAST_MAP_DATA_END || env.BLAST_DATA_END }}", heat, fixed = TRUE))
   mw_env <- new.env(parent = globalenv()); sys.source("map_window_edge.R", envir = mw_env)
   pt <- data.table(pid = as.character(1:100), mx = as.Date("2026-11-26"))
   ok("that day is the one the last refresh reached: Friday's top-up gives Thursday",
@@ -1252,6 +1264,106 @@ cat("\n31. The IFS trial is a separate copy: no code, directory, cache branch or
      sum(grepl("email_started.txt", iw, fixed = TRUE)) >= 2L && !any(grepl("send_email.py", it, fixed = TRUE)))
   ok("until then an incomplete map is reported, not failed: nothing has been sent",
      any(grepl("IFS trial still accumulating", iw, fixed = TRUE)))
+
+  # SWITCHING THE MAIN EMAIL. The maintainer will choose a source and wants the
+  # choice easy to make and easy to take back. The switch is whether the
+  # product's weekly workflow is switched on in GitHub; the trial's weekly run
+  # asks, and is the trial beside it or the main email accordingly. No file
+  # changes hands, nothing is deleted, and the same click undoes it.
+  ok("the role follows the product's weekly workflow: on means trial, off or gone means main",
+     ifs_role_from_state(200L, "active") == "trial" &&
+     ifs_role_from_state(200L, "disabled_manually") == "main" &&
+     ifs_role_from_state(200L, "disabled_inactivity") == "main" &&
+     ifs_role_from_state(404L, NA) == "main")
+  ok("when GitHub cannot be asked, or answers something unknown, the product is assumed to be running",
+     ifs_role_from_state(NA, NA) == "trial" && ifs_role_from_state(500L, NA) == "trial" &&
+     ifs_role_from_state(403L, "disabled_manually") == "trial" &&
+     ifs_role_from_state(200L, "something new") == "trial" && ifs_role_from_state(200L, NA) == "trial")
+  ok("and it is never the main email on a day the product has already fetched",
+     ifs_role_from_state(200L, "disabled_manually", product_spent = 7900) == "trial" &&
+     ifs_role_from_state(200L, "disabled_manually", product_spent = 1) == "main" &&
+     ifs_role_from_state(200L, "disabled_manually", product_spent = NA) == "main")
+  cfg_role <- function(role) {
+    old <- Sys.getenv("IFS_ROLE", unset = NA)
+    if (is.na(role)) Sys.unsetenv("IFS_ROLE") else Sys.setenv(IFS_ROLE = role)
+    on.exit(if (is.na(old)) Sys.unsetenv("IFS_ROLE") else Sys.setenv(IFS_ROLE = old), add = TRUE)
+    e <- new.env(parent = globalenv()); sys.source("blast_config.R", envir = e); e
+  }
+  et <- cfg_role(NA); em <- cfg_role("main")
+  ok("as the trial the email is marked and its map may be two days behind the towns",
+     et$IFS_ROLE == "trial" && nzchar(et$SOURCE_TAG) && nzchar(et$SOURCE_NOTE) && et$HEALTH_MAX_MAP_BEHIND_DAYS == 2L &&
+     identical(IFS_ROLE, "trial"))
+  ok("as the main email it carries no trial marking and its map must be current",
+     em$IFS_ROLE == "main" && !nzchar(em$SOURCE_TAG) && !nzchar(em$SOURCE_NOTE) && em$HEALTH_MAX_MAP_BEHIND_DAYS == 1L)
+  nm_t <- ls(et, all.names = TRUE); nm_m <- ls(em, all.names = TRUE)
+  same <- function(k) { a <- get(k, envir = et); b <- get(k, envir = em)
+    if (is.function(a)) identical(deparse(a), deparse(b)) else identical(a, b) }
+  role_diff <- if (setequal(nm_t, nm_m)) Filter(function(k) !same(k), nm_t) else "(different settings exist)"
+  ok("and the role changes nothing else: same weather, same models, same thresholds, same directory",
+     setequal(role_diff, c("IFS_ROLE", "SOURCE_TAG", "SOURCE_NOTE", "HEALTH_MAX_MAP_BEHIND_DAYS")),
+     sprintf("(differs: %s)", paste(role_diff, collapse = ", ")))
+  ok("an unknown role is the trial", cfg_role("era5")$IFS_ROLE == "trial" && cfg_role("")$IFS_ROLE == "trial")
+  ok("it still names its weather source as the main email",
+     grepl("Open-Meteo ECMWF IFS archive", em$CITATION, fixed = TRUE) && em$WEATHER_NAME == "ECMWF IFS")
+
+  ps <- function(x) regexpr(x, hs, fixed = TRUE)
+  mapstep <- sub("\n      - name:.*$", "", sub("^.*\n      - name: Map window from the cache", "", hs))
+  ok("the weekly run asks which email is the main one, after its tests and before the map",
+     ps("name: Main or trial") > ps("name: Offline tests") && ps("name: Main or trial") < ps("name: Map window from the cache") &&
+     grepl("Rscript main_email_role.R", hs, fixed = TRUE) && any(grepl("^\\s*actions: read\\b", iw)) &&
+     grepl("GH_TOKEN: ${{ github.token }}", hs, fixed = TRUE))
+  ok("with the product's ledger as main has it now, so 'main' is refused on a day the product fetched",
+     grepl("git show FETCH_HEAD:blast_outputs/weighted_spend.csv", hs, fixed = TRUE) &&
+     grepl("export IFS_PRODUCT_LEDGER=", hs, fixed = TRUE))
+  ok("anything but a clear answer is the trial",
+     grepl("case \"$ROLE\" in main|trial) ;; *) ROLE=trial ;; esac", hs, fixed = TRUE))
+  ok("as the main email the map is fetched in the run: no cache window, no zero budget",
+     grepl("if: env.IFS_ROLE != 'main'", mapstep, fixed = TRUE) &&
+     grepl("echo \"IFS_ROLE=$ROLE\" >> \"$GITHUB_ENV\"", hs, fixed = TRUE) &&
+     grepl("echo \"IFS_GRID_CAP=$CAP\" >> \"$GITHUB_ENV\"", hs, fixed = TRUE))
+  ok("a role test is capped at 30 calls, never emails and never starts the email",
+     grepl("main)  ROLE=main;  CAP=30 ;;", hs, fixed = TRUE) &&
+     ps("if [ \"${IFS_ROLE_TEST:-0}\" = 1 ]; then") > 0 &&
+     ps("if [ \"${IFS_ROLE_TEST:-0}\" = 1 ]; then") < ps("elif [ -f \"$latch\" ]; then"))
+  ok("and a week with no email at all (product off, trial email not started) is called out",
+     grepl("title=No email this week", hs, fixed = TRUE))
+  ok("the top-ups do not depend on the role: both sources keep their caches warm whichever is main",
+     !any(grepl("IFS_ROLE|main_email_role", it)))
+  cands <- Sys.which(c("python3", "python", "py")); cands <- unname(cands[nzchar(cands)])
+  pyx <- NA_character_
+  for (p in cands) if (isTRUE(tryCatch(suppressWarnings(system2(p, "--version", stdout = FALSE, stderr = FALSE)) == 0L,
+                                       error = function(e) FALSE))) { pyx <- p; break }
+  if (is.na(pyx)) {
+    cat("  SKIP  no working python here; the sender's two roles are exercised in CI\n")
+  } else {
+    fx <- tempfile("blast_email_role_"); dir.create(fx)
+    writeLines("plain body", file.path(fx, "blast_summary_latest.txt"))
+    writeLines("<p>html body</p>", file.path(fx, "blast_summary_latest.html"))
+    writeLines(c("town,2026-11-28", "Dubbo,0"), file.path(fx, "town_trends.csv"))
+    writeLines(c("town,2026-11-28", "Dubbo,0"), file.path(fx, "blastam_trends.csv"))
+    writeLines(c("town_window_end=2026-11-28", "degraded=0", "reasons="), file.path(fx, "run_status.txt"))
+    dry <- function(role, map_end) {
+      writeLines(sprintf("7721|0.30|7721|0.30|gz|5126|gz|%s|0.30|7721|0.0331|14||epirice+blastam|0||", map_end),
+                 file.path(fx, "map_stats.txt"))
+      vars <- c("MAIL_USERNAME", "MAIL_PASSWORD", "MAIL_TO", "BLAST_RUN_DATE", "RUN_DATE",
+                "BLAST_OUT_DIR", "BLAST_EMAIL_DRY_RUN", "IFS_ROLE")
+      old <- Sys.getenv(vars, unset = NA)
+      Sys.setenv(MAIL_USERNAME = "sender@example.org", MAIL_PASSWORD = "x", MAIL_TO = "a@example.org",
+                 BLAST_RUN_DATE = "2026-11-30", BLAST_OUT_DIR = fx, BLAST_EMAIL_DRY_RUN = "1")
+      if (is.na(role)) Sys.unsetenv("IFS_ROLE") else Sys.setenv(IFS_ROLE = role)
+      on.exit(for (v in names(old))
+        if (is.na(old[[v]])) Sys.unsetenv(v) else do.call(Sys.setenv, as.list(setNames(old[[v]], v))), add = TRUE)
+      paste(suppressWarnings(system2(pyx, "send_email.py", stdout = TRUE, stderr = TRUE)), collapse = "\n")
+    }
+    o_main <- dry("main", "2026-11-28"); o_trial <- dry(NA, "2026-11-26")
+    ok("as the main email the subject is the regular one, towns and maps on one day",
+       grepl("subject 'Blast risk summary 2026-11-30 (weather to 2026-11-28)'", o_main, fixed = TRUE),
+       sprintf("(%s)", substr(o_main, 1, 300)))
+    ok("as the trial it is marked, and names the map's older day",
+       grepl("subject '[IFS trial] Blast risk summary 2026-11-30 (weather to 2026-11-28; maps to 2026-11-26)'",
+             o_trial, fixed = TRUE), sprintf("(%s)", substr(o_trial, 1, 300)))
+    unlink(fx, recursive = TRUE)
+  }
   ok("the first run may start from no cache, but no run overwrites a cache it did not read",
      sum(grepl("git ls-remote --exit-code --heads origin cache-data-ifs", c(iw, it), fixed = TRUE)) == 4L &&
      sum(grepl("appeared during a cold-start run", c(iw, it), fixed = TRUE)) == 2L)
