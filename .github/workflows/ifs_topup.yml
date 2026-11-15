@@ -124,7 +124,8 @@ jobs:
       # yesterday.
       - name: Resolve archive edge
         env:
-          BLAST_EDGE_WAIT_MIN: "60"
+          # A capped smoke test does not wait: it only has to prove the steps run.
+          BLAST_EDGE_WAIT_MIN: ${{ github.event.inputs.weighted_cap != '' && '0' || '60' }}
         run: |
           DE=$(Rscript probe_archive_edge.R | sed -n 's/^EDGE=//p' | tail -n 1)
           case "$DE" in

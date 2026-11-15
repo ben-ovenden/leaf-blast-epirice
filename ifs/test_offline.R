@@ -971,7 +971,9 @@ cat("\n26. The run asks the archive what it has, rather than assuming\n")
        regexpr("name: Offline tests", y, fixed = TRUE) < regexpr("name: Resolve archive edge", y, fixed = TRUE) &&
        regexpr("name: Resolve archive edge", y, fixed = TRUE) < regexpr("run: Rscript run_blast_grid.R", y, fixed = TRUE))
   ok("the weekly run waits for today's first forecast run; a top-up waits an hour at most",
-     !grepl("BLAST_EDGE_WAIT_MIN", wk, fixed = TRUE) && grepl("BLAST_EDGE_WAIT_MIN: \"60\"", tu, fixed = TRUE))
+     grepl("BLAST_EDGE_WAIT_MIN: ${{ github.event.inputs.edge_wait_min }}", wk, fixed = TRUE) &&
+     !grepl("BLAST_EDGE_WAIT_MIN: \"", wk, fixed = TRUE) &&
+     grepl("BLAST_EDGE_WAIT_MIN: ${{ github.event.inputs.weighted_cap != '' && '0' || '60' }}", tu, fixed = TRUE))
   ok("and the weekly job's timeout allows for that wait",
      as.integer(sub(".*timeout-minutes: ([0-9]+).*", "\\1", wk)) >=
        ARCHIVE_EDGE_WAIT_MAX_MIN + GRID_MAX_MINUTES + GRID_RESERVE_MINUTES + TOWN_QUOTA_WAIT_MAX_MIN)
