@@ -39,6 +39,10 @@ on:
         description: 'Override the run date (YYYY-MM-DD). Leave blank for today in Sydney.'
         required: false
         default: ''
+      edge_wait_min:
+        description: 'Minutes to wait for the day''s first IFS run to reach the archive. Leave blank for the default (90); 0 for a quick test.'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -195,6 +199,9 @@ jobs:
       # 6b of blast_config.R). The probe waits for it, up to
       # ARCHIVE_EDGE_WAIT_MAX_MIN, and otherwise answers yesterday.
       - name: Resolve archive edge
+        env:
+          # Blank on a scheduled run, which the probe reads as "the default wait".
+          BLAST_EDGE_WAIT_MIN: ${{ github.event.inputs.edge_wait_min }}
         run: |
           DE=$(Rscript probe_archive_edge.R | sed -n 's/^EDGE=//p' | tail -n 1)
           case "$DE" in
