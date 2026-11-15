@@ -1,0 +1,15 @@
+# The IFS trial's outputs. Maps and summaries are delivered by email, not
+# committed; only the state that must persist across runs is kept.
+#
+# The weather cache (weather_cache.csv.gz) and its schema marker
+# (cache_version.txt) are NOT on this branch. They live on the `cache-data-ifs`
+# branch as one commit that every run replaces. To get them into a local checkout:
+#   git fetch origin cache-data-ifs
+#   git cat-file blob FETCH_HEAD:weather_cache.csv.gz > ifs/blast_outputs_ifs/weather_cache.csv.gz
+#   git cat-file blob FETCH_HEAD:cache_version.txt   > ifs/blast_outputs_ifs/cache_version.txt
+blast_outputs_ifs/*
+!blast_outputs_ifs/town_trends.csv
+!blast_outputs_ifs/blastam_trends.csv
+!blast_outputs_ifs/fetch_failures.csv
+!blast_outputs_ifs/map_stats.txt
+!blast_outputs_ifs/midweek_status.txt

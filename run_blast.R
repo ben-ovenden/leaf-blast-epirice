@@ -414,12 +414,11 @@ midweek_line <- function() {
 mw <- midweek_line()
 
 summary_lines <- c(
-  paste0("Blast risk summary", if (nzchar(SOURCE_TAG)) paste0(" (", SOURCE_TAG, ")") else ""),
+  "Blast risk summary",
   strrep("=", 60),
-  if (nzchar(SOURCE_NOTE)) c(strwrap(SOURCE_NOTE, width = 78), "") else NULL,
   paste0("Generated:   ", format(RUN_DATE, "%A %d %B %Y")),
   paste0("Models:      EPIRICE (Savary et al. 2012) + BLASTAM (Koshimizu 1988)"),
-  paste0("Weather:     Open-Meteo ", WEATHER_NAME, " archive, to ", format(end_date, "%Y-%m-%d")),
+  paste0("Weather:     Open-Meteo ERA5 archive, to ", format(end_date, "%Y-%m-%d")),
   sprintf("EPIRICE:     %d day window, RcT infection optimum %d C",
           CROP_AGE_DAYS, EPIRICE_RCT_PEAK),
   sprintf("Cache schema: version %d", CACHE_SCHEMA_VERSION),
@@ -584,16 +583,10 @@ html <- paste0(
 "<div style='font-family:Arial,Helvetica,sans-serif;color:", NSW_BRAND_DARK,
 ";max-width:760px;margin:auto;'>",
 "<div style='background:", NSW_BRAND_BLUE, ";color:#fff;padding:16px 20px;border-radius:6px 6px 0 0;'>",
-"<div style='font-size:19px;font-weight:bold;'>Blast risk summary",
-if (nzchar(SOURCE_TAG)) paste0(" (", SOURCE_TAG, ")") else "", "</div>",
+"<div style='font-size:19px;font-weight:bold;'>Blast risk summary</div>",
 sprintf("<div style='font-size:13px;opacity:.9;'>%s</div>", format(RUN_DATE, "%A %d %B %Y")),
 "</div>",
 "<div style='padding:16px 20px;border:1px solid #E0E0E0;border-top:none;border-radius:0 0 6px 6px;'>",
-# The IFS trial says what it is before anything else. Empty for the product.
-if (nzchar(SOURCE_NOTE)) sprintf(
-  paste0("<p style='margin:0 0 12px;padding:10px 12px;background:#EBF1F8;",
-         "border-left:4px solid %s;border-radius:3px;font-size:13px;'>%s</p>"),
-  NSW_BRAND_BLUE, sub("^Trial version\\.", "<b>Trial version.</b>", SOURCE_NOTE)) else "",
 # The opening used to say "fetched to 29 Sep and modelled to 28 Sep", which is the
 # pipeline talking to itself, and "how much disease the rolling 60 day window has
 # built up", which reads as disease that exists. It is a simulation on an assumed
@@ -682,8 +675,7 @@ sprintf(paste0("<p style='font-size:12px;color:#6b7378;margin:10px 0 0;'><b>BLAS
        BLASTAM_NIGHT_START, BLASTAM_NIGHT_END,
        BLASTAM_RH_WET, format(BLASTAM_RAIN_WET), heavy_html),
 paste0("<p style='font-size:12px;color:#6b7378;margin:10px 0 0;'><b>Limits:</b> These are ",
-       "modelled values from gridded ", WEATHER_NAME, " weather (about ", WEATHER_GRID_KM,
-       " km). Humidity inside an ",
+       "modelled values from gridded ERA5 weather (about 25 km). Humidity inside an ",
        "irrigated rice crop canopy runs well above the surrounding air (Lanoiselet ",
        "<em>et al.</em> 2002), so modelled values are best read as lower bounds.</p>"),
 paste0("<p style='font-size:11px;color:#9aa0a6;margin:10px 0 0;'><b>References:</b> ",
@@ -692,7 +684,7 @@ paste0("<p style='font-size:11px;color:#9aa0a6;margin:10px 0 0;'><b>References:<
        "Tohoku Natl. Agric. Exp. Stn. 78:67-121. Hayashi T, Koshimizu Y (1988) ibid. ",
        "78:123-138. Barksdale TH, Jones MW (1965) Phytopathology 55:1037-1040. Lanoiselet ",
        "V, Cother EJ, Ash GJ (2002) Australasian Plant Pathology 31:1-7. Weather: ",
-       "Open-Meteo ", WEATHER_NAME, " (CC BY 4.0).</p>"),
+       "Open-Meteo ERA5 (CC BY 4.0).</p>"),
 # The map and top-up lines are how a reader sees that the weather retrieval is
 # not keeping up (fewer cells, an older window, a top-up that fetched little), so
 # they stay in full.
