@@ -1,0 +1,334 @@
+name: IFS trial weekly run (second email)
+
+# THE IFS TRIAL. A second, separate weekly run on ECMWF IFS weather, sent beside
+# the regular (ERA5) email so the maintainer can compare the two and keep one.
+# See section 6b of blast_config.R. This file is weekly_blast.yml with:
+#
+#   * BLAST_SOURCE=ifs on the job, which selects the IFS archive, a two day lag
+#     and the blast_outputs_ifs directory;
+#   * its own cache branch, cache-data-ifs, which the first run creates;
+#   * its own concurrency group, so it can never queue behind, delay or displace
+#     an ERA5 run;
+#   * an email that starts only once the map is complete at full resolution
+#     (about twelve fetch days from an empty cache), and then every week.
+#
+# WHEN. Monday in UTC. The ERA5 workflows own Sunday (weekly), Wednesday and
+# Saturday (top-ups) and spend most of a day's free API allowance each time; the
+# IFS workflows use the other four days, so the two never share an allowance.
+# It fires at 00:17 UTC so that even a start twelve hours late stays inside
+# Monday UTC. GitHub starts this repository's schedules five to seven hours late,
+# so expect the email on Monday evening, Sydney time, with weather to Friday.
+#
+# TO END THE TRIAL keeping ERA5: disable this workflow and ifs_topup.yml.
+on:
+  schedule:
+    - cron: '17 0 * * 1'   # 00:17 UTC Monday = 10:17 AEST / 11:17 AEDT
+  workflow_dispatch:
+    inputs:
+      run_date:
+        description: 'Override the run date (YYYY-MM-DD). Leave blank for today in Sydney.'
+        required: false
+        default: ''
+      weighted_cap:
+        description: 'Cap the grid fetch at N weighted API calls (e.g. 30 for a smoke test). Leave blank for the full budget.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+# Two runs must never write the weather cache at once.
+concurrency:
+  group: blast-grid-ifs
+  cancel-in-progress: false
+
+jobs:
+  blast:
+    runs-on: ubuntu-latest
+    # Must exceed ARCHIVE_EDGE_WAIT_MAX_MIN (90) plus GRID_MAX_MINUTES (200) plus
+    # GRID_RESERVE_MINUTES (25) plus the town run's TOWN_QUOTA_WAIT_MAX_MIN (10)
+    # with room to commit and email, so the scripts' own graceful stops fire first
+    # and the run still saves. The hosted-runner ceiling is 360.
+    timeout-minutes: 345
+    env:
+      BLAST_SOURCE: ifs
+      BLAST_OUT_DIR: blast_outputs_ifs
+      MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+    # rocker/geospatial ships R with terra, sf and a matching GDAL already built.
+    container:
+      image: rocker/geospatial:latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ONE RUN DATE FOR THE WHOLE JOB.
+      #
+      # This is the fix for the 2026-07-30 email, which carried maps titled
+      # "weather to 2026-07-23" beside body text saying "weather to 24 Jul 2026".
+      # The grid script took its window from Sys.Date() before a two hour fetch
+      # and its run_tag from a second Sys.Date() after it, then the town script
+      # started on the far side of local midnight and took a third. Pinning the
+      # date here and exporting it makes all three impossible.
+      #
+      # The UTC date is pinned alongside it: the archive's availability follows
+      # the UTC clock, and blast_data_end() counts the lag from the earlier of the
+      # two dates. On the scheduled run the UTC date is Sunday and the run date is
+      # the Monday the email is for.
+      - name: Resolve run date
+        run: |
+          RD="${{ github.event.inputs.run_date }}"
+          if [ -z "$RD" ]; then
+            RD=$(TZ=Australia/Sydney date +%F)
+            # A scheduled run is the Monday morning email whenever GitHub starts
+            # it: Sunday evening on time, after local midnight on a bad day. Date
+            # it, and everything named after it, for that Monday. A manual run
+            # keeps today's date unless run_date is given.
+            if [ "${{ github.event_name }}" = "schedule" ] && [ "$(TZ=Australia/Sydney date +%u)" = "7" ]; then
+              RD=$(date -u -d "$RD + 1 day" +%F)
+            fi
+          fi
+          UD=$(date -u +%F)
+          echo "BLAST_RUN_DATE=$RD" >> "$GITHUB_ENV"
+          echo "RUN_DATE=$RD" >> "$GITHUB_ENV"
+          echo "BLAST_UTC_DATE=$UD" >> "$GITHUB_ENV"
+          echo "Run date pinned to $RD (the Monday the email is for, or today in Australia/Sydney); UTC date $UD"
+          # The previous run's verdict is committed; clear it so the Verdict
+          # step below cannot mistake last week's health for this week's.
+          rm -f blast_outputs_ifs/run_status.txt
+
+      # THE WEATHER CACHE LIVES ON ITS OWN BRANCH, `cache-data-ifs`: one parentless
+      # commit, replaced on every run. It used to be committed to main, and git
+      # keeps every version of a file: 38 runs had put 104 MB of old caches into
+      # the history, and three runs a week would add about a gigabyte a year. No
+      # model reads weather older than the crop window, so nothing is lost by not
+      # keeping the old versions.
+      #
+      # Restoring it is NOT optional. A run that carried on with an empty cache
+      # would spend about twelve fetch days rebuilding the grid, and would then
+      # overwrite the good cache with its fragment.
+      - name: Restore weather cache
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir -p blast_outputs_ifs
+          # THE FIRST RUN HAS NOTHING TO RESTORE. "No such branch" is an answer
+          # from the server (exit 2), not a failure to reach it; only that
+          # answer lets the run start from an empty cache.
+          set +e; git ls-remote --exit-code --heads origin cache-data-ifs >/dev/null 2>&1; rc=$?; set -e
+          if [ "$rc" = 2 ]; then
+            echo "::notice title=IFS cache::no cache-data-ifs branch yet; accumulation starts from nothing"
+            echo "CACHE_BASE=" >> "$GITHUB_ENV"
+            exit 0
+          elif [ "$rc" != 0 ]; then
+            echo "::error title=Weather cache not restored::could not ask the remote about cache-data-ifs (git ls-remote exit $rc)"
+            exit 1
+          fi
+          ok=0
+          for i in 1 2 3; do
+            if git fetch --no-tags --depth 1 origin cache-data-ifs; then ok=1; break; fi
+            sleep $((i*10))
+          done
+          if [ "$ok" != 1 ]; then
+            echo "::error title=Weather cache not restored::could not fetch the cache-data-ifs branch. Refusing to run on an empty cache: rebuilding it takes about twelve fetch days."
+            exit 1
+          fi
+          CACHE_BASE=$(git rev-parse FETCH_HEAD)
+          echo "CACHE_BASE=$CACHE_BASE" >> "$GITHUB_ENV"
+          git cat-file blob "$CACHE_BASE:weather_cache.csv.gz" > blast_outputs_ifs/weather_cache.csv.gz
+          git cat-file blob "$CACHE_BASE:cache_version.txt" > blast_outputs_ifs/cache_version.txt
+          echo "Restored $(git log -1 --format='%h %s' "$CACHE_BASE"): $(stat -c %s blast_outputs_ifs/weather_cache.csv.gz) bytes, schema $(cat blast_outputs_ifs/cache_version.txt)"
+
+      - name: Install extra R packages
+        run: |
+          # curl is required: openmeteo_batch.R needs real HTTP status codes,
+          # which jsonlite::fromJSON(url) cannot expose.
+          pkgs <- c("data.table", "jsonlite", "curl", "terra")
+          need <- pkgs[!pkgs %in% rownames(installed.packages())]
+          if (length(need)) install.packages(need)
+        shell: Rscript {0}
+
+      # send_email.py is executed by the offline suite in dry-run mode, so the
+      # interpreter has to exist BEFORE the tests, not only at send time. The
+      # 2026-09-28 email was sent and the step still failed, on a NameError in the
+      # line after the send: nothing had ever run the script before the live run.
+      - name: Ensure python3
+        run: |
+          command -v python3 >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq python3; }
+          python3 --version
+
+      # Offline regression tests: no network, no quota, a few seconds. Fails the
+      # run before three hours of fetching are spent on broken code. terra is
+      # attached inside the suite on purpose: terra::shift masks
+      # data.table::shift, and that masking once turned every grid point into a
+      # silent "empty" and produced a blank map with no error in the log.
+      #
+      # A MISSING file is a warning, not a failure: tests that fail should block
+      # the run, but the absence of a test file should never stop the product.
+      - name: Offline tests
+        env:
+          BLAST_SOURCE: ""
+          BLAST_OUT_DIR: ""
+        run: |
+          if [ -f test_offline.R ]; then
+            Rscript test_offline.R
+          elif [ -f tests/test_offline.R ]; then
+            Rscript tests/test_offline.R
+          else
+            echo "::warning::test_offline.R not found; skipping offline tests"
+          fi
+
+      # ASK THE ARCHIVE WHAT IT HAS. The last day fetched used to be pure
+      # arithmetic, "UTC date minus 6", and when that day was not published yet
+      # every cell west of 120 E landed a day short. probe_archive_edge.R requests
+      # one western point, waits for the daily update if it has not landed, and
+      # prints the newest day that is really there; both R scripts then use it.
+      # If the probe cannot answer, they fall back to the arithmetic.
+      - name: Resolve archive edge
+        env:
+          BLAST_EDGE_WAIT_MIN: "0"   # IFS has no daily update to wait for
+        run: |
+          DE=$(Rscript probe_archive_edge.R | sed -n 's/^EDGE=//p' | tail -n 1)
+          case "$DE" in
+            20[0-9][0-9]-[01][0-9]-[0-3][0-9])
+              echo "BLAST_DATA_END=$DE" >> "$GITHUB_ENV"
+              echo "Archive edge pinned: $DE" ;;
+            *)
+              echo "::warning title=Archive edge not probed::probe returned '$DE'; the scripts fall back to the arithmetic edge" ;;
+          esac
+
+      - name: Continental heatmaps
+        env:
+          BLAST_WEIGHTED_CAP: ${{ github.event.inputs.weighted_cap }}
+        run: Rscript run_blast_grid.R
+
+      # Saved straight after the fetch, before the town table, so a failure further
+      # down no longer costs the two hours of weather just fetched. One parentless
+      # commit, force-pushed to cache-data-ifs and nowhere else.
+      - name: Save weather cache
+        run: |
+          f=blast_outputs_ifs/weather_cache.csv.gz; v=blast_outputs_ifs/cache_version.txt
+          if [ ! -s "$f" ] || [ ! -s "$v" ]; then
+            echo "::error title=Weather cache not saved::$f or $v is missing or empty"
+            exit 1
+          fi
+          new=$(stat -c %s "$f"); newv=$(tr -d '[:space:]' < "$v")
+          if [ -n "$CACHE_BASE" ]; then
+            old=$(git cat-file -s "$CACHE_BASE:weather_cache.csv.gz")
+            oldv=$(git cat-file blob "$CACHE_BASE:cache_version.txt" | tr -d '[:space:]')
+            # On the same schema, a cache under half the size of the one restored is
+            # far more likely a bug than progress.
+            if [ "$oldv" = "$newv" ] && [ "$new" -lt $((old / 2)) ]; then
+              echo "::error title=Weather cache not saved::new cache is $new bytes against $old restored, same schema $newv. Refusing to replace it."
+              exit 1
+            fi
+          elif git ls-remote --exit-code --heads origin cache-data-ifs >/dev/null 2>&1; then
+            # This run started from nothing, yet a cache branch exists now: another
+            # run made it. Do not replace a cache this run never read.
+            echo "::error title=Weather cache not saved::cache-data-ifs appeared during a cold-start run. Refusing to replace it."
+            exit 1
+          fi
+          blob=$(git hash-object -w "$f"); vblob=$(git hash-object -w "$v")
+          tree=$(printf '100644 blob %s\tcache_version.txt\n100644 blob %s\tweather_cache.csv.gz\n' "$vblob" "$blob" | git mktree)
+          commit=$(git -c user.name=github-actions -c user.email=github-actions@github.com commit-tree "$tree" -m "Weather cache ${BLAST_RUN_DATE} (${new} bytes, schema ${newv})")
+          for i in 1 2 3; do git push --force origin "$commit:refs/heads/cache-data-ifs" && break || sleep $((i*10)); done
+          if ! git ls-remote origin refs/heads/cache-data-ifs | grep -q "$commit"; then
+            echo "::error title=Weather cache not saved::the push to cache-data-ifs did not land"
+            exit 1
+          fi
+          echo "Saved cache as $commit ($new bytes)"
+
+      - name: Site table and summary
+        run: Rscript run_blast.R
+
+      # THE SECOND EMAIL STARTS WHEN THE MAP IS COMPLETE, and not before: a map of a
+      # half-filled grid beside the ERA5 one would compare coverage, not weather.
+      # map_stats.txt field 9 is the finest lattice that is complete. The first run
+      # to reach full resolution writes email_started.txt, which is committed, and
+      # from then on every run emails, degraded or not, exactly as the product does.
+      - name: Decide whether to email
+        run: |
+          latch=blast_outputs_ifs/email_started.txt
+          want=$(Rscript -e 'source("blast_config.R"); cat(sprintf("%.2f", GRID_RES_FINEST))')
+          have=$(cut -d'|' -f9 blast_outputs_ifs/map_stats.txt 2>/dev/null | tr -d '[:space:]' || true)
+          if [ -f "$latch" ]; then
+            echo "SEND_IFS_EMAIL=1" >> "$GITHUB_ENV"
+            echo "The second email started on $(cat "$latch"); sending."
+          elif [ -n "$have" ] && [ "$have" = "$want" ]; then
+            echo "$BLAST_RUN_DATE" > "$latch"
+            echo "SEND_IFS_EMAIL=1" >> "$GITHUB_ENV"
+            echo "::notice title=IFS trial::the map is complete to $want deg; the second email starts with this run"
+          else
+            echo "SEND_IFS_EMAIL=0" >> "$GITHUB_ENV"
+            echo "::notice title=IFS trial::map complete to '${have:-nothing yet}' of $want deg; still accumulating, no email this run"
+          fi
+
+      # Never let a missing optional file abort the step. `run:` uses bash -e, so
+      # a `git add` on a path that does not exist used to abort before `git push`.
+      # The weather cache is NOT in this list: see "Save weather cache".
+      - name: Commit trends and run state
+        run: |
+          git config --local user.email "github-actions@github.com"
+          git config --local user.name "github-actions"
+          for f in fetch_failures.csv weighted_spend.csv town_trends.csv blastam_trends.csv \
+                   run_log.csv map_stats.txt midweek_status.txt run_date.txt run_status.txt email_started.txt; do
+            [ -f "blast_outputs_ifs/$f" ] && git add -f "blast_outputs_ifs/$f" || true
+          done
+          git add -u blast_outputs_ifs/ 2>/dev/null || true
+          if git diff --staged --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "IFS weekly run (trends + run state) ${BLAST_RUN_DATE}"
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+            for i in 1 2 3; do git push && break || sleep $((i*10)); done
+          fi
+
+      # Email via a Python stdlib script rather than a JavaScript action: the
+      # send-mail action broke when GitHub forced actions onto Node 24.
+      - name: Email summary and heatmaps
+        if: env.MAIL_USERNAME != '' && env.SEND_IFS_EMAIL == '1'
+        env:
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          # The same recipients as the regular email, unless a MAIL_TO_IFS secret
+          # names a different list for the trial.
+          MAIL_TO: ${{ secrets.MAIL_TO_IFS || secrets.MAIL_TO }}
+        run: |
+          command -v python3 >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq python3; }
+          python3 send_email.py
+
+      # Fallback copy of everything kept for 90 days, in case an email fails.
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blast-outputs-ifs
+          path: blast_outputs_ifs/
+          retention-days: 90
+
+      # FAIL LOUDLY, LAST. Everything above has already been committed, emailed
+      # and uploaded; this step only decides the colour of the run. run_blast.R
+      # writes run_status.txt with degraded=0/1 and the reasons (run_health.R);
+      # a missing file, or one from another run date, means the town step never
+      # finished. A red run makes GitHub notify the workflow's owner, on top of
+      # the "[DEGRADED]" subject line. The 2026-09-07 run delivered 31 towns of
+      # "no data" and the next two a map three weeks stale, and all three showed
+      # a green tick.
+      - name: Verdict
+        if: always()
+        run: |
+          f=blast_outputs_ifs/run_status.txt
+          if [ ! -f "$f" ]; then
+            echo "::error title=Blast run did not finish::$f is missing: run_blast.R did not complete"
+            exit 1
+          fi
+          cat "$f"
+          if ! grep -q "^run_date=${BLAST_RUN_DATE}$" "$f"; then
+            echo "::error title=Blast run did not finish::$f is from another run date"
+            exit 1
+          fi
+          if grep -q '^degraded=1' "$f"; then
+            echo "::error title=Degraded blast run::$(grep '^reasons=' "$f" | cut -d= -f2-)"
+            exit 1
+          fi
+          w=$(grep '^warnings=' "$f" | cut -d= -f2-)
+          if [ -n "$w" ]; then echo "::warning title=Blast run notes::$w"; fi
+          echo "Healthy run."

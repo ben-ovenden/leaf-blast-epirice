@@ -27,7 +27,16 @@ from email.message import EmailMessage
 # suite runs it against fixture files. With BLAST_EMAIL_DRY_RUN=1 every line runs
 # except the SMTP conversation, so a mistake anywhere else is caught by the tests,
 # before a run, rather than by the live send.
-OUT = os.environ.get("BLAST_OUT_DIR", "").strip() or "blast_outputs"
+#
+# BLAST_SOURCE=ifs is the trial run on ECMWF IFS weather that is sent beside the
+# regular email (see section 6b of blast_config.R). It reads its own output
+# directory, and its subject and attachment names say what it is, so the two
+# emails cannot be confused in an inbox or a downloads folder. Unset, nothing
+# here differs from before.
+IS_IFS = os.environ.get("BLAST_SOURCE", "").strip().lower() == "ifs"
+OUT = os.environ.get("BLAST_OUT_DIR", "").strip() or ("blast_outputs_ifs" if IS_IFS else "blast_outputs")
+SUBJECT_TAG = "[IFS trial] " if IS_IFS else ""
+ATTACH_PREFIX = "ifs_" if IS_IFS else ""
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 465
 FROM_NAME = "WWAI Cereal Pathology: blast models"
@@ -85,7 +94,7 @@ def build_subject(run_date, status, map_end):
     """
     town_end = status.get("town_window_end", "")
     window = town_end or map_end
-    subject = f"Blast risk summary {run_date}"
+    subject = f"{SUBJECT_TAG}Blast risk summary {run_date}"
     if window:
         subject += f" (weather to {window}"
         if town_end and map_end and map_end != town_end:
@@ -101,7 +110,7 @@ def attach(msg, path):
     maintype, subtype = (ctype or "application/octet-stream").split("/", 1)
     with open(path, "rb") as f:
         msg.add_attachment(f.read(), maintype=maintype, subtype=subtype,
-                           filename=os.path.basename(path))
+                           filename=ATTACH_PREFIX + os.path.basename(path))
 
 
 def main():

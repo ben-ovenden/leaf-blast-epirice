@@ -24,5 +24,14 @@ blast_outputs/*
 !blast_outputs/midweek_status.txt
 !blast_outputs/.gitkeep
 
+# The IFS trial keeps the same kind of state in its own directory, and its cache
+# on the `cache-data-ifs` branch.
+blast_outputs_ifs/*
+!blast_outputs_ifs/town_trends.csv
+!blast_outputs_ifs/blastam_trends.csv
+!blast_outputs_ifs/fetch_failures.csv
+!blast_outputs_ifs/map_stats.txt
+!blast_outputs_ifs/midweek_status.txt
+
 # Python bytecode from running or compiling send_email.py locally
 __pycache__/
