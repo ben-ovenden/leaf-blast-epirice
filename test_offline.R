@@ -12,6 +12,10 @@
 ################################################################################
 suppressPackageStartupMessages({library(data.table); library(methods)})
 SCRIPT_DIR <- normalizePath(".", winslash = "/")
+# This suite tests the PRODUCT. The IFS trial's workflows export BLAST_SOURCE=ifs
+# to their jobs; clear it here so the same tests mean the same thing wherever
+# they run. Test 31 switches the trial on in an environment of its own.
+Sys.unsetenv("BLAST_SOURCE")
 source("blast_config.R"); source("epirice_model.R"); source("blastam_model.R")
 
 fails <- 0L; n <- 0L
@@ -1114,6 +1118,124 @@ cat("\n30. The BLASTAM cell can be read on every shade\n")
      !grepl("color:#6b7378;font-size:11px", raw, fixed = TRUE))
   ok("the legend chips use the same text colours as the cells",
      grepl("BLASTAM_CELL_BG,\n    BLASTAM_CELL_FG)", gsub("\r", "", raw), fixed = TRUE))
+}
+
+cat("\n31. The IFS trial runs beside the product and cannot touch it\n")
+# From November 2026 a second run on ECMWF IFS weather is sent beside the ERA5
+# email, so the maintainer can compare the two and keep one. The instruction was
+# explicit: do not break the ERA5 run. So the trial is a switch that is OFF
+# unless a workflow sets it, with its own directory, cache branch, workflows,
+# concurrency group and UTC days.
+{
+  cfg_env <- function(src) {
+    old <- Sys.getenv("BLAST_SOURCE", unset = NA)
+    if (is.na(src)) Sys.unsetenv("BLAST_SOURCE") else Sys.setenv(BLAST_SOURCE = src)
+    on.exit(if (is.na(old)) Sys.unsetenv("BLAST_SOURCE") else Sys.setenv(BLAST_SOURCE = old), add = TRUE)
+    e <- new.env(parent = globalenv()); sys.source("blast_config.R", envir = e); e
+  }
+  e0 <- cfg_env(NA); ei <- cfg_env("ifs")
+  ok("with no BLAST_SOURCE the settings are the product's: ERA5, six days back, blast_outputs",
+     e0$BLAST_SOURCE == "era5" && e0$OPENMETEO_MODEL == "era5" && e0$ARCHIVE_LAG_DAYS == 6L &&
+     e0$OUTPUT_DIR == "blast_outputs" && e0$MIDWEEK_MAX_AGE_DAYS == 2L && e0$WEATHER_NAME == "ERA5" &&
+     !nzchar(e0$SOURCE_TAG) && !nzchar(e0$SOURCE_NOTE))
+  ok("and this suite is testing the product, whatever its caller exported",
+     identical(BLAST_SOURCE, "era5") && identical(OUTPUT_DIR, "blast_outputs") && identical(OPENMETEO_MODEL, "era5"))
+  ok("BLAST_SOURCE=ifs selects the IFS archive, two days back, in its own directory",
+     ei$OPENMETEO_MODEL == "ecmwf_ifs" && ei$ARCHIVE_LAG_DAYS == 2L && ei$OUTPUT_DIR == "blast_outputs_ifs" &&
+     ei$WEATHER_NAME == "ECMWF IFS" && nzchar(ei$SOURCE_TAG) && grepl("^Trial version\\.", ei$SOURCE_NOTE))
+  nm0 <- ls(e0, all.names = TRUE); nmi <- ls(ei, all.names = TRUE)
+  same <- function(k) { a <- get(k, envir = e0); b <- get(k, envir = ei)
+    if (is.function(a)) identical(deparse(a), deparse(b)) else identical(a, b) }
+  changed <- if (setequal(nm0, nmi)) Filter(function(k) !same(k), nm0) else "(different settings exist)"
+  allowed <- c("BLAST_SOURCE", "OPENMETEO_MODEL", "ARCHIVE_LAG_DAYS", "OUTPUT_DIR", "MIDWEEK_MAX_AGE_DAYS",
+               "WEATHER_NAME", "WEATHER_GRID_KM", "SOURCE_TAG", "SOURCE_NOTE",
+               "CITATION", "CITATION_MAP", "CAVEAT_CANOPY")
+  ok("and changes nothing else: same models, same thresholds, same grid, same budgets",
+     all(changed %in% allowed), sprintf("(also changed: %s)", paste(setdiff(changed, allowed), collapse = ", ")))
+  ok("the product's wording still says ERA5, the trial's says IFS, from one setting",
+     grepl("Open-Meteo ERA5 archive", e0$CITATION, fixed = TRUE) && grepl("driven by ERA5 ambient", e0$CAVEAT_CANOPY, fixed = TRUE) &&
+     grepl("Open-Meteo ECMWF IFS archive", ei$CITATION, fixed = TRUE) && !grepl("ERA5", ei$CAVEAT_CANOPY, fixed = TRUE))
+  ok("an unknown source stops the run rather than guessing",
+     inherits(tryCatch(cfg_env("gfs"), error = function(e) e), "error"))
+  vars <- c("BLAST_RUN_DATE", "BLAST_UTC_DATE", "BLAST_DATA_END"); old <- Sys.getenv(vars, unset = NA)
+  Sys.setenv(BLAST_RUN_DATE = "2026-11-16", BLAST_UTC_DATE = "2026-11-16"); Sys.unsetenv("BLAST_DATA_END")
+  ok("an IFS run on Monday UTC models to the Friday before; ERA5 on the same day would reach the Monday before",
+     ei$blast_data_end(ei$blast_run_date()) - ei$DAY_CUT_LAG_DAYS == as.Date("2026-11-13") &&
+     e0$blast_data_end(e0$blast_run_date()) - e0$DAY_CUT_LAG_DAYS == as.Date("2026-11-09"))
+  for (v in vars) if (is.na(old[[v]])) Sys.unsetenv(v) else do.call(Sys.setenv, as.list(setNames(old[[v]], v)))
+  ok("the email, the summary and the maps take the source's name and the trial banner from the config",
+     grepl("WEATHER_NAME", tsrc, fixed = TRUE) && grepl("nzchar(SOURCE_NOTE)", tsrc, fixed = TRUE) &&
+     grepl("map_title(title, model_end)", gsrc, fixed = TRUE))
+
+  rd <- function(f) { p <- file.path(".github/workflows", f); if (file.exists(p)) readLines(p, warn = FALSE) else character(0) }
+  crons_of <- function(l) unlist(regmatches(l, gregexpr("(?<=cron: ')[^']+", l, perl = TRUE)))
+  dow <- function(cr) vapply(strsplit(cr, " "), function(x) x[5], character(1))
+  hr  <- function(cr) vapply(strsplit(cr, " "), function(x) as.integer(x[2]), integer(1))
+  iw <- rd("ifs_weekly.yml"); it <- rd("ifs_topup.yml"); ew <- rd("weekly_blast.yml"); et <- rd("midweek_topup.yml")
+  ok("the trial has its own weekly and top-up workflows", length(iw) > 0L && length(it) > 0L)
+  era_days <- dow(crons_of(c(ew, et))); ifs_cr <- crons_of(c(iw, it))
+  ok("on UTC days no ERA5 workflow uses, so the two never share a day's API allowance",
+     length(ifs_cr) >= 2L && length(era_days) >= 3L && !any(dow(ifs_cr) %in% era_days),
+     sprintf("(ERA5 days %s; IFS crons %s)", paste(era_days, collapse = ","), paste(ifs_cr, collapse = " | ")))
+  ok("early in the UTC day, so a start twelve hours late still lands on its own day",
+     length(ifs_cr) >= 2L && all(hr(ifs_cr) <= 6L))
+  both <- paste(c(iw, it), collapse = "\n")
+  ok("they set BLAST_SOURCE=ifs and name only the trial's directory and cache branch",
+     any(grepl("BLAST_SOURCE: ifs", iw, fixed = TRUE)) && any(grepl("BLAST_SOURCE: ifs", it, fixed = TRUE)) &&
+     !grepl("blast_outputs(?!_ifs)", both, perl = TRUE) && !grepl("cache-data(?!-ifs)", both, perl = TRUE))
+  ok("in a concurrency group of their own, so they cannot queue behind or displace an ERA5 run",
+     sum(grepl("^\\s*group: blast-grid-ifs\\s*$", c(iw, it))) == 2L &&
+     sum(grepl("^\\s*group: blast-grid\\s*$", c(ew, et))) == 2L)
+  ok("the ERA5 workflows know nothing of the trial",
+     length(ew) > 0L && length(et) > 0L && !any(grepl("BLAST_SOURCE|_ifs|-ifs|IFS", c(ew, et))))
+  ok("the trial's jobs still run this suite against the product's defaults",
+     sum(grepl("BLAST_SOURCE: \"\"", c(iw, it), fixed = TRUE)) == 2L)
+  ok("the second email waits for a map complete at full resolution, then goes every week",
+     any(grepl("env.SEND_IFS_EMAIL == '1'", iw, fixed = TRUE)) && any(grepl("GRID_RES_FINEST", iw, fixed = TRUE)) &&
+     sum(grepl("email_started.txt", iw, fixed = TRUE)) >= 2L && !any(grepl("send_email.py", it, fixed = TRUE)))
+  ok("the first run may start from no cache, but no run overwrites a cache it did not read",
+     sum(grepl("git ls-remote --exit-code --heads origin cache-data-ifs", c(iw, it), fixed = TRUE)) == 4L &&
+     sum(grepl("appeared during a cold-start run", c(iw, it), fixed = TRUE)) == 2L)
+  gi <- readLines(".gitignore", warn = FALSE)
+  ok("the trial's cache is kept off main, like the product's",
+     any(gi == "blast_outputs_ifs/*") && !any(grepl("^!blast_outputs_ifs/(weather_cache|cache_version)", gi)))
+
+  # The sender, run for real in both modes (everything but the SMTP conversation).
+  cands <- Sys.which(c("python3", "python", "py")); cands <- unname(cands[nzchar(cands)])
+  pyx <- NA_character_
+  for (p in cands) if (isTRUE(tryCatch(suppressWarnings(system2(p, "--version", stdout = FALSE, stderr = FALSE)) == 0L,
+                                       error = function(e) FALSE))) { pyx <- p; break }
+  if (is.na(pyx)) {
+    cat("  SKIP  no working python here; the sender's two modes are exercised in CI\n")
+  } else {
+    fx <- tempfile("blast_email_ifs_"); dir.create(fx)
+    writeLines("plain body", file.path(fx, "blast_summary_latest.txt"))
+    writeLines("<p>html body</p>", file.path(fx, "blast_summary_latest.html"))
+    writeLines(c("town,2026-11-13", "Dubbo,0"), file.path(fx, "town_trends.csv"))
+    writeLines(c("town,2026-11-13", "Dubbo,0"), file.path(fx, "blastam_trends.csv"))
+    writeLines("7721|0.30|7721|0.30|gz|5126|gz|2026-11-13|0.30|7721|0.0331|14||epirice+blastam|0||",
+               file.path(fx, "map_stats.txt"))
+    writeLines(c("town_window_end=2026-11-13", "degraded=0", "reasons="), file.path(fx, "run_status.txt"))
+    dry <- function(source) {
+      vars <- c("MAIL_USERNAME", "MAIL_PASSWORD", "MAIL_TO", "BLAST_RUN_DATE", "RUN_DATE",
+                "BLAST_OUT_DIR", "BLAST_EMAIL_DRY_RUN", "BLAST_SOURCE")
+      old <- Sys.getenv(vars, unset = NA)
+      Sys.setenv(MAIL_USERNAME = "sender@example.org", MAIL_PASSWORD = "x", MAIL_TO = "a@example.org",
+                 BLAST_RUN_DATE = "2026-11-16", BLAST_OUT_DIR = fx, BLAST_EMAIL_DRY_RUN = "1")
+      if (is.na(source)) Sys.unsetenv("BLAST_SOURCE") else Sys.setenv(BLAST_SOURCE = source)
+      on.exit(for (v in names(old))
+        if (is.na(old[[v]])) Sys.unsetenv(v) else do.call(Sys.setenv, as.list(setNames(old[[v]], v))), add = TRUE)
+      paste(suppressWarnings(system2(pyx, "send_email.py", stdout = TRUE, stderr = TRUE)), collapse = "\n")
+    }
+    o_ifs <- dry("ifs"); o_era <- dry(NA)
+    ok("the trial's email says what it is in the subject",
+       grepl("subject '[IFS trial] Blast risk summary 2026-11-16 (weather to 2026-11-13)'", o_ifs, fixed = TRUE),
+       sprintf("(%s)", substr(o_ifs, 1, 300)))
+    ok("and the product's subject is exactly as it was",
+       grepl("subject 'Blast risk summary 2026-11-16 (weather to 2026-11-13)'", o_era, fixed = TRUE),
+       sprintf("(%s)", substr(o_era, 1, 300)))
+    unlink(fx, recursive = TRUE)
+  }
 }
 
 cat(sprintf("\n%d tests, %d failures\n", n, fails))
