@@ -802,12 +802,6 @@ legend_ticks <- function(hmax, s, n = 5L) {
   list(at = disp_at, labels = format(true_at, trim = TRUE))
 }
 
-# The IFS trial's maps say so in the title, so a saved attachment cannot be
-# mistaken for the product's. The product's title is unchanged.
-map_title <- function(title, model_end)
-  sprintf("%s%s  weather to %s",
-          if (exists("SOURCE_TAG") && nzchar(SOURCE_TAG)) "IFS: " else "", title, format(model_end))
-
 render_map <- function(pts, valcol, title, colours, hmax, stretch, legend, base,
                        obs_max = NA_real_, obs_fmt = "%.3f", stale_pts = NULL) {
   if (nrow(pts) < 3) {
@@ -892,13 +886,13 @@ render_map <- function(pts, valcol, title, colours, hmax, stretch, legend, base,
   plotted <- tryCatch({
     terra::plot(rs, col = ramp, range = c(0, rmax), xlab = "Longitude", ylab = "Latitude",
                 ext = frame,
-                main = map_title(title, model_end),
+                main = sprintf("%s  weather to %s", title, format(model_end)),
                 plg = list(title = legend, at = tk$at, labels = tk$labels))
     TRUE
   }, error = function(e) FALSE)
   if (!plotted)
     terra::plot(rs, col = ramp, range = c(0, rmax), xlab = "Longitude", ylab = "Latitude",
-                main = map_title(title, model_end),
+                main = sprintf("%s  weather to %s", title, format(model_end)),
                 plg = list(title = legend))
 
   # Grey goes on before the line overlays so roads, rivers and coast sit on top.

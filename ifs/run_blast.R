@@ -1,0 +1,849 @@
+#!/usr/bin/env Rscript
+################################################################################
+# run_blast.R
+#
+# Weekly rice leaf blast risk for the monitoring towns, using EPIRICE (Savary
+# et al. 2012) and BLASTAM (Koshimizu 1988), driven by Open-Meteo weather.
+#
+#   Rscript run_blast.R
+#
+# Pipeline:
+#   1. Fetch hourly weather for all towns in ONE batched request.
+#   2. Run both models per town over the rolling CROP_AGE_DAYS window.
+#   3. Report current intensity, its recent trend, a risk band, BLASTAM days and
+#      the number of nights that could not be judged.
+#   4. Write a CSV, a text summary and an HTML body for the email step.
+#
+# CHANGES IN THIS REVISION
+#   * The run date comes from blast_run_date() once, so the town table and the
+#     maps can no longer be dated differently when a run straddles midnight.
+#   * The BLASTAM window is bounded at both ends inside blastam_score(), so the
+#     town figure is the same 21 day count the map reports, not 22.
+#   * The daily series is checked for calendar gaps before SEIR sees it. SEIR
+#     indexes by position; only the grid runner used to screen for this.
+#   * The town fetch is budgeted against the shared weighted-spend ledger.
+#   * Reporting fixes: the wetness threshold is described as the temperature
+#     dependent curve actually used, not a fixed 10 h; intensity is printed to
+#     three decimals so the 0.2% and 1% band edges are resolvable; the trend
+#     column shows a dash rather than "+0.00" for no change; unjudged nights are
+#     surfaced; bands use the NSW Government palette; trends columns are keyed on
+#     the DATA end date and blanks are written as NA.
+#
+# CHANGES AFTER THE SEPTEMBER 2026 OUTAGE
+#   * data_end comes from blast_data_end(), so the town table and the maps agree
+#     on a window the archive actually holds (see blast_config.R section 2).
+#   * An hourly HTTP 429 is waited out, for at most TOWN_QUOTA_WAIT_MAX_MIN, rather
+#     than producing 31 towns of "no data" as on 2026-09-07. After a 429 that
+#     could not be waited out, the serial fallback is skipped: it is unpaced and
+#     unbudgeted, and it would only be refused too.
+#   * The "Degraded run" banner is built from what the grid run recorded in
+#     map_stats.txt (cells drawn grey, their ages, the fetch's own reason) and no
+#     longer asserts that the daily quota was spent. In September 2026 it said so
+#     three weeks running while the quota had not been spent at all.
+#   * A health verdict (run_health.R) is written to blast_outputs/run_status.txt:
+#     the email subject gains "[DEGRADED]" and the town window, and the workflow's
+#     final step turns the run red, once everything has been committed and sent.
+#     This script still exits 0 on a degraded run, so that it IS sent.
+#   * Towns the batch did not deliver are retried one per request through the
+#     SAME fetch_points_batched() path: budget, pacer, ledger and 429 handling.
+#     The old serial fallback called the single-point adapter directly, so a
+#     rerun the ledger had capped at 42 weighted calls fetched 29 towns off the
+#     books (2026-09-21).
+#   * A rerun over the same data window cannot make the record worse: trends
+#     blanks are filled from the earlier run's column, and the run log keeps the
+#     row that modelled the most towns.
+#   * The weekly email reports the last grid top-up run on a weekly cadence.
+################################################################################
+
+SCRIPT_DIR <- tryCatch(
+  normalizePath(dirname(sys.frame(1)$ofile), winslash = "/"),
+  error = function(e) normalizePath(getwd(), winslash = "/")
+)
+
+source(file.path(SCRIPT_DIR, "blast_config.R"))
+# THE IFS TRIAL'S COPY of this script (see README.md in this directory). It must
+# be run from ifs/, where blast_config.R is the trial's. From anywhere else it
+# would load another config and write into another directory; refuse instead.
+if (!isTRUE(get0("IFS_TRIAL")))
+  stop("this is the IFS trial's copy: run it from the ifs/ directory", call. = FALSE)
+source(file.path(SCRIPT_DIR, "epirice_model.R"))
+source(file.path(SCRIPT_DIR, "blastam_model.R"))
+source(file.path(SCRIPT_DIR, "openmeteo_wth.R"))
+source(file.path(SCRIPT_DIR, "openmeteo_batch.R"))
+source(file.path(SCRIPT_DIR, "run_health.R"))
+
+suppressPackageStartupMessages({library(data.table); library(methods)})
+
+# ---- One run date, one window ----------------------------------------------
+RUN_DATE  <- blast_run_date()
+data_end  <- blast_data_end(RUN_DATE)         # last day FETCHED; lag counted from
+                                              # the UTC date when that is earlier
+end_date  <- data_end - DAY_CUT_LAG_DAYS      # last day MODELLED
+emergence <- end_date - CROP_AGE_DAYS
+run_tag   <- format(RUN_DATE, "%Y-%m-%d")
+data_tag  <- format(end_date, "%Y-%m-%d")
+
+classify <- function(intensity) {
+  if (is.na(intensity)) return("no data")
+  if (intensity < INTENSITY_LOW_MAX) return("low")
+  if (intensity < INTENSITY_MODERATE_MAX) return("moderate")
+  "high"
+}
+
+# Intensity is a fraction of leaf sites. Three decimals as a percentage, because
+# the band edges are 0.2% and 1% and one decimal cannot resolve either: the
+# 2026-07-30 email printed "0.00%" beside a "low" band for every town.
+fmt_pct <- function(x) if (is.na(x)) "-" else sprintf("%.3f%%", x * 100)
+fmt_chg <- function(x) {
+  if (is.na(x)) return("-")
+  v <- x * 100
+  if (abs(v) < 0.0005) "-" else sprintf("%+.3f", v)
+}
+
+na_row_for <- function(name, lat, lon, level = "no data") {
+  data.table(name = name, lat = lat, lon = lon,
+             intensity = NA_real_, peak = NA_real_, trend7 = NA_real_,
+             level = level, last_date = NA_character_, days = 0L,
+             blast_events = NA_integer_, blast_recent = NA_integer_,
+             blast_semi = NA_integer_, blast_unjudged = NA_integer_,
+             blast_window = NA_integer_, note = "no usable weather")
+}
+
+# SEIR indexes the weather vector by POSITION, so a missing calendar day shifts
+# every later day against crop age. Return the longest continuous run ending at
+# the last available date, and report what was dropped.
+trim_to_continuous <- function(dd) {
+  setorder(dd, date)
+  n <- nrow(dd)
+  if (n < 2L) return(dd)
+  gaps <- which(as.integer(diff(dd$date)) != 1L)
+  if (length(gaps) == 0L) return(dd)
+  dd[(max(gaps) + 1L):n]
+}
+
+# Model one town from its daily rows.
+model_town <- function(name, lat, lon, dd, emergence, end_date) {
+  if (is.null(dd) || nrow(dd) == 0L) return(na_row_for(name, lat, lon))
+  dd <- as.data.table(dd)[date <= end_date]
+  if (nrow(dd) == 0L) return(na_row_for(name, lat, lon))
+
+  # BLASTAM is scored on the full series, gaps and all: an unjudgeable night is
+  # already NA, so a gap lowers `unjudged` rather than corrupting the count.
+  lagd <- if (exists("BLASTAM_END_LAG_DAYS")) BLASTAM_END_LAG_DAYS else 0L
+  bs <- blastam_score(dd$infect, dd$semi, dd$date, end_date - lagd,
+                      window = BLASTAM_WINDOW_DAYS, recent = BLASTAM_RECENT_DAYS)
+  semi_n <- sum(dd$semi[dd$date > (end_date - lagd - BLASTAM_WINDOW_DAYS) &
+                        dd$date <= (end_date - lagd)], na.rm = TRUE)
+
+  bl <- function(r) { r[, `:=`(blast_events = bs$events, blast_recent = bs$recent,
+                               blast_semi = as.integer(semi_n),
+                               blast_unjudged = bs$unjudged,
+                               blast_window = as.integer(bs$n_days))]; r }
+
+  cont <- trim_to_continuous(dd)
+  dropped <- nrow(dd) - nrow(cont)
+  if (nrow(cont) < MIN_DAYS)
+    return(bl(na_row_for(name, lat, lon))[, note := "series too short for EPIRICE"])
+
+  wth <- data.table(YYYYMMDD = cont$date,
+                    DOY = as.integer(format(cont$date, "%j")),
+                    TEMP = cont$TEMP, RHUM = cont$RHUM, RAIN = cont$RAIN,
+                    LAT = lat, LON = lon)
+  setorder(wth, YYYYMMDD)
+  duration <- as.integer(min(120L, nrow(wth)))
+  lb <- tryCatch(predict_leaf_blast(wth, emergence = wth$YYYYMMDD[1], duration = duration),
+                 error = function(e) NULL)
+  if (is.null(lb) || nrow(lb) == 0)
+    return(bl(na_row_for(name, lat, lon))[, note := "EPIRICE did not converge"])
+
+  cur <- lb$intensity[nrow(lb)]
+  bl(data.table(name = name, lat = lat, lon = lon,
+                intensity = cur, peak = max(lb$intensity, na.rm = TRUE),
+                trend7 = if (nrow(lb) > 7) cur - lb$intensity[nrow(lb) - 7] else NA_real_,
+                level = classify(cur),
+                last_date = as.character(lb$dates[nrow(lb)]),
+                days = duration,
+                blast_events = NA_integer_, blast_recent = NA_integer_,
+                blast_semi = NA_integer_, blast_unjudged = NA_integer_,
+                blast_window = NA_integer_,
+                note = if (dropped > 0)
+                  sprintf("%d day(s) before a gap excluded", dropped) else ""))
+}
+
+# ---- Run all towns ---------------------------------------------------------
+cat("\nRice leaf blast risk (EPIRICE + BLASTAM / Open-Meteo)\n")
+cat(strrep("=", 60), "\n")
+blastam_check_fetch_arithmetic()
+
+sites <- as.data.table(MONITOR_TOWNS)
+sites[, pid := sprintf("%s", name)]
+
+cat("Run date:   ", format(RUN_DATE, "%A %d %B %Y"), " (UTC date ", format(blast_utc_date()), ")\n", sep = "")
+cat("Fetched to: ", format(data_end, "%Y-%m-%d"),
+    if (data_end < blast_archive_edge(RUN_DATE))
+      sprintf(" (the archive's newest day, as probed; the arithmetic edge is %s)\n",
+              format(blast_archive_edge(RUN_DATE)))
+    else sprintf(" (archive lag %d days from the earlier of the two dates)\n", ARCHIVE_LAG_DAYS),
+    sep = "")
+cat("Modelled to:", format(end_date, "%Y-%m-%d"), " (model day cut at ",
+    BLASTAM_DAY_CUT_HOUR, ":00 local solar, so the last fetched day is partial)\n", sep = "")
+cat("Crop age:   ", CROP_AGE_DAYS, " days (rolling emergence ",
+    format(emergence), ")\n\n", sep = "")
+
+# One batched request covers all towns, with BLASTAM_LEADIN_DAYS of lead-in that
+# is computed and then discarded, and lon passed so the model day and night
+# window are in local solar time.
+fetch_from <- emergence - BLASTAM_LEADIN_DAYS
+OUT <- file.path(SCRIPT_DIR, OUTPUT_DIR)
+dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
+ledger_path <- file.path(OUT, SPEND_LEDGER_FILE)
+already <- om_spend_read(ledger_path)
+town_budget <- max(0, DAILY_WEIGHTED_HARD_CAP - already)
+cat(sprintf("Weighted quota: %.0f already spent today, %.0f available to this run.\n",
+            already, town_budget))
+
+town_daily <- new.env(parent = emptyenv())
+on_town <- function(pid, lon, lat, hw) {
+  w <- tryCatch(blastam_daily_from_hourly(hw, lon = lon), error = function(e) NULL)
+  if (is.null(w) || nrow(w) == 0) return(NULL)
+  w <- w[date >= emergence & date <= end_date]
+  if (nrow(w) == 0) return(NULL)
+  assign(pid, as.data.table(w), envir = town_daily)
+  data.table(pid = pid)          # non-empty return marks the point as ok
+}
+# The town run has no fetch deadline of its own, so its 429 waiting is bounded by
+# TOWN_QUOTA_WAIT_MAX_MIN; the workflow's timeout-minutes allows for it.
+fr <- fetch_points_batched(sites[, .(pid, lon, lat)], fetch_from, data_end,
+                           on_point = on_town, budget = town_budget, label = "towns",
+                           quota_wait_max_s = TOWN_QUOTA_WAIT_MAX_MIN * 60)
+om_spend_add(ledger_path, fr$spent, "towns")
+
+# Second pass for towns the batch did not deliver: one town per request, through
+# the SAME budget, pacer, spend ledger and 429 handling as the first pass. This
+# used to call get_openmeteo_hourly() directly: unpaced, uncharged and invisible
+# to the ledger, so the 2026-09-21 rerun, which the ledger had correctly capped
+# at 42 weighted calls, went on to fetch 29 towns off the books.
+#
+# Not after a 429 that could not be waited out: it would only be refused again.
+missing <- setdiff(sites$pid, ls(town_daily))
+if (length(missing) > 0 && identical(fr$stopped, "quota")) {
+  cat(sprintf("Second pass skipped for %d town(s): the API quota ceiling was hit and could not be waited out.\n",
+              length(missing)))
+} else if (length(missing) > 0 && fr$spent < town_budget) {
+  cat(sprintf("Second pass for %d town(s), one per request: %s\n",
+              length(missing), paste(missing, collapse = ", ")))
+  fr2 <- fetch_points_batched(sites[pid %in% missing, .(pid, lon, lat)], fetch_from, data_end,
+                              on_point = on_town, budget = town_budget - fr$spent,
+                              label = "towns-retry", batch_size = 1L,
+                              quota_wait_max_s = TOWN_QUOTA_WAIT_MAX_MIN * 60)
+  om_spend_add(ledger_path, fr2$spent, "towns-retry")
+  fr$spent <- fr$spent + fr2$spent          # the run log records the whole town spend
+  if (identical(fr2$stopped, "quota")) fr$stopped <- "quota"
+}
+
+results <- rbindlist(lapply(seq_len(nrow(sites)), function(k) {
+  s <- sites[k]
+  dd <- if (exists(s$pid, envir = town_daily, inherits = FALSE))
+    get(s$pid, envir = town_daily) else NULL
+  model_town(s$name, s$lat, s$lon, dd, emergence, end_date)
+}), fill = TRUE)
+
+for (k in seq_len(nrow(results))) {
+  r <- results[k]
+  msg <- if (is.na(r$intensity)) r$level else sprintf("%s (%s)", fmt_pct(r$intensity), r$level)
+  cat(sprintf("%-16s ... %s\n", r$name, msg))
+}
+
+# Attach state and order by state then town
+st <- as.data.table(MONITOR_TOWNS)[, .(name, state)]
+results <- merge(results, st, by = "name", all.x = TRUE, sort = FALSE)
+results[is.na(state), state := "--"]
+setorder(results, state, name)
+
+# ---- Summary ---------------------------------------------------------------
+counts <- results[, .N, by = level]
+getn <- function(lv) { x <- counts[level == lv, N]; if (length(x)) x else 0L }
+n_unjudged <- sum(results$blast_unjudged, na.rm = TRUE)
+
+wet_rule <- if (isTRUE(BLASTAM_USE_BJ_THRESHOLD)) {
+  paste0("reaches a temperature dependent minimum (about ",
+         sprintf("%.0f", blastam_bj_min_hours(16)), " h at 16 C falling to about ",
+         sprintf("%.0f", blastam_bj_min_hours(27)), " h at 27 C; Barksdale and Jones 1965)")
+} else {
+  sprintf("reaches at least %d h (Koshimizu's fixed threshold)", BLASTAM_WET_HOURS_FIXED)
+}
+# The pieces of the email's "How the models work" list. Every number comes from
+# the setting or the curve the models actually ran with, so the email cannot
+# drift from the code. The EPIRICE constants (onset, the wet day gate, the
+# latent and infectious periods, RcOpt) are literals in predict_leaf_blast().
+wet_html <- if (isTRUE(BLASTAM_USE_BJ_THRESHOLD)) {
+  sprintf(paste0("a temperature dependent minimum, about %.0f h at 16&deg;C falling to ",
+                 "about %.0f h at 27&deg;C (Barksdale &amp; Jones 1965; Koshimizu used a ",
+                 "fixed 10 h)"),
+          blastam_bj_min_hours(16), blastam_bj_min_hours(27))
+} else {
+  sprintf("%d h (Koshimizu's fixed threshold)", BLASTAM_WET_HOURS_FIXED)
+}
+raised <- function(v) if (v > 25) " (upper limit raised from Koshimizu's 25&deg;C)" else ""
+heavy_html <- if (is.finite(BLASTAM_RAIN_HEAVY))
+  sprintf("; hours with %s mm or more are left out, as heavy rain washes spores off (Yoshino 1988)",
+          format(BLASTAM_RAIN_HEAVY)) else ""
+rct_tab <- epirice_rct()
+rct_at  <- function(t) 100 * rct_tab[rct_tab[, 1] == t, 2]
+band_lo <- sprintf("%g", INTENSITY_LOW_MAX * 100)
+band_hi <- sprintf("%g", INTENSITY_MODERATE_MAX * 100)
+
+# Read the grid's stats line (written by run_blast_grid.R).
+# Fields: mapped | mean_land_spacing | mapped_last_run | finest | fmt | kb |
+#         read_fmt | window_end | complete_res | weighted_spent | obs_max_epi |
+#         obs_max_blastam | fallback_note | rendered | n_grey | stale_note |
+#         fetch_reason
+map_growth_line <- function() {
+  f <- file.path(OUT, "map_stats.txt")
+  if (!file.exists(f)) return(NULL)
+  s <- tryCatch(strsplit(readLines(f, warn = FALSE)[1], "\\|")[[1]],
+                error = function(e) NULL)
+  if (length(s) < 4) return(NULL)
+  fld <- function(i, f = identity) if (length(s) >= i && nzchar(s[i])) f(s[i]) else NA
+  now    <- as.integer(s[1]);  finest <- as.numeric(s[4]); prev <- as.integer(s[3])
+  fmt    <- fld(5); kb <- fld(6, as.numeric); rd <- fld(7); wend <- fld(8)
+  cres   <- fld(9, as.numeric); spent <- fld(10, as.numeric)
+  mx_epi <- fld(11, as.numeric); mx_bl <- fld(12, as.numeric)
+  wnote  <- if (length(s) >= 13 && nzchar(trimws(s[13]))) trimws(s[13]) else NA_character_
+  rendered <- if (length(s) >= 14) trimws(s[14]) else NA_character_
+  n_grey <- if (length(s) >= 15) suppressWarnings(as.integer(s[15])) else NA_integer_
+
+  chg <- if (is.na(prev) || prev <= 0) ""
+         else if (now > prev) sprintf(" (up from %d mapped last run)", prev)
+         else if (now < prev) sprintf(" (down from %d mapped last run)", prev)
+         else " (steady)"
+  cbit <- if (is.na(cres)) "" else
+    sprintf(" Complete to %.2f deg (~%.0f km cells).", cres, cres * 111)
+  wtxt <- if (is.na(wend)) "" else {
+    d <- suppressWarnings(as.Date(wend))
+    if (is.na(d)) "" else sprintf(" All cells modelled over one window to %s.", format(d, "%d %b"))
+  }
+  # Observed maxima, so a flat map is distinguishable from a broken one.
+  mbit <- if (is.na(mx_epi) && is.na(mx_bl)) "" else
+    sprintf(" Observed maxima: EPIRICE %s, BLASTAM %s.",
+            if (is.na(mx_epi)) "NA" else sprintf("%.3f%%", mx_epi),
+            if (is.na(mx_bl))  "NA" else sprintf("%.0f days", mx_bl))
+  cache_bit <- if (is.na(fmt) || is.na(kb)) "" else {
+    active <- if (!is.na(rd) && rd %in% c("gz", "csv")) rd
+              else if (grepl("^gz", fmt)) "gz" else "csv"
+    sprintf(" Cache: %s active, %s.", active,
+            if (kb >= 1024) sprintf("%.1f MB", kb / 1024) else sprintf("%.0f KB", kb))
+  }
+  qbit <- if (is.na(spent)) "" else sprintf(" Used ~%.0f weighted API calls.", spent)
+  gbit <- if (!is.na(n_grey) && n_grey > 0)
+    sprintf(" %d cell(s) drawn grey: not refreshed to that window.", n_grey) else ""
+  sprintf("%d cells on a %.2f deg lattice%s.%s%s%s%s%s%s",
+          now, finest, chg, cbit, wtxt, gbit, mbit, cache_bit, qbit)
+}
+mg <- map_growth_line()
+
+# Degraded-run banner. A run that could not refresh still models from cache and
+# still emails, but it must say so rather than quietly arriving with an older
+# window, with grey cells, or without a map. Every sentence here comes from what
+# the grid run recorded: the banner used to end with "usually because the daily
+# weather-API quota was already spent", which in September 2026 was untrue three
+# weeks running.
+map_warning <- function() {
+  f <- file.path(OUT, "map_stats.txt")
+  if (!file.exists(f)) return(NULL)
+  s <- tryCatch(strsplit(readLines(f, warn = FALSE)[1], "\\|")[[1]],
+                error = function(e) NULL)
+  if (length(s) < 13) return(NULL)
+  fld <- function(i) if (length(s) >= i) trimws(s[i]) else ""
+  wnote  <- fld(13); rend <- fld(14)
+  n_grey <- suppressWarnings(as.integer(fld(15)))
+  stale  <- fld(16); reason <- fld(17)
+  miss <- setdiff(c("epirice", "blastam"), strsplit(rend, "\\+")[[1]])
+  parts <- c(
+    if (nzchar(wnote)) paste0("The map ", wnote,
+      ". The coloured cells are real cached weather, all on one window, just an older one.") else NULL,
+    if (!is.na(n_grey) && n_grey > 0 && nzchar(stale)) paste0(stale, ".") else NULL,
+    if (nzchar(reason) && (nzchar(wnote) || (!is.na(n_grey) && n_grey > 0)))
+      paste0("Why: ", reason, ".") else NULL,
+    if (nzchar(rend) && length(miss) > 0) sprintf(
+      "The %s heatmap could not be rendered this run and is not attached.",
+      paste(miss, collapse = " and ")) else NULL)
+  if (length(parts) == 0) NULL else paste(parts, collapse = " ")
+}
+mwarn <- map_warning()
+
+# ---- Health verdict --------------------------------------------------------
+# Judged once, here, from the town table and the grid's stats line. Written to
+# RUN_STATUS_FILE for send_email.py (the "[DEGRADED]" subject) and for the
+# workflow's final step (a red run). A town shortfall is named in the banner too;
+# the map's own problems are already described by map_warning().
+ms_fields <- tryCatch(strsplit(readLines(file.path(OUT, "map_stats.txt"), warn = FALSE)[1], "\\|")[[1]],
+                      error = function(e) character(0))
+msf <- function(i) if (length(ms_fields) >= i) trimws(ms_fields[i]) else ""
+map_end  <- suppressWarnings(as.Date(msf(8)))
+towns_ok <- sum(!is.na(results$intensity))
+verdict <- health_verdict(
+  towns_modelled = towns_ok, towns_total = nrow(results),
+  map_behind_days = if (is.na(map_end)) 0L else as.integer(end_date - map_end),
+  map_cells = suppressWarnings(as.integer(msf(1))),
+  map_cells_prev = suppressWarnings(as.integer(msf(3))),
+  map_grey = suppressWarnings(as.integer(msf(15))),
+  fetch_reason = msf(17))
+if (any(grepl("towns modelled", verdict$reasons, fixed = TRUE)))
+  mwarn <- paste(c(sprintf("Only %d of %d towns could be modelled this run; the rest show as no data.",
+                           towns_ok, nrow(results)), mwarn), collapse = " ")
+
+# The grid top-up (.github/workflows/midweek_topup.yml) writes
+# midweek_status.txt: date | cells after | cells before | added | fmt | KB |
+# cells fetched. It is a weekly job, so "none in the last MIDWEEK_MAX_AGE_DAYS"
+# is the complaint; the line used to assume a DAILY job that never existed and
+# would have complained every Monday.
+midweek_line <- function() {
+  f <- file.path(OUT, "midweek_status.txt")
+  if (!file.exists(f)) return(NULL)
+  s <- tryCatch(strsplit(readLines(f, warn = FALSE)[1], "\\|")[[1]],
+                error = function(e) NULL)
+  if (length(s) < 4) return(NULL)
+  d <- suppressWarnings(as.Date(s[1])); pts <- as.integer(s[2]); added <- as.integer(s[4])
+  fetched <- if (length(s) >= 7) suppressWarnings(as.integer(s[7])) else NA_integer_
+  max_age <- if (exists("MIDWEEK_MAX_AGE_DAYS")) MIDWEEK_MAX_AGE_DAYS else 7L
+  if (is.na(d) || as.integer(RUN_DATE - d) > max_age)
+    sprintf("Grid top-up: none in the last %d days (last %s); check the top-up workflow.",
+            max_age, if (is.na(d)) "never" else format(d, "%a %d %b"))
+  else
+    sprintf("Grid top-up ran %s: %s%d new cell(s), cache now %d.",
+            format(d, "%a %d %b"),
+            if (is.na(fetched)) "" else sprintf("%d cell(s) fetched, ", fetched),
+            added, pts)
+}
+mw <- midweek_line()
+
+summary_lines <- c(
+  paste0("Blast risk summary", if (nzchar(SOURCE_TAG)) paste0(" (", SOURCE_TAG, ")") else ""),
+  strrep("=", 60),
+  if (nzchar(SOURCE_NOTE)) c(strwrap(SOURCE_NOTE, width = 78), "") else NULL,
+  paste0("Generated:   ", format(RUN_DATE, "%A %d %B %Y")),
+  paste0("Models:      EPIRICE (Savary et al. 2012) + BLASTAM (Koshimizu 1988)"),
+  paste0("Weather:     Open-Meteo ", WEATHER_NAME, " archive, to ", format(end_date, "%Y-%m-%d")),
+  sprintf("EPIRICE:     %d day window, RcT infection optimum %d C",
+          CROP_AGE_DAYS, EPIRICE_RCT_PEAK),
+  sprintf("Cache schema: version %d", CACHE_SCHEMA_VERSION),
+  "",
+  sprintf("EPIRICE bands  High:%d  Moderate:%d  Low:%d  No data:%d",
+          getn("high"), getn("moderate"), getn("low"), getn("no data")),
+  "",
+  sprintf("Town detail: EPIRICE intensity + BLASTAM favourable days (last %d), by state:",
+          BLASTAM_WINDOW_DAYS),
+  strrep("-", 60)
+)
+cur_state <- ""
+for (k in seq_len(nrow(results))) {
+  r <- results[k]
+  if (r$state != cur_state) {
+    cur_state <- r$state
+    summary_lines <- c(summary_lines, "", paste0("[", cur_state, "]"))
+  }
+  bl <- if (is.na(r$blast_events)) "-" else
+    sprintf("%d days (%dd %d)", r$blast_events, BLASTAM_RECENT_DAYS, r$blast_recent)
+  uj <- if (!is.na(r$blast_unjudged) && r$blast_unjudged > 0)
+    sprintf(" [%d night(s) not judged]", r$blast_unjudged) else ""
+  summary_lines <- c(summary_lines,
+    sprintf("  %-16s EPIRICE %8s %-9s  BLASTAM %s%s",
+            r$name, fmt_pct(r$intensity), r$level, bl, uj))
+}
+summary_lines <- c(summary_lines, "",
+  "About these estimates: two different models",
+  strrep("-", 60),
+  "EPIRICE (intensity %) mechanistically simulates the whole epidemic. It steps",
+  sprintf("through a crop %d days old at the final day, tracking healthy, latent,", CROP_AGE_DAYS),
+  "infectious and removed leaf sites, and reports the proportion of leaf tissue",
+  "diseased. Intensity is (diseased - removed) / (total sites - removed) on the",
+  "final day. It is slow and cumulative and reads near zero in cool, dry weather.",
+  "",
+  "The EPIRICE wetness gate opens on a daily MEAN RH of 90% or a daily rain SUM",
+  "of 5 mm. A 24 hour mean of 90% requires an all day saturated air mass and is",
+  "rarely reached, so in practice this configuration is driven by the rain branch.",
+  "",
+  "BLASTAM (infection days) is the Japanese infection-warning model (Koshimizu",
+  "1988). For each night it judges whether conditions favoured a NEW infection and",
+  sprintf("counts the favourable nights in the last %d days. A night is favourable when", BLASTAM_WINDOW_DAYS),
+  paste0("all three hold: leaf wetness ", wet_rule, ";"),
+  sprintf("mean temperature during wetness %d-%d C; and the PRECEDING 5 day mean",
+          BLASTAM_TWET_MIN, BLASTAM_TWET_MAX),
+  sprintf("temperature %d-%d C (upper bounds raised from Japan's 25 C for warm",
+          BLASTAM_PREV5_MIN, BLASTAM_PREV5_MAX),
+  "conditions). If the wetness bar is met but one temperature condition fails, the",
+  "night is only semi-favourable and is reported separately in the CSV.",
+  "",
+  sprintf("The model day runs from %02d:00 local solar so a night's wet period and",
+          BLASTAM_DAY_CUT_HOUR),
+  "rainfall sit inside one day rather than being split at midnight.",
+  "",
+  "Nights that could not be judged, from missing hours or insufficient lead-in,",
+  "are counted separately and are NOT scored as unfavourable.",
+  if (n_unjudged > 0)
+    sprintf("This run: %d unjudged night(s) across all towns.", n_unjudged)
+  else "This run: no unjudged nights.",
+  "",
+  "Used together: BLASTAM flags when infection windows open (useful for timing a",
+  "response), while EPIRICE estimates the disease that may result.",
+  "",
+  strwrap(CAVEAT_CANOPY, width = 78),
+  "",
+  "Reading the trends CSVs: emergence is taken as (last modelled date minus",
+  sprintf("%d days) and therefore MOVES each run, so a row is a rolling %d day", CROP_AGE_DAYS, CROP_AGE_DAYS),
+  "window through time, not a cumulative season total. Columns are keyed on the",
+  "DATA end date, not the run date, and run_log.csv records the schema and model",
+  "options behind each column so a change of method is not read as a change in",
+  "the weather.",
+  "",
+  "Bands and thresholds are provisional; calibrate against field observations.",
+  "",
+  if (exists("CITATION")) CITATION else NULL,
+  if (!is.null(mg) || !is.null(mw)) "" else NULL,
+  if (!is.null(mwarn)) paste0("NOTE:    ", mwarn) else NULL,
+  if (!is.null(mg)) paste0("Map:     ", mg) else NULL,
+  if (!is.null(mw)) paste0("Top-up:  ", mw) else NULL,
+  "",
+  paste0("Sent by ", CONTACT_NAME, ", ", CONTACT_EMAIL))
+
+summary_text <- paste(summary_lines, collapse = "\n")
+cat("\n", summary_text, "\n", sep = "")
+
+# ---- Write outputs ---------------------------------------------------------
+fwrite(results, file.path(OUT, sprintf("blast_results_%s.csv", run_tag)), na = "NA")
+writeLines(summary_text, file.path(OUT, sprintf("blast_summary_%s.txt", run_tag)))
+fwrite(results, file.path(OUT, "blast_results_latest.csv"), na = "NA")
+writeLines(summary_text, file.path(OUT, "blast_summary_latest.txt"))
+
+# ---- HTML email body -------------------------------------------------------
+band <- function(l) { s <- BAND_STYLE[[l]]; if (is.null(s)) BAND_STYLE[["no data"]] else s }
+chip <- function(l) {
+  s <- band(l)
+  sprintf(paste0("<span style='display:inline-block;background:%s;color:%s;padding:2px 9px;",
+                 "border-radius:10px;font-size:12px;white-space:nowrap;'>",
+                 "<span style='display:inline-block;width:7px;height:7px;border-radius:50%%;",
+                 "background:%s;margin-right:5px;'></span>%s</span>"),
+          s$bg, s$fg, s$dot, l)
+}
+pill <- function(l, n) {
+  s <- band(l)
+  sprintf(paste0("<span style='display:inline-block;background:%s;color:%s;padding:4px 12px;",
+                 "border-radius:14px;margin-right:6px;font-size:13px;'>",
+                 "<span style='display:inline-block;width:8px;height:8px;border-radius:50%%;",
+                 "background:%s;margin-right:6px;'></span>%s %d</span>"),
+          s$bg, s$fg, s$dot, tools::toTitleCase(l), n)
+}
+# Which shade a count falls in, then the background, the colour of the count and
+# the colour of the smaller "(7d n)" figure for that shade (blast_config.R).
+bl_idx <- function(n) {
+  if (is.na(n)) return(1L)
+  max(1L, min(length(BLASTAM_CELL_BG), findInterval(n, c(0, 1, 3, 6, 11, 16))))
+}
+bl_bg  <- function(n) BLASTAM_CELL_BG[bl_idx(n)]
+bl_fg  <- function(n) BLASTAM_CELL_FG[bl_idx(n)]
+bl_sub <- function(n) BLASTAM_CELL_SUB[bl_idx(n)]
+
+row_html <- character(0); cur <- ""
+for (k in seq_len(nrow(results))) {
+  r <- results[k]
+  if (r$state != cur) {
+    cur <- r$state
+    row_html <- c(row_html, sprintf(
+      paste0("<tr><td colspan='5' style='background:%s;font-weight:bold;",
+             "padding:6px 8px;border-top:1px solid %s;'>%s</td></tr>"),
+      NSW_GREY_01, NSW_GREY_02, cur))
+  }
+  # The 7 day figure and the unjudged-night asterisk take their colour from the
+  # shade they sit on. Both used to be fixed (grey, orange) and vanished on the
+  # darker cells.
+  blv <- if (is.na(r$blast_events)) "-" else
+    sprintf("%d<span style='color:%s;font-size:11px;'> (%dd %d)</span>%s",
+            r$blast_events, bl_sub(r$blast_events), BLASTAM_RECENT_DAYS, r$blast_recent,
+            if (!is.na(r$blast_unjudged) && r$blast_unjudged > 0)
+              sprintf("<span title='%d night(s) could not be judged' style='color:%s;font-weight:bold;'>&nbsp;*</span>",
+                      r$blast_unjudged, bl_fg(r$blast_events)) else "")
+  row_html <- c(row_html, sprintf(
+    paste0("<tr><td style='padding:5px 8px;border-top:1px solid #EEE;'>%s</td>",
+           "<td style='padding:5px 8px;border-top:1px solid #EEE;text-align:right;",
+           "font-variant-numeric:tabular-nums;'>%s</td>",
+           "<td style='padding:5px 8px;border-top:1px solid #EEE;'>%s</td>",
+           "<td style='padding:5px 8px;border-top:1px solid #EEE;text-align:right;",
+           "color:#6b7378;'>%s</td>",
+           "<td style='padding:5px 8px;border-top:1px solid #EEE;text-align:right;",
+           "background:%s;color:%s;'>%s</td></tr>"),
+    r$name, fmt_pct(r$intensity), chip(r$level), fmt_chg(r$trend7),
+    bl_bg(r$blast_events), bl_fg(r$blast_events), blv))
+}
+
+bl_legend <- paste0(
+  "<span style='font-size:12px;color:#6b7378;margin-right:8px;'>BLASTAM days:</span>",
+  paste(mapply(function(lab, bg, fg) sprintf(
+    paste0("<span style='display:inline-block;background:%s;color:%s;padding:3px 9px;",
+           "border-radius:3px;margin-right:4px;font-size:12px;'>%s</span>"), bg, fg, lab),
+    c("0", "1-2", "3-5", "6-10", "11-15", "16-21"),
+    BLASTAM_CELL_BG,
+    BLASTAM_CELL_FG), collapse = ""))
+
+html <- paste0(
+"<div style='font-family:Arial,Helvetica,sans-serif;color:", NSW_BRAND_DARK,
+";max-width:760px;margin:auto;'>",
+"<div style='background:", NSW_BRAND_BLUE, ";color:#fff;padding:16px 20px;border-radius:6px 6px 0 0;'>",
+"<div style='font-size:19px;font-weight:bold;'>Blast risk summary",
+if (nzchar(SOURCE_TAG)) paste0(" (", SOURCE_TAG, ")") else "", "</div>",
+sprintf("<div style='font-size:13px;opacity:.9;'>%s</div>", format(RUN_DATE, "%A %d %B %Y")),
+"</div>",
+"<div style='padding:16px 20px;border:1px solid #E0E0E0;border-top:none;border-radius:0 0 6px 6px;'>",
+# The IFS trial says what it is before anything else. Empty for the product.
+if (nzchar(SOURCE_NOTE)) sprintf(
+  paste0("<p style='margin:0 0 12px;padding:10px 12px;background:#EBF1F8;",
+         "border-left:4px solid %s;border-radius:3px;font-size:13px;'>%s</p>"),
+  NSW_BRAND_BLUE, sub("^Trial version\\.", "<b>Trial version.</b>", SOURCE_NOTE)) else "",
+# The opening used to say "fetched to 29 Sep and modelled to 28 Sep", which is the
+# pipeline talking to itself, and "how much disease the rolling 60 day window has
+# built up", which reads as disease that exists. It is a simulation on an assumed
+# crop with the pathogen assumed present, and the opening now says so.
+sprintf(paste0("<p style='margin:0 0 12px;'>Weather based leaf blast risk for %d towns, ",
+        "using weather to <b>%s</b>. ",
+        "<b>EPIRICE intensity</b> is the percentage of leaf tissue a simulated epidemic ",
+        "would have diseased by that date, on a susceptible rice crop that emerged %d days ",
+        "earlier. <b>BLASTAM days</b> is the number of nights in the most recent %d ",
+        "modelled that were wet and warm enough for a new infection. ",
+        "Both assume the host crop and the pathogen are present.</p>"),
+        nrow(results), format(end_date, "%d %b %Y"), CROP_AGE_DAYS, BLASTAM_WINDOW_DAYS),
+if (!is.null(mwarn)) sprintf(
+  paste0("<p style='margin:0 0 12px;padding:10px 12px;background:#FDEBD9;",
+         "border-left:4px solid %s;border-radius:3px;font-size:13px;'>",
+         "<b>Degraded run.</b> %s</p>"), COL_MODERATE, mwarn) else "",
+"<p style='margin:0 0 8px;'>",
+"<span style='font-size:12px;color:#6b7378;margin-right:8px;'>EPIRICE bands:</span>",
+pill("high", getn("high")), pill("moderate", getn("moderate")), pill("low", getn("low")),
+if (getn("no data") > 0) pill("no data", getn("no data")) else "",
+"</p>",
+"<p style='margin:0 0 14px;'>", bl_legend, "</p>",
+"<table style='border-collapse:collapse;width:100%;font-size:13px;'>",
+sprintf("<thead><tr style='text-align:left;border-bottom:2px solid %s;'>", NSW_BRAND_BLUE),
+"<th style='padding:6px 8px;'>Town</th>",
+"<th style='padding:6px 8px;text-align:right;'>EPIRICE intensity</th>",
+"<th style='padding:6px 8px;'>Risk</th>",
+"<th style='padding:6px 8px;text-align:right;'>7 day change (pts)</th>",
+sprintf("<th style='padding:6px 8px;text-align:right;'>BLASTAM days (last %d)</th></tr></thead><tbody>",
+        BLASTAM_WINDOW_DAYS),
+paste(row_html, collapse = ""),
+"</tbody></table>",
+if (n_unjudged > 0) sprintf(
+  paste0("<p style='font-size:12px;color:%s;margin:10px 0 0;'>* %d night(s) could not be ",
+         "judged this run, from missing hours or insufficient lead-in. These are NOT counted ",
+         "as unfavourable.</p>"), COL_MODERATE, n_unjudged) else "",
+# The small print, in the order a reader needs it: how to read the two numbers,
+# the thresholds each model uses and where they come from, what the numbers
+# cannot say, the references, then the map and top-up lines. It used to be one
+# dense paragraph that also explained the trends CSV conventions, which are in
+# the plain-text part of the email and the README. The wording is the
+# maintainer's (edited 2026-10-26); the numbers come from the settings.
+sprintf(paste0("<p style='font-size:12px;color:#6b7378;margin:14px 0 0;'><b>Reading the ",
+       "table:</b> a rising BLASTAM count means recent nights have suited infection. ",
+       "EPIRICE moves slowly and mostly after rain, so it shows whether favourable ",
+       "weather for blast disease has persisted. Arbitrary EPIRICE bands: low below %s%%, ",
+       "moderate %s to %s%%, high %s%% and above. Both read low in cool, dry weather.</p>"),
+       band_lo, band_lo, band_hi, band_hi),
+sprintf(paste0("<p style='font-size:12px;color:#6b7378;margin:10px 0 0;'><b>How the models work:</b> ",
+       "<b>EPIRICE</b> (Savary <em>et al.</em> 2012, run with code from the epicrop R ",
+       "package) measures potential disease: the percentage of leaf tissue that a blast ",
+       "epidemic would have diseased by the last modelled day, on a susceptible rice crop ",
+       "that emerged %d days earlier. The table shows that percentage, simulated day by ",
+       "day under these rules:</p>",
+       "<ul style='font-size:12px;color:#6b7378;margin:4px 0 0 18px;padding:0;'>",
+       "<li style='margin:0 0 2px;'>Inoculum: the pathogen is introduced on day 15 after emergence.</li>",
+       "<li style='margin:0 0 2px;'>Wet days: infection advances only on days with 5 mm or more of rain, ",
+       "or a mean relative humidity of 90%% or more.</li>",
+       "<li style='margin:0 0 2px;'>Temperature: the infection rate peaks at a daily mean of %d&deg;C, ",
+       "falls to %.0f%% of that at %d&deg;C and %.0f%% at %d&deg;C, and is zero at ",
+       "10&deg;C and 45&deg;C (Savary <em>et al.</em> 2012, Table 2).</li>",
+       "<li style='margin:0 0 2px;'>Disease cycle: an infection is latent for 5 days, then infectious for ",
+       "20 days, then removed.</li>",
+       "</ul>",
+       "<p style='font-size:12px;color:#6b7378;margin:4px 0 0;'>Rain, humidity and temperature are daily values over a day ",
+       "starting at %02d:00 local solar time, so a night's rain is counted in one ",
+       "day.</p>"),
+       CROP_AGE_DAYS, EPIRICE_RCT_PEAK, rct_at(EPIRICE_RCT_PEAK - 5L), EPIRICE_RCT_PEAK - 5L,
+       rct_at(EPIRICE_RCT_PEAK + 5L), EPIRICE_RCT_PEAK + 5L, BLASTAM_DAY_CUT_HOUR),
+sprintf(paste0("<p style='font-size:12px;color:#6b7378;margin:10px 0 0;'><b>BLASTAM</b> (Koshimizu 1988; Hayashi &amp; Koshimizu ",
+       "1988) measures infection opportunity: the number of nights, out of the most ",
+       "recent %d modelled, on which leaves stayed wet long enough at a suitable ",
+       "temperature for blast spores to infect. The table shows the count when all three ",
+       "criteria are met:</p>",
+       "<ul style='font-size:12px;color:#6b7378;margin:4px 0 0 18px;padding:0;'>",
+       "<li style='margin:0 0 2px;'>Leaf wetness lasts at least %s.</li>",
+       "<li style='margin:0 0 2px;'>Mean temperature during the wet period is %d to %d&deg;C%s.</li>",
+       "<li style='margin:0 0 2px;'>Mean temperature of the preceding 5 days is %d to %d&deg;C%s.</li>",
+       "</ul>",
+       "<p style='font-size:12px;color:#6b7378;margin:4px 0 0;'>Leaf wetness is estimated hourly each night, %02d:00 to ",
+       "%02d:00 local solar time. An hour counts as wet when relative humidity is %d%% ",
+       "or more, or rain is %s mm or more%s.</p>"),
+       BLASTAM_WINDOW_DAYS, wet_html,
+       BLASTAM_TWET_MIN, BLASTAM_TWET_MAX, raised(BLASTAM_TWET_MAX),
+       BLASTAM_PREV5_MIN, BLASTAM_PREV5_MAX, raised(BLASTAM_PREV5_MAX),
+       BLASTAM_NIGHT_START, BLASTAM_NIGHT_END,
+       BLASTAM_RH_WET, format(BLASTAM_RAIN_WET), heavy_html),
+paste0("<p style='font-size:12px;color:#6b7378;margin:10px 0 0;'><b>Limits:</b> These are ",
+       "modelled values from gridded ", WEATHER_NAME, " weather (about ", WEATHER_GRID_KM,
+       " km). Humidity inside an ",
+       "irrigated rice crop canopy runs well above the surrounding air (Lanoiselet ",
+       "<em>et al.</em> 2002), so modelled values are best read as lower bounds.</p>"),
+paste0("<p style='font-size:11px;color:#9aa0a6;margin:10px 0 0;'><b>References:</b> ",
+       "Savary S, Nelson A, Willocquet L, Pangga I, Aunario J (2012) Crop Protection ",
+       "34:6-17. epicrop R package (A.H. Sparks and colleagues). Koshimizu Y (1988) Bull. ",
+       "Tohoku Natl. Agric. Exp. Stn. 78:67-121. Hayashi T, Koshimizu Y (1988) ibid. ",
+       "78:123-138. Barksdale TH, Jones MW (1965) Phytopathology 55:1037-1040. Lanoiselet ",
+       "V, Cother EJ, Ash GJ (2002) Australasian Plant Pathology 31:1-7. Weather: ",
+       "Open-Meteo ", WEATHER_NAME, " (CC BY 4.0).</p>"),
+# The map and top-up lines are how a reader sees that the weather retrieval is
+# not keeping up (fewer cells, an older window, a top-up that fetched little), so
+# they stay in full.
+if (!is.null(mg))
+  sprintf(paste0("<p style='font-size:11px;color:#9aa0a6;margin:8px 0 0;'>",
+                 "<b>Map:</b> %s</p>"), mg) else "",
+if (!is.null(mw))
+  sprintf(paste0("<p style='font-size:11px;color:#9aa0a6;margin:2px 0 0;'>",
+                 "<b>Top-up:</b> %s</p>"), mw) else "",
+sprintf(paste0("<p style='font-size:11px;color:#b0b5ba;margin:8px 0 0;'>Sent by %s, ",
+               "<a href='mailto:%s' style='color:#b0b5ba;'>%s</a></p>"),
+        CONTACT_NAME, CONTACT_EMAIL, CONTACT_EMAIL),
+"</div></div>")
+writeLines(html, file.path(OUT, "blast_summary_latest.html"))
+
+# ---- Rolling trends CSVs ---------------------------------------------------
+# Wide format: one row per town, one column per DATA end date.
+#
+# Columns used to be keyed on the RUN date, so three test runs on 28, 29 and 30
+# July each took a column while describing almost the same weather, and with a
+# short history that evicts the genuinely older columns. Keying on the data end
+# date means a re-run over the same window MERGES into its column: towns this run
+# modelled take this run's value, towns it could not keep the earlier one. The
+# 2026-09-21 rerun used to replace the column outright and turned two towns NA.
+#
+# Blanks are written as NA. In the delivered 2026-07-11 column an absent town
+# read as an empty cell, which is indistinguishable from a zero in a spreadsheet.
+write_trends <- function(values, file_name) {
+  today <- data.table(town = results$name)
+  today[[data_tag]] <- values
+  f <- file.path(OUT, file_name)
+  hist <- if (file.exists(f))
+    fread(f, header = TRUE, colClasses = list(character = "town"), na.strings = "NA") else
+    data.table(town = character())
+  m <- trends_merge_rerun(today, hist, data_tag)
+  if (m$n_kept > 0L)
+    cat(sprintf("Trends %s: %d town(s) with no value this run keep the earlier run's value for the same window.\n",
+                file_name, m$n_kept))
+  today <- m$today; hist <- m$hist
+  hist <- merge(hist, today, by = "town", all = TRUE)
+  ord <- c(results$name, setdiff(hist$town, results$name))
+  hist <- hist[match(ord, town)]
+  dcols <- setdiff(names(hist), "town")
+  parsed <- suppressWarnings(as.Date(dcols))
+  dcols <- dcols[!is.na(parsed)][order(parsed[!is.na(parsed)])]
+  if (length(dcols) > HISTORY_RUNS) dcols <- tail(dcols, HISTORY_RUNS)
+  hist <- hist[, c("town", dcols), with = FALSE]
+  fwrite(hist, f, na = "NA")
+  cat(sprintf("Trends: %d towns x %d data windows -> %s\n", nrow(hist), length(dcols), f))
+}
+write_trends(round(results$intensity * 100, 4), "town_trends.csv")     # EPIRICE %
+write_trends(as.integer(results$blast_events),  "blastam_trends.csv")  # BLASTAM days
+
+# ---- Run log ---------------------------------------------------------------
+# One row per run recording the method behind each trends column, so a change in
+# schema or parameters is visible in the series rather than looking like a real
+# epidemiological collapse. This is what was missing when Malanda dropped from
+# 0.374% to 0.006% between the 2026-07-28 and 2026-07-29 columns.
+log_row <- data.table(
+  run_date = format(RUN_DATE), data_end = data_tag, fetched_to = format(data_end),
+  crop_age_days = CROP_AGE_DAYS, cache_schema = CACHE_SCHEMA_VERSION,
+  rct_peak_c = EPIRICE_RCT_PEAK, day_cut_hour = BLASTAM_DAY_CUT_HOUR,
+  blastam_window = BLASTAM_WINDOW_DAYS,
+  bj_threshold = BLASTAM_USE_BJ_THRESHOLD,
+  twet = sprintf("%d-%d", BLASTAM_TWET_MIN, BLASTAM_TWET_MAX),
+  prev5 = sprintf("%d-%d", BLASTAM_PREV5_MIN, BLASTAM_PREV5_MAX),
+  towns_modelled = sum(!is.na(results$intensity)),
+  unjudged_nights = n_unjudged,
+  weighted_spent_towns = round(fr$spent, 1))
+log_f <- file.path(OUT, RUN_LOG_FILE)
+# Append safely. fread() infers types, so a column written as character (a date
+# formatted with format()) comes back as Date and rbind() then refuses with
+# "Class attribute on column 3 ... does not match". Align the old rows to the new
+# row's classes before binding, and never let a metadata write kill a run whose
+# real outputs are already on disk.
+append_run_log <- function(f, row) {
+  old <- if (file.exists(f)) tryCatch(fread(f), error = function(e) NULL) else NULL
+  # One row per window: the run that modelled the most towns. A rerun that did
+  # worse leaves the earlier row alone (its own spend is on the ledger anyway).
+  k <- runlog_keep_better(old, row, data_tag)
+  if (!k$write_new) {
+    cat(sprintf("Run log: an earlier run over the same window modelled %d towns against %d now; its row is kept.\n",
+                k$prev_towns, row$towns_modelled[1]))
+    return(invisible(FALSE))
+  }
+  old <- k$old
+  if (!is.null(old) && nrow(old) > 0) {
+    for (cl in intersect(names(row), names(old)))
+      if (!identical(class(old[[cl]]), class(row[[cl]])))
+        set(old, j = cl, value = methods::as(as.character(old[[cl]]), class(row[[cl]])[1]))
+  }
+  fwrite(if (is.null(old) || nrow(old) == 0) row else rbind(old, row, fill = TRUE),
+         f, na = "NA")
+  invisible(TRUE)
+}
+tryCatch(append_run_log(log_f, log_row),
+         error = function(e) cat("Run log not updated:", conditionMessage(e), "\n"))
+cat("Run log: ", log_f, "\n")
+
+# ---- Run status ------------------------------------------------------------
+# key=value lines read by send_email.py and by the workflow's Verdict step. This
+# script exits 0 whatever the verdict: a non-zero exit here would stop the
+# workflow before the commit and the email, and the run that most needs
+# explaining is the one that must be reported. The red run comes last.
+status <- list(
+  run_date = format(RUN_DATE), utc_date = format(blast_utc_date()),
+  town_window_end = data_tag, towns_modelled = towns_ok, towns_total = nrow(results),
+  map_window_end = msf(8), map_cells = msf(1), map_cells_grey = msf(15),
+  map_behind_days = if (is.na(map_end)) 0L else as.integer(end_date - map_end),
+  degraded = as.integer(verdict$degraded),
+  reasons = verdict$reasons, warnings = verdict$warnings)
+status_f <- file.path(OUT, RUN_STATUS_FILE)
+writeLines(run_status_lines(status), status_f)
+cat(sprintf("\nRun verdict: %s%s\n",
+            if (verdict$degraded) "DEGRADED" else "healthy",
+            if (verdict$degraded) paste0(" (", paste(verdict$reasons, collapse = "; "), ")") else ""))
+if (length(verdict$warnings)) cat("  notes: ", paste(verdict$warnings, collapse = "; "), "\n", sep = "")
+cat("Status:  ", status_f, "\n")
+
+# ---- Optional simple town point map ----------------------------------------
+band_col <- function(level) {
+  vapply(level, function(l) switch(l,
+    low = COL_LOW, moderate = COL_MODERATE, high = COL_HIGH, COL_NODATA),
+    character(1))
+}
+if (isTRUE(MAKE_MAP)) {
+  map_file <- file.path(OUT, sprintf("blast_map_%s.png", run_tag))
+  png(map_file, width = MAP_WIDTH, height = MAP_HEIGHT, res = 120)
+  op <- par(mar = c(4, 4, 3, 1))
+  xr <- range(results$lon) + c(-2, 2)
+  yr <- range(results$lat) + c(-2, 2)
+  plot(results$lon, results$lat, type = "n", xlim = xr, ylim = yr,
+       xlab = "Longitude", ylab = "Latitude",
+       main = sprintf("Rice leaf blast risk, weather to %s", format(end_date)))
+  grid(col = "#E4E7E9")
+  points(results$lon, results$lat, pch = 21, cex = 3,
+         bg = band_col(results$level), col = NSW_BRAND_DARK, lwd = 1.5)
+  text(results$lon, results$lat, labels = results$name, pos = 3,
+       offset = 1, cex = 0.8, col = NSW_BRAND_DARK)
+  legend("topright", legend = c("Low", "Moderate", "High", "No data"),
+         pt.bg = c(COL_LOW, COL_MODERATE, COL_HIGH, COL_NODATA),
+         pch = 21, pt.cex = 2, bty = "n")
+  par(op); dev.off()
+  file.copy(map_file, file.path(OUT, "blast_map_latest.png"), overwrite = TRUE)
+  cat("\nMap:     ", map_file, "\n")
+}
+
+cat("Results: ", file.path(OUT, sprintf("blast_results_%s.csv", run_tag)), "\n")
+cat("\nDone.\n")

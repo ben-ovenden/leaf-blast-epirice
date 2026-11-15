@@ -77,14 +77,12 @@ requires in canopy loggers deployed alongside ERA5 driven model runs.
 | `map_labels.R` | Where each town label goes: twelve candidate positions per marker, none allowed to touch another label or cover another town's marker |
 | `run_health.R` | The run's verdict: is this run degraded, and why. Written to `run_status.txt` for the subject line and the workflow's final step |
 | `send_email.py` | Python stdlib email sender; the subject carries the town window and a `[DEGRADED]` prefix when `run_status.txt` says so |
-| `test_offline.R` | Offline regression tests: 248 tests, no network, runs in seconds, in CI |
+| `test_offline.R` | Offline regression tests: 228 tests, no network, runs in seconds, in CI |
 | `australia_land.geojson` | Land polygon for masking ocean and clipping the map |
 | `australia_rivers.geojson` | River overlay |
 | `australia_roads.geojson` | Road overlay |
 | `.github/workflows/weekly_blast.yml` | Weekly workflow (06:17 UTC Sunday): pin the dates, restore the cache, test, probe the archive, fetch, save the cache, model, commit, email, verdict |
 | `.github/workflows/midweek_topup.yml` | Wednesday and Saturday top-ups (03:17 UTC): restore the cache, probe, fetch, save the cache, stop. No maps, no email |
-| `.github/workflows/ifs_weekly.yml` | **IFS trial**, weekly run (00:17 UTC Monday): the same steps on ECMWF IFS weather, writing to `blast_outputs_ifs/` with its cache on `cache-data-ifs`. Emails once its map is complete |
-| `.github/workflows/ifs_topup.yml` | **IFS trial**, top-ups (00:17 UTC Tuesday, Thursday, Friday) |
 
 ---
 
@@ -146,7 +144,7 @@ git cat-file blob FETCH_HEAD:weather_cache.csv.gz > blast_outputs/weather_cache.
 git cat-file blob FETCH_HEAD:cache_version.txt   > blast_outputs/cache_version.txt
 ```
 
-All 248 offline tests must pass before a run is meaningful. Each test guards a
+All 228 offline tests must pass before a run is meaningful. Each test guards a
 bug that was actually shipped.
 
 ---
@@ -796,63 +794,6 @@ and disagreed with the map, which used the correct form.
 
 ---
 
-## IFS trial: a second run beside the product
-
-From November 2026 the pipeline runs twice: the product, on ERA5, exactly as
-described above, and a trial on ECMWF's IFS archive, so the maintainer can
-compare the two and keep one. **The trial is a switch that is off unless a
-workflow turns it on.** With `BLAST_SOURCE` unset every script behaves as it did
-before the trial existed; test 31 checks that, and that the switch changes
-nothing but the weather source, its lag, the output directory and the wording
-that names the source.
-
-| | Product | Trial |
-| --- | --- | --- |
-| Switch | `BLAST_SOURCE` unset | `BLAST_SOURCE=ifs` |
-| Weather | ERA5, 0.25 degrees, 6 days behind | ECMWF IFS, 9 km, held back 2 days |
-| Outputs | `blast_outputs/` | `blast_outputs_ifs/` |
-| Cache branch | `cache-data` | `cache-data-ifs` |
-| Workflows | `weekly_blast.yml`, `midweek_topup.yml` | `ifs_weekly.yml`, `ifs_topup.yml` |
-| UTC days | Sunday; Wednesday, Saturday | Monday; Tuesday, Thursday, Friday |
-| Concurrency group | `blast-grid` | `blast-grid-ifs` |
-| Email | Monday by 7 am, weather to the previous Sunday | Monday evening, weather to Friday, subject `[IFS trial] ...` |
-
-**Why the days differ.** Each grid run spends most of a day's free API
-allowance, so the two must not run on the same UTC day. The ERA5 workflows keep
-their days; the trial takes the other four and fires early in the UTC day so
-that a late start cannot spill into an ERA5 day. That is why the trial's email
-arrives on Monday evening during the trial. If IFS is kept, it takes over the
-Sunday slot and the 7 am delivery.
-
-**Why IFS is held back two days.** Its archive is updated every six hours and
-runs to the end of today, so its newest hours are forecast (on 14 November 2026
-at 02:41 UTC it returned every hour of that day). Two UTC days keeps every
-modelled hour on settled data.
-
-**Accumulation.** The trial starts with an empty cache and fills it the way the
-product once did, coarse to fine, about twelve fetch days: at four a week, about
-three weeks. Its weekly run models the towns and draws whatever map it can from
-the first week, and keeps the results as a workflow artifact, but **the second
-email starts only when the map is complete at 0.30 degrees**; the run that first
-reaches it writes `blast_outputs_ifs/email_started.txt`, and every weekly run
-after that emails. It goes to the `MAIL_TO` recipients unless a `MAIL_TO_IFS`
-secret names a different list.
-
-**The two are not interchangeable.** Over the same 60 days to 7 November 2026 at
-the 31 towns, IFS had 190 days of 5 mm or more against ERA5's 144 and 163
-infection nights against 144; the BLASTAM count at Home Hill was 10 against 1.
-The gap is in the tropics and on the coast, where the 9 km cell is the town's own
-and the ERA5 cell is partly sea; in NSW the two agree. Which is closer to the
-ground has not been established, which is what the trial is for. The trial's
-trends files are a separate record and must not be joined to the product's.
-
-**Ending the trial.** To keep ERA5: disable the two `ifs_*` workflows
-(`gh workflow disable ifs_weekly.yml`, and the same for `ifs_topup.yml`); the
-directory and the cache branch can then be deleted. To keep IFS: disable the two
-ERA5 workflows and move `ifs_weekly.yml` to the Sunday slot.
-
----
-
 ## Known limitations
 
 ### Ambient versus in canopy humidity
@@ -892,7 +833,7 @@ The weekly workflow runs:
 1. **Resolve run date and UTC date**, pinned once and exported as
    `BLAST_RUN_DATE` and `BLAST_UTC_DATE`, then **restore the weather cache** from
    the `cache-data` branch, failing the run if it cannot.
-2. **Offline tests**, `Rscript test_offline.R`. 248 tests, no network, preceded
+2. **Offline tests**, `Rscript test_offline.R`. 228 tests, no network, preceded
    by a step that makes sure `python3` exists, because the suite executes
    `send_email.py` in dry-run mode: the 2026-09-28 email was sent and the step
    then failed on a `NameError` in the line after the send, and nothing had ever

@@ -2,10 +2,13 @@ name: IFS trial weekly run (second email)
 
 # THE IFS TRIAL. A second, separate weekly run on ECMWF IFS weather, sent beside
 # the regular (ERA5) email so the maintainer can compare the two and keep one.
-# See section 6b of blast_config.R. This file is weekly_blast.yml with:
 #
-#   * BLAST_SOURCE=ifs on the job, which selects the IFS archive, a two day lag
-#     and the blast_outputs_ifs directory;
+# COMPLETELY SEPARATE FROM THE PRODUCT. Every step runs in ifs/, which holds the
+# trial's own copy of every script, its own config and its own tests (see
+# ifs/README.md). Nothing here runs, reads or writes a file outside that
+# directory, and the product's scripts and workflows know nothing about the
+# trial. It also has:
+#
 #   * its own cache branch, cache-data-ifs, which the first run creates;
 #   * its own concurrency group, so it can never queue behind, delay or displace
 #     an ERA5 run;
@@ -19,7 +22,7 @@ name: IFS trial weekly run (second email)
 # Monday UTC. GitHub starts this repository's schedules five to seven hours late,
 # so expect the email on Monday evening, Sydney time, with weather to Friday.
 #
-# TO END THE TRIAL keeping ERA5: disable this workflow and ifs_topup.yml.
+# TO END THE TRIAL keeping ERA5: delete this workflow, ifs_topup.yml and ifs/.
 on:
   schedule:
     - cron: '17 0 * * 1'   # 00:17 UTC Monday = 10:17 AEST / 11:17 AEDT
@@ -50,9 +53,12 @@ jobs:
     # with room to commit and email, so the scripts' own graceful stops fire first
     # and the run still saves. The hosted-runner ceiling is 360.
     timeout-minutes: 345
+    # EVERY STEP RUNS IN ifs/, the trial's own copy of the pipeline. Nothing in
+    # this workflow runs, reads or writes a file outside that directory.
+    defaults:
+      run:
+        working-directory: ifs
     env:
-      BLAST_SOURCE: ifs
-      BLAST_OUT_DIR: blast_outputs_ifs
       MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
     # rocker/geospatial ships R with terra, sf and a matching GDAL already built.
     container:
@@ -155,6 +161,7 @@ jobs:
           command -v python3 >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq python3; }
           python3 --version
 
+      # The trial's own suite, ifs/test_offline.R, on the trial's own scripts.
       # Offline regression tests: no network, no quota, a few seconds. Fails the
       # run before three hours of fetching are spent on broken code. terra is
       # attached inside the suite on purpose: terra::shift masks
@@ -164,9 +171,6 @@ jobs:
       # A MISSING file is a warning, not a failure: tests that fail should block
       # the run, but the absence of a test file should never stop the product.
       - name: Offline tests
-        env:
-          BLAST_SOURCE: ""
-          BLAST_OUT_DIR: ""
         run: |
           if [ -f test_offline.R ]; then
             Rscript test_offline.R
@@ -301,7 +305,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: blast-outputs-ifs
-          path: blast_outputs_ifs/
+          path: ifs/blast_outputs_ifs/
           retention-days: 90
 
       # FAIL LOUDLY, LAST. Everything above has already been committed, emailed

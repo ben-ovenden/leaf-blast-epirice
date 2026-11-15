@@ -661,58 +661,6 @@ HEALTH_MAX_MAP_DROP_FRAC   <- 0.10  # mapped cells fell by more than this vs las
 RUN_STATUS_FILE <- "run_status.txt"
 
 ################################################################################
-# 6b. Weather source: the product (ERA5) or the IFS trial
-################################################################################
-# BLAST_SOURCE chooses the archive a run is built on.
-#
-# UNSET, the default, is the product as it has always run: ERA5, six days
-# behind, written to blast_outputs/, cache on the `cache-data` branch. Nothing
-# above this block is changed for it, and the offline suite checks that.
-#
-# BLAST_SOURCE=ifs is a second, separate run on ECMWF's IFS archive (9 km) that
-# the maintainer is trialling beside ERA5 from November 2026, to decide which to
-# keep. It has its own output directory, its own cache branch (`cache-data-ifs`)
-# and its own workflows (.github/workflows/ifs_*.yml), which run on UTC days the
-# ERA5 workflows do not use: the two never share a day's API allowance, and
-# neither can overwrite the other's files. To end the trial, disable one pair of
-# workflows.
-#
-# WHY IFS IS HELD BACK TWO DAYS. Its archive is updated every six hours and runs
-# to the end of TODAY, so its newest hours are forecast. On 14 November 2026 at
-# 02:41 UTC it returned every hour of 14 November. Two UTC days keeps every
-# modelled hour on settled data; the archive-edge probe cannot tell the
-# difference, so this arithmetic is the guard.
-#
-# THE TWO ARE NOT INTERCHANGEABLE. Same 31 towns, same 60 days to 7 November
-# 2026: IFS had 190 days of 5 mm or more against ERA5's 144, and 163 infection
-# nights against 144; BLASTAM at Home Hill was 10 against 1. The gap is in the
-# tropics and on the coast (NSW agreed). Which is closer to the ground is not
-# known, which is what the trial is for.
-BLAST_SOURCE <- tolower(trimws(Sys.getenv("BLAST_SOURCE", "")))
-if (!nzchar(BLAST_SOURCE)) BLAST_SOURCE <- "era5"
-if (!BLAST_SOURCE %in% c("era5", "ifs"))
-  stop("BLAST_SOURCE must be unset, 'era5' or 'ifs', not '", BLAST_SOURCE, "'", call. = FALSE)
-
-WEATHER_NAME    <- "ERA5"    # as printed in the email, the summary and the citations
-WEATHER_GRID_KM <- 25L
-SOURCE_TAG      <- ""        # shown in titles and the subject; empty for the product
-SOURCE_NOTE     <- ""        # a banner at the top of the email; empty for the product
-if (identical(BLAST_SOURCE, "ifs")) {
-  SOURCE_NOTE <- sprintf(paste0(
-    "Trial version. This email is built on ECMWF IFS weather (about 9 km grid, held ",
-    "back %d days) instead of ERA5 (about 25 km, %d days). It is sent beside the ",
-    "regular email so the two can be compared. The two weather models differ, so its ",
-    "numbers will not match the regular email's."), 2L, ARCHIVE_LAG_DAYS)
-  OPENMETEO_MODEL      <- "ecmwf_ifs"
-  ARCHIVE_LAG_DAYS     <- 2L
-  OUTPUT_DIR           <- "blast_outputs_ifs"
-  MIDWEEK_MAX_AGE_DAYS <- 3L     # weekly run on Monday UTC, last top-up on Friday
-  WEATHER_NAME         <- "ECMWF IFS"
-  WEATHER_GRID_KM      <- 9L
-  SOURCE_TAG           <- "IFS trial"
-}
-
-################################################################################
 # 7. Citation (added to the summary and to the heatmap footer)
 ################################################################################
 CITATION <- paste(
@@ -743,18 +691,18 @@ CITATION <- paste(
   "  Deviations from Koshimizu: temperature-dependent wetness threshold (Barksdale",
   "  & Jones 1965); upper bounds raised from 25 C for tropical Australia; heavy",
   "  rain (>=4 mm/h) excluded from the wet count (Yoshino 1988); wetness from",
-  sprintf("  hourly %s RH (>=90%%) rather than AMeDAS energy balance; night window in", WEATHER_NAME),
+  "  hourly ERA5 RH (>=90%) rather than AMeDAS energy balance; night window in",
   "  local solar time.",
   "Prior Australian modelling: Lanoiselet, V., Cother, E.J. and Ash, G.J. (2002).",
   "  CLIMEX and DYMEX simulations of the potential occurrence of rice blast",
   "  disease in south-eastern Australia. Australasian Plant Pathology 31: 1-7.",
-  sprintf("Weather: Open-Meteo %s archive (data CC BY 4.0), non-commercial research use.", WEATHER_NAME),
+  "Weather: Open-Meteo ERA5 archive (data CC BY 4.0), non-commercial research use.",
   sep = "\n"
 )
 
 CITATION_MAP <- paste(
   "Model: EPIRICE (Savary et al. 2012, Crop Prot. 34:6-17). Code: epicrop (A.H. Sparks).",
-  sprintf("BLASTAM: Koshimizu 1988. Weather: Open-Meteo %s (CC BY 4.0).", WEATHER_NAME),
+  "BLASTAM: Koshimizu 1988. Weather: Open-Meteo ERA5 (CC BY 4.0).",
   sep = "\n"
 )
 
@@ -762,7 +710,7 @@ CITATION_MAP <- paste(
 # in-canopy RH at Yanco at least 20 percentage points above ambient, so both
 # models read as conservative lower bounds in irrigated paddocks.
 CAVEAT_CANOPY <- paste0(
-  "Both models are driven by ", WEATHER_NAME, " ambient humidity, roughly a Stevenson screen ",
+  "Both models are driven by ERA5 ambient humidity, roughly a Stevenson screen ",
   "at field-bank height. In-canopy RH in irrigated rice was measured at Yanco ",
   "at least 20 percentage points above ambient (Lanoiselet et al. 2002), so ",
   "these outputs are better read as conservative lower bounds than as estimates."
